@@ -182,7 +182,7 @@ mod tests {
 
     use crate::{
         live::timer::LiveTimer,
-        runner::{TimeEventSender, set_time_event_sender},
+        runner::{TimeEventMessage, TimeEventSender, set_time_event_sender},
         testing::wait_until,
         timer::{TimeEvent, TimeEventCallback},
     };
@@ -196,7 +196,7 @@ mod tests {
     struct TestTimeEventSender;
 
     impl TimeEventSender for TestTimeEventSender {
-        fn send(&self, _handler: crate::timer::TimeEventHandler) {
+        fn send(&self, _message: TimeEventMessage) {
             // Test implementation - just ignore the events
         }
     }
@@ -235,7 +235,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         timer.cancel();
-        wait_until(|| timer.is_expired(), Duration::from_secs(2));
+        assert!(timer.is_expired(), "Timer should be expired after cancel");
         assert!(timer.next_time_ns() > next_time_ns);
     }
 

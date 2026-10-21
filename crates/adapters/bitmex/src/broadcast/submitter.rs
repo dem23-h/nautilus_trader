@@ -397,7 +397,7 @@ impl TransportClient {
 #[derive(Debug)]
 pub struct SubmitBroadcaster {
     config: SubmitBroadcasterConfig,
-    transports: Arc<Vec<TransportClient>>,
+    transports: Arc<[TransportClient]>,
     health_check_task: Arc<RwLock<Option<JoinHandle<()>>>>,
     running: Arc<AtomicBool>,
     total_submits: Arc<AtomicU64>,
@@ -446,7 +446,7 @@ impl SubmitBroadcaster {
 
         Ok(Self {
             config,
-            transports: Arc::new(transports),
+            transports: Arc::from(transports),
             health_check_task: Arc::new(RwLock::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             total_submits: Arc::new(AtomicU64::new(0)),
@@ -505,7 +505,7 @@ impl SubmitBroadcaster {
 
         *self.health_check_task.write().await = Some(task);
 
-        log::info!(
+        log::debug!(
             "SubmitBroadcaster started with {} clients",
             self.transports.len()
         );
@@ -525,7 +525,7 @@ impl SubmitBroadcaster {
             task.abort();
         }
 
-        log::info!("SubmitBroadcaster stopped");
+        log::debug!("SubmitBroadcaster stopped");
     }
 
     async fn run_health_checks(&self) {
@@ -829,7 +829,7 @@ impl SubmitBroadcaster {
     ) -> Self {
         Self {
             config,
-            transports: Arc::new(transports),
+            transports: Arc::from(transports),
             health_check_task: Arc::new(RwLock::new(None)),
             running: Arc::new(AtomicBool::new(false)),
             total_submits: Arc::new(AtomicU64::new(0)),
@@ -963,6 +963,7 @@ mod tests {
             ts_init: 0.into(),
             client_order_id: None,
             avg_px: None,
+            activation_price: None,
             trigger_price: None,
             trigger_type: None,
             contingency_type: ContingencyType::NoContingency,
@@ -1049,10 +1050,7 @@ mod tests {
     async fn test_broadcast_submit_duplicate_clordid_expected() {
         let transports = vec![
             create_stub_transport("client-0", || async { anyhow::bail!("Duplicate clOrdID") }),
-            create_stub_transport("client-1", || async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                anyhow::bail!("Should be aborted")
-            }),
+            create_stub_transport("client-1", || async { anyhow::bail!("Connection timeout") }),
         ];
 
         let config = SubmitBroadcasterConfig::default();
@@ -1637,10 +1635,7 @@ mod tests {
             create_stub_transport("client-0", || async {
                 anyhow::bail!("Duplicate clOrdID: O-123 already exists")
             }),
-            create_stub_transport("client-1", || async {
-                tokio::time::sleep(Duration::from_secs(10)).await;
-                anyhow::bail!("Should be aborted")
-            }),
+            create_stub_transport("client-1", || async { anyhow::bail!("Connection timeout") }),
         ];
 
         let config = SubmitBroadcasterConfig::default();

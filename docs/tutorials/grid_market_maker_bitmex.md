@@ -369,11 +369,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_delay_post_stop_secs(5)
         .build()?;
 
-    let config = GridMarketMakerConfig::new(instrument_id, Quantity::from("300"))
-        .with_num_levels(3)
-        .with_grid_step_bps(100)
-        .with_skew_factor(0.5)
-        .with_requote_threshold_bps(10);
+    let config = GridMarketMakerConfig::builder()
+        .instrument_id(instrument_id)
+        .max_position(Quantity::from("300"))
+        .num_levels(3)
+        .grid_step_bps(100)
+        .skew_factor(0.5)
+        .requote_threshold_bps(10)
+        .build();
     let strategy = GridMarketMaker::new(config);
 
     node.add_strategy(strategy)?;
@@ -454,8 +457,8 @@ Press **Ctrl+C** to stop the node. The shutdown sequence:
 
 ### Deadman's switch parameter
 
-| Parameter                      | Type          | Description                                                                                       |
-| ------------------------------ | ------------- | ------------------------------------------------------------------------------------------------- |
+| Parameter                      | Type          | Description                                                                                                      |
+| ------------------------------ | ------------- | ---------------------------------------------------------------------------------------------------------------- |
 | `deadmans_switch_timeout_secs` | `Option<u64>` | Server‑side cancel timer in seconds. Refresh interval = `timeout / 4` (minimum 1s). `None` disables the feature. |
 
 A 60-second timeout gives a 15-second refresh interval and a 60-second
@@ -499,14 +502,14 @@ flowchart TB
 
 ### Key log messages
 
-| Log message                                                             | Meaning                                                  |
-| ----------------------------------------------------------------------- | -------------------------------------------------------- |
-| `Requoting grid: mid=X, last_mid=Y`                                     | Mid moved beyond threshold, refreshing grid.             |
-| `Starting dead man's switch: timeout=60s, refresh_interval=15s`         | Deadman's switch armed at node start.                    |
-| `Dead man's switch heartbeat failed: ...`                               | Transient network issue; switch will retry next interval.|
-| `Disarming dead man's switch`                                           | Switch stopped cleanly during shutdown.                  |
-| `benign cancel error, treating as success`                              | Cancel for an already‑filled or cancelled order (normal).|
-| `Reconciling orders from last 2880 minutes`                             | Startup reconciliation loading prior state.              |
+| Log message                                                     | Meaning                                                   |
+| --------------------------------------------------------------- | --------------------------------------------------------- |
+| `Requoting grid: mid=X, last_mid=Y`                             | Mid moved beyond threshold, refreshing grid.              |
+| `Starting dead man's switch: timeout=60s, refresh_interval=15s` | Deadman's switch armed at node start.                     |
+| `Dead man's switch heartbeat failed: ...`                       | Transient network issue; switch will retry next interval. |
+| `Disarming dead man's switch`                                   | Switch stopped cleanly during shutdown.                   |
+| `benign cancel error, treating as success`                      | Cancel for an already‑filled or cancelled order (normal). |
+| `Reconciling orders from last 2880 minutes`                     | Startup reconciliation loading prior state.               |
 
 ### Expected behaviour patterns
 

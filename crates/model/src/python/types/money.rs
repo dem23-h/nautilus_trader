@@ -19,11 +19,13 @@ use std::{
     str::FromStr,
 };
 
-use nautilus_core::python::{get_pytype_name, to_pytype_err, to_pyvalue_err};
+use nautilus_core::python::{
+    correctness_error_to_pyvalue_err, get_pytype_name, to_pytype_err, to_pyvalue_err,
+};
 use pyo3::{IntoPyObjectExt, basic::CompareOp, prelude::*, types::PyFloat};
 use rust_decimal::{Decimal, RoundingStrategy};
 
-use crate::types::{Currency, Money, money::MoneyRaw};
+use crate::types::{Currency, Money, fixed::raw_scale, money::MoneyRaw};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -308,8 +310,10 @@ impl Money {
         if self.raw < 0 { -*self } else { *self }
     }
 
-    fn __int__(&self) -> i64 {
-        self.as_f64() as i64
+    fn __int__(&self) -> MoneyRaw {
+        let scale = MoneyRaw::try_from(raw_scale(self.currency.precision))
+            .expect("effective raw scale should fit in MoneyRaw");
+        self.raw / scale
     }
 
     fn __float__(&self) -> f64 {
@@ -350,8 +354,8 @@ impl Money {
     /// Creates a new `Money` instance from the given `raw` fixed-point value and the specified `currency`.
     #[staticmethod]
     #[pyo3(name = "from_raw")]
-    fn py_from_raw(raw: MoneyRaw, currency: Currency) -> Self {
-        Self::from_raw(raw, currency)
+    fn py_from_raw(raw: MoneyRaw, currency: Currency) -> PyResult<Self> {
+        Self::from_raw_checked(raw, currency).map_err(correctness_error_to_pyvalue_err)
     }
 
     /// Creates a new `Money` from a `Decimal` value with specified currency.
@@ -432,5 +436,93 @@ impl Money {
             )));
         }
         Ok(self.checked_sub(other))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyo3::Python;
+    use rstest::rstest;
+    use rust_decimal::Decimal;
+
+    use super::*;
+    use crate::{
+        enums::CurrencyType,
+        types::{
+            fixed::FIXED_PRECISION,
+            money::{MONEY_RAW_MAX, MONEY_RAW_MIN},
+        },
+    };
+
+    #[rstest]
+    #[case("0", 0)]
+    #[case("0.000000001", 0)]
+    #[case("-0.000000001", 0)]
+    #[case("1.999999999", 1)]
+    #[case("-1.999999999", -1)]
+    #[case("50.25", 50)]
+    #[case("9007199253.999999999", 9_007_199_253)]
+    fn test_int_uses_exact_raw_value(#[case] value: &str, #[case] expected: i64) {
+        let currency = Currency::new("TST9", 9, 0, "Test 9dp", CurrencyType::Crypto);
+        let money = Money::from_decimal(Decimal::from_str(value).unwrap(), currency).unwrap();
+
+        assert_eq!(money.__int__(), MoneyRaw::from(expected));
+    }
+
+    #[rstest]
+    fn test_int_preserves_domain_boundaries() {
+        let currency = Currency::new(
+            "TST",
+            FIXED_PRECISION,
+            0,
+            "Test fixed precision",
+            CurrencyType::Crypto,
+        );
+        let expected_max: MoneyRaw = if cfg!(feature = "high-precision") {
+            17_014_118_346_046
+        } else {
+            9_223_372_036
+        };
+        let expected_min = -expected_max;
+
+        assert_eq!(
+            Money::from_raw(MONEY_RAW_MAX, currency).__int__(),
+            expected_max
+        );
+        assert_eq!(
+            Money::from_raw(MONEY_RAW_MIN, currency).__int__(),
+            expected_min
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "defi")]
+    fn test_int_uses_defi_raw_scale() {
+        let currency = Currency::new(
+            "TST18",
+            crate::defi::WEI_PRECISION,
+            0,
+            "Test 18dp",
+            CurrencyType::Crypto,
+        );
+        let money = Money::from_raw(1_999_999_999_999_999_999, currency);
+
+        assert_eq!(money.__int__(), 1);
+    }
+
+    #[rstest]
+    fn test_py_from_raw_rejects_out_of_range_raw_value() {
+        Python::initialize();
+        Python::attach(|_| {
+            let raw = MONEY_RAW_MAX.saturating_add(1);
+            let error = Money::py_from_raw(raw, Currency::USD()).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "ValueError: `raw` value {raw} exceeded bounds [{MONEY_RAW_MIN}, {MONEY_RAW_MAX}] for Money"
+                )
+            );
+        });
     }
 }

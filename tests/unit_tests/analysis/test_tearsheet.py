@@ -28,18 +28,22 @@ from nautilus_trader.analysis.config import TearsheetEquityChart
 from nautilus_trader.analysis.config import TearsheetMonthlyReturnsChart
 from nautilus_trader.analysis.config import TearsheetRunInfoChart
 from nautilus_trader.analysis.config import TearsheetStatsTableChart
+from nautilus_trader.analysis.config import TearsheetYearlyReturnsChart
 from nautilus_trader.analysis.tearsheet import PLOTLY_AVAILABLE
+from nautilus_trader.analysis.tearsheet import _aggregate_period_returns
 from nautilus_trader.analysis.tearsheet import _calculate_account_returns
 from nautilus_trader.analysis.tearsheet import _create_stats_table
 from nautilus_trader.analysis.tearsheet import _create_tearsheet_figure
 from nautilus_trader.analysis.tearsheet import _normalize_theme_config
 from nautilus_trader.analysis.tearsheet import _resolve_tearsheet_returns
+from nautilus_trader.analysis.tearsheet import _result_account_info
 from nautilus_trader.analysis.tearsheet import create_drawdown_chart
 from nautilus_trader.analysis.tearsheet import create_equity_curve
 from nautilus_trader.analysis.tearsheet import create_monthly_returns_heatmap
 from nautilus_trader.analysis.tearsheet import create_returns_distribution
 from nautilus_trader.analysis.tearsheet import create_tearsheet
 from nautilus_trader.analysis.tearsheet import create_tearsheet_from_stats
+from nautilus_trader.analysis.tearsheet import create_yearly_returns
 from nautilus_trader.analysis.tearsheet import get_chart
 from nautilus_trader.analysis.tearsheet import list_charts
 from nautilus_trader.analysis.tearsheet import register_chart
@@ -83,6 +87,151 @@ def sample_stats():
         "Win Rate": 0.55,
         "Total Return": 0.25,
     }
+
+
+@pytest.fixture
+def two_month_returns():
+    """
+    Two single-day returns of +10%, one in each of two consecutive months.
+
+    The running equity index ends each month at 1.10 then 1.21, so the compounded
+    monthly returns are [10%, 10%] while the simple (fixed-base) monthly returns are
+    [10%, 11%]. Both reconcile to a 21% total return.
+
+    """
+    index = pd.to_datetime(["2024-01-31", "2024-02-29"])
+    return pd.Series([0.10, 0.10], index=index)
+
+
+def test_aggregate_period_returns_compounding_uses_running_base(two_month_returns):
+    # Act
+    result = _aggregate_period_returns(two_month_returns, "ME", compounding=True)
+
+    # Assert
+    assert result.tolist() == pytest.approx([10.0, 10.0])
+
+
+def test_aggregate_period_returns_simple_uses_fixed_initial_base(two_month_returns):
+    # Act
+    result = _aggregate_period_returns(two_month_returns, "ME", compounding=False)
+
+    # Assert
+    assert result.tolist() == pytest.approx([10.0, 11.0])
+
+
+def test_aggregate_period_returns_simple_sums_to_total_return(two_month_returns):
+    # Arrange
+    total = ((1 + two_month_returns).prod() - 1) * 100  # 21%
+
+    # Act
+    simple = _aggregate_period_returns(two_month_returns, "ME", compounding=False)
+    compounded = _aggregate_period_returns(two_month_returns, "ME", compounding=True)
+
+    # Assert
+    assert simple.sum() == pytest.approx(total)
+    assert ((1 + compounded / 100).prod() - 1) * 100 == pytest.approx(total)
+
+
+def test_aggregate_period_returns_simple_is_order_independent():
+    # Arrange: same two returns as the sorted fixture, but rows out of date order
+    unsorted = pd.Series([0.10, 0.10], index=pd.to_datetime(["2024-02-29", "2024-01-31"]))
+
+    # Act
+    result = _aggregate_period_returns(unsorted, "ME", compounding=False)
+
+    # Assert: Jan == 10%, Feb == 11% regardless of input row order
+    assert result.tolist() == pytest.approx([10.0, 11.0])
+
+
+@pytest.mark.parametrize("compounding", [True, False])
+def test_aggregate_period_returns_empty_interior_period_is_zero(compounding):
+    # Arrange: Jan and Mar have returns, Feb has none (an empty interior month)
+    returns = pd.Series(
+        [0.10, 0.10],
+        index=pd.to_datetime(["2024-01-31", "2024-03-31"]),
+    )
+
+    # Act
+    result = _aggregate_period_returns(returns, "ME", compounding=compounding)
+
+    # Assert: the empty month carries no gain (no NaN) in both modes
+    assert list(result.index.month) == [1, 2, 3]
+    assert result.iloc[1] == pytest.approx(0.0)
+    assert not result.isna().any()
+
+
+def test_aggregate_period_returns_single_period_modes_match():
+    # Arrange
+    returns = pd.Series([0.10], index=pd.to_datetime(["2024-01-31"]))
+
+    # Act
+    compounded = _aggregate_period_returns(returns, "ME", compounding=True)
+    simple = _aggregate_period_returns(returns, "ME", compounding=False)
+
+    # Assert
+    assert compounded.tolist() == pytest.approx([10.0])
+    assert simple.tolist() == pytest.approx([10.0])
+
+
+def test_monthly_returns_chart_compounding_kwarg():
+    # Assert
+    assert TearsheetMonthlyReturnsChart().kwargs() == {"compounding": True}
+    assert TearsheetMonthlyReturnsChart(compounding=False).kwargs() == {"compounding": False}
+
+
+def test_yearly_returns_chart_compounding_kwarg():
+    # Assert
+    assert TearsheetYearlyReturnsChart().kwargs() == {"compounding": True}
+    assert TearsheetYearlyReturnsChart(compounding=False).kwargs() == {"compounding": False}
+
+
+def test_create_monthly_returns_heatmap_simple_default_title(two_month_returns):
+    # Act
+    compounded = create_monthly_returns_heatmap(two_month_returns)
+    simple = create_monthly_returns_heatmap(two_month_returns, compounding=False)
+
+    # Assert
+    assert compounded.layout.title.text == "Monthly Returns (%)"
+    assert simple.layout.title.text == "Monthly Returns (% of initial capital)"
+
+
+def test_create_yearly_returns_simple_default_title(two_month_returns):
+    # Act
+    compounded = create_yearly_returns(two_month_returns)
+    simple = create_yearly_returns(two_month_returns, compounding=False)
+
+    # Assert
+    assert compounded.layout.title.text == "Yearly Returns"
+    assert simple.layout.title.text == "Yearly Returns (% of initial capital)"
+
+
+def test_create_monthly_returns_heatmap_explicit_title_preserved(two_month_returns):
+    # Act
+    fig = create_monthly_returns_heatmap(two_month_returns, compounding=False, title="Custom")
+
+    # Assert
+    assert fig.layout.title.text == "Custom"
+
+
+def test_tearsheet_figure_routes_compounding_flag_to_renderer(two_month_returns):
+    # Arrange
+    config = TearsheetConfig(charts=[TearsheetMonthlyReturnsChart(compounding=False)])
+
+    # Act
+    fig = _create_tearsheet_figure(
+        stats_returns={},
+        stats_general={},
+        stats_pnls={},
+        returns=two_month_returns,
+        title="Routing",
+        config=config,
+    )
+
+    # Assert
+    heatmaps = [trace for trace in fig.data if trace.type == "heatmap"]
+    assert len(heatmaps) == 1
+    # Jan (fixed base) == 10%, Feb (fixed base) == 11%
+    assert heatmaps[0].z[0] == pytest.approx([10.0, 11.0])
 
 
 def test_create_equity_curve_with_valid_data(sample_returns, tmp_path):
@@ -364,6 +513,134 @@ def test_resolve_tearsheet_returns_falls_back_to_analyzer_returns(monkeypatch):
 
     # Assert
     pd.testing.assert_series_equal(result, analyzer_returns)
+
+
+def test_create_tearsheet_accepts_pyo3_backtest_result(monkeypatch):
+    # Arrange
+    result = SimpleNamespace(
+        run_config_id="run-001",
+        run_id="11111111-1111-4111-8111-111111111111",
+        run_started=1_704_067_200_000_000_000,
+        run_finished=1_704_067_202_000_000_000,
+        backtest_start=1_704_067_200_000_000_000,
+        backtest_end=1_704_067_201_000_000_000,
+        elapsed_time_secs=86_400.0,
+        iterations=3,
+        total_events=4,
+        total_orders=5,
+        total_positions=6,
+        stats_pnls={"USD": {"PnL (total)": 10.0}, "AUD": {"PnL (total)": 1.0}},
+        stats_returns={"Sharpe Ratio (252 days)": 1.5},
+        stats_general={"Win Rate": 0.5},
+        returns_series={
+            1_704_067_200_000_000_000: 0.01,
+            1_704_153_600_000_000_000: -0.02,
+        },
+        summary={"account.XCME.id": "XCME-001"},
+    )
+    cache = object()
+    account_report = pd.DataFrame(
+        {
+            "currency": ["USD", "USD", "AUD", "AUD"],
+            "total": ["1000.00", "1010.00", "2000.00", "2020.00"],
+        },
+        index=pd.to_datetime(
+            ["2024-01-01", "2024-01-02", "2024-01-01", "2024-01-02"],
+            utc=True,
+        ),
+    )
+
+    class MockNode:
+        configs = [SimpleNamespace(id="run-001", dispose_on_completion=False)]
+
+        def get_engine_cache(self, run_config_id):
+            assert run_config_id == "run-001"
+            return cache
+
+        def generate_account_report(self, run_config_id, account_id):
+            assert run_config_id == "run-001"
+            assert str(account_id) == "XCME-001"
+            return account_report
+
+        def generate_fills_report(self, run_config_id):
+            assert run_config_id == "run-001"
+            return pd.DataFrame({"instrument_id": ["ESM4.XCME"]})
+
+    captured = {}
+
+    def fake_create_tearsheet_from_stats(**kwargs):
+        captured.update(kwargs)
+        return "html"
+
+    monkeypatch.setattr(
+        "nautilus_trader.analysis.tearsheet.create_tearsheet_from_stats",
+        fake_create_tearsheet_from_stats,
+    )
+
+    # Act
+    html = create_tearsheet(
+        result,
+        output_path=None,
+        node=MockNode(),
+        currency="USD",
+        config=TearsheetConfig(charts=[TearsheetStatsTableChart()]),
+    )
+
+    # Assert
+    assert html == "html"
+    assert captured["stats_pnls"] == {"USD": {"PnL (total)": 10.0}}
+    assert captured["run_info"]["Total orders"] == "5"
+    assert captured["run_info"]["Elapsed time"] == "0 days 00:00:02"
+    assert captured["account_info"] == {
+        "Starting balance (XCME, USD)": "1000.0",
+        "Ending balance (XCME, USD)": "1010.0",
+    }
+    assert captured["engine"].cache is cache
+    assert captured["engine"].generate_fills_report().to_dict("records") == [
+        {"instrument_id": "ESM4.XCME"},
+    ]
+    assert captured["returns"].to_dict() == {
+        pd.Timestamp("2024-01-01T00:00:00Z"): 0.01,
+        pd.Timestamp("2024-01-02T00:00:00Z"): -0.02,
+    }
+
+
+def test_create_tearsheet_rejects_disposed_pyo3_node_state():
+    # Arrange
+    result = SimpleNamespace(run_config_id="run-001", returns_series={}, stats_returns={})
+    node = SimpleNamespace(
+        configs=[SimpleNamespace(id="run-001", dispose_on_completion=True)],
+    )
+
+    # Act and assert
+    with pytest.raises(ValueError, match="dispose_on_completion=False"):
+        create_tearsheet(
+            result,
+            output_path=None,
+            node=node,
+            config=TearsheetConfig(charts=[TearsheetStatsTableChart()]),
+        )
+
+
+def test_result_account_info_filters_summary_balance_by_currency():
+    # Arrange
+    result = SimpleNamespace(
+        summary={
+            "account.XCME.balance.USD.total": "1010.0",
+            "account.XCME.balance.AUD.total": "2020.0",
+        },
+    )
+
+    # Act
+    account_info = _result_account_info(
+        result,
+        node=None,
+        run_config_id=None,
+        currency="USD",
+    )
+
+    # Assert
+    assert account_info == {"Ending balance (XCME, USD)": "1010.0"}
 
 
 def test_resolve_tearsheet_returns_prefers_analyzer_portfolio_returns(monkeypatch):

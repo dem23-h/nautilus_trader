@@ -17,7 +17,7 @@
 
 use std::{
     future::Future,
-    sync::{Arc, Mutex},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -27,7 +27,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::ExecutionClient,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::{get_runtime, runner::get_exec_event_sender, task::TaskHandles},
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -37,7 +37,7 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    MUTEX_POISONED, UnixNanos,
+    UnixNanos,
     params::Params,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
@@ -45,6 +45,7 @@ use nautilus_live::{ExecutionClientCore, ExecutionEventEmitter};
 use nautilus_model::{
     accounts::AccountAny,
     enums::{AccountType, OmsType, OrderSide, OrderType, TimeInForce, TrailingOffsetType},
+    events::OrderDeniedReason,
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TraderId, Venue, VenueOrderId,
     },
@@ -61,7 +62,7 @@ use crate::{
     common::{
         consts::{
             OKX_CONDITIONAL_ORDER_TYPES, OKX_SUCCESS_CODE, OKX_VENUE, OKX_WS_HEARTBEAT_SECS,
-            resolve_instrument_families, validate_okx_client_order_id,
+            resolve_instrument_families, should_retry_error_code, validate_okx_client_order_id,
         },
         enums::{OKXInstrumentType, OKXMarginMode, OKXTradeMode, is_advance_algo_order},
         parse::{is_okx_spread_symbol, nanos_to_datetime, okx_instrument_type_from_symbol},
@@ -92,7 +93,7 @@ pub struct OKXExecutionClient {
     ws_stream_handle: Option<JoinHandle<()>>,
     ws_business_stream_handle: Option<JoinHandle<()>>,
     ws_dispatch_state: Arc<WsDispatchState>,
-    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
+    pending_tasks: TaskHandles,
 }
 
 impl OKXExecutionClient {
@@ -106,7 +107,7 @@ impl OKXExecutionClient {
             config.api_key.clone(),
             config.api_secret.clone(),
             config.api_passphrase.clone(),
-            config.base_url_http.clone(),
+            Some(config.http_base_url()),
             config.http_timeout_secs,
             config.max_retries,
             config.retry_delay_initial_ms,
@@ -124,7 +125,7 @@ impl OKXExecutionClient {
             config.api_passphrase.clone(),
             Some(account_id),
             Some(OKX_WS_HEARTBEAT_SECS),
-            None,
+            config.auth_timeout_secs,
             config.transport_backend,
             config.proxy_url.clone(),
         )
@@ -137,7 +138,7 @@ impl OKXExecutionClient {
             config.api_passphrase.clone(),
             Some(account_id),
             Some(OKX_WS_HEARTBEAT_SECS),
-            None,
+            config.auth_timeout_secs,
             config.transport_backend,
             config.proxy_url.clone(),
         )
@@ -171,7 +172,7 @@ impl OKXExecutionClient {
             ws_stream_handle: None,
             ws_business_stream_handle: None,
             ws_dispatch_state,
-            pending_tasks: Mutex::new(Vec::new()),
+            pending_tasks: TaskHandles::default(),
         })
     }
 
@@ -307,10 +308,7 @@ impl OKXExecutionClient {
     fn submit_regular_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
         let order = {
             let cache = self.core.cache();
-            cache
-                .order(&cmd.client_order_id)
-                .map(|o| o.clone())
-                .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?
+            cache.try_order_owned(&cmd.client_order_id)?
         };
         let ws_private = self.ws_private.clone();
         let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
@@ -346,6 +344,9 @@ impl OKXExecutionClient {
         let speed_bump = get_param_as_string(&cmd.params, "speed_bump");
         let outcome = get_param_as_string(&cmd.params, "outcome");
         let slippage_pct = get_param_as_string(&cmd.params, "slippage_pct");
+        let rpi = get_param_as_bool(&cmd.params, "rpi");
+        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
 
         self.spawn_task("submit_order", async move {
             let result = ws_private
@@ -371,6 +372,9 @@ impl OKXExecutionClient {
                     speed_bump,
                     outcome,
                     slippage_pct,
+                    rpi,
+                    rpi_taker_access,
+                    rpi_px_round,
                 )
                 .await;
 
@@ -386,7 +390,7 @@ impl OKXExecutionClient {
                         false,
                     );
                 } else {
-                    log::error!(
+                    log::warn!(
                         "Ambiguous submit failure for {client_order_id}, awaiting reconciliation: {e}"
                     );
                 }
@@ -402,10 +406,7 @@ impl OKXExecutionClient {
     fn submit_order_http(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
         let order = {
             let cache = self.core.cache();
-            cache
-                .order(&cmd.client_order_id)
-                .map(|o| o.clone())
-                .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?
+            cache.try_order_owned(&cmd.client_order_id)?
         };
         let http_client = self.http_client.clone();
         let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
@@ -431,6 +432,9 @@ impl OKXExecutionClient {
         let time_in_force = order.time_in_force();
         let price = order.price();
         let is_post_only = order.is_post_only();
+        let rpi = get_param_as_bool(&cmd.params, "rpi");
+        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
 
         self.spawn_task("submit_order_http", async move {
             let result = http_client
@@ -453,13 +457,14 @@ impl OKXExecutionClient {
                     None,
                     None,
                     None,
+                    rpi,
+                    rpi_taker_access,
+                    rpi_px_round,
                 )
                 .await;
 
             if let Err(e) = result {
-                if is_okx_http_structured_venue_rejection(&e)
-                    || is_okx_http_local_command_failure(&e)
-                {
+                if is_okx_http_submit_rejection(&e) || is_okx_http_local_command_failure(&e) {
                     let ts_event = clock.get_time_ns();
                     emitter.emit_order_rejected_event(
                         strategy_id,
@@ -470,7 +475,7 @@ impl OKXExecutionClient {
                         false,
                     );
                 } else {
-                    log::error!(
+                    log::warn!(
                         "Ambiguous HTTP submit failure for {client_order_id}, awaiting reconciliation: {e}"
                     );
                 }
@@ -486,10 +491,7 @@ impl OKXExecutionClient {
     fn submit_conditional_order(&self, cmd: &SubmitOrder) -> anyhow::Result<()> {
         let order = {
             let cache = self.core.cache();
-            cache
-                .order(&cmd.client_order_id)
-                .map(|o| o.clone())
-                .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?
+            cache.try_order_owned(&cmd.client_order_id)?
         };
         let http_client = self.http_client.clone();
         let trade_mode = self.trade_mode_for_order(cmd.instrument_id, &cmd.params);
@@ -571,9 +573,7 @@ impl OKXExecutionClient {
                 .await;
 
             if let Err(e) = result {
-                if is_okx_http_structured_venue_rejection(&e)
-                    || is_okx_http_local_command_failure(&e)
-                {
+                if is_okx_http_submit_rejection(&e) || is_okx_http_local_command_failure(&e) {
                     let ts_event = clock.get_time_ns();
                     emitter.emit_order_rejected_event(
                         strategy_id,
@@ -584,7 +584,7 @@ impl OKXExecutionClient {
                         false,
                     );
                 } else {
-                    log::error!(
+                    log::warn!(
                         "Ambiguous algo submit failure for {client_order_id}, awaiting reconciliation: {e}"
                     );
                 }
@@ -621,7 +621,7 @@ impl OKXExecutionClient {
                         command.client_order_id
                     );
                 } else {
-                    log::error!(
+                    log::warn!(
                         "Ambiguous cancel failure for {}, awaiting reconciliation: {e}",
                         command.client_order_id
                     );
@@ -667,7 +667,7 @@ impl OKXExecutionClient {
                         command.client_order_id
                     );
                 } else {
-                    log::error!(
+                    log::warn!(
                         "Ambiguous HTTP cancel failure for {}, awaiting reconciliation: {e}",
                         command.client_order_id
                     );
@@ -721,7 +721,7 @@ impl OKXExecutionClient {
                     None
                 }
                 Err(e) => {
-                    log::error!(
+                    log::warn!(
                         "Ambiguous algo cancel failure for {}, awaiting reconciliation: {e}",
                         command.client_order_id
                     );
@@ -832,9 +832,7 @@ impl OKXExecutionClient {
             }
         });
 
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        tasks.retain(|handle| !handle.is_finished());
-        tasks.push(handle);
+        self.pending_tasks.push(handle);
     }
 
     // Partitions algo cancel orders into regular and advance, then spawns
@@ -925,11 +923,7 @@ impl OKXExecutionClient {
     }
 
     fn abort_pending_tasks(&self) {
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-
-        for handle in tasks.drain(..) {
-            handle.abort();
-        }
+        self.pending_tasks.abort_all();
     }
 
     /// Polls the cache until the account is registered or timeout is reached.
@@ -1050,7 +1044,7 @@ impl ExecutionClient for OKXExecutionClient {
                         continue;
                     }
 
-                    log::info!(
+                    log::debug!(
                         "Loaded {} {instrument_type:?} instruments",
                         instruments.len()
                     );
@@ -1077,7 +1071,7 @@ impl ExecutionClient for OKXExecutionClient {
                             continue;
                         }
 
-                        log::info!(
+                        log::debug!(
                             "Loaded {} {instrument_type:?} instruments for family {family}",
                             instruments.len()
                         );
@@ -1180,11 +1174,11 @@ impl ExecutionClient for OKXExecutionClient {
         }
 
         for inst_type in &instrument_types {
-            log::info!("Subscribing to orders channel for {inst_type:?}");
+            log::debug!("Subscribing to orders channel for {inst_type:?}");
             self.ws_private.subscribe_orders(*inst_type).await?;
 
             if self.config.use_fills_channel {
-                log::info!("Subscribing to fills channel for {inst_type:?}");
+                log::debug!("Subscribing to fills channel for {inst_type:?}");
                 if let Err(e) = self.ws_private.subscribe_fills(*inst_type).await {
                     log::warn!("Failed to subscribe to fills channel ({inst_type:?}): {e}");
                 }
@@ -1194,7 +1188,7 @@ impl ExecutionClient for OKXExecutionClient {
         self.ws_private.subscribe_account().await?;
 
         if self.config.load_spreads {
-            log::info!("Subscribing to Nitro spread orders channel");
+            log::debug!("Subscribing to Nitro spread orders channel");
             self.ws_business.subscribe_spread_orders().await?;
         }
 
@@ -1213,7 +1207,7 @@ impl ExecutionClient for OKXExecutionClient {
             .context("failed to request OKX account state")?;
 
         if !account_state.balances.is_empty() {
-            log::info!(
+            log::debug!(
                 "Received account state with {} balance(s)",
                 account_state.balances.len()
             );
@@ -1427,7 +1421,7 @@ impl ExecutionClient for OKXExecutionClient {
                 ws_private.cache_inst_id_codes(all_inst_id_codes.clone());
                 ws_business.cache_instruments(&all_instruments);
                 ws_business.cache_inst_id_codes(all_inst_id_codes);
-                log::info!("Instruments initialized");
+                log::debug!("Instruments initialized");
             }
         });
 
@@ -1825,9 +1819,7 @@ impl ExecutionClient for OKXExecutionClient {
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         let route = {
             let cache = self.core.cache();
-            let order = cache
-                .order(&cmd.client_order_id)
-                .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
+            let order = cache.try_order(&cmd.client_order_id)?;
 
             if order.is_closed() {
                 log::warn!("Cannot submit closed order {}", order.client_order_id());
@@ -1835,7 +1827,8 @@ impl ExecutionClient for OKXExecutionClient {
             }
 
             if let Err(reason) = validate_okx_client_order_id(cmd.client_order_id.as_str()) {
-                self.emitter.emit_order_denied(&order, &reason);
+                let denied = OrderDeniedReason::InvalidClientOrderId { detail: reason };
+                self.emitter.emit_order_denied(&order, &denied.to_string());
                 return Ok(());
             }
 
@@ -1858,12 +1851,14 @@ impl ExecutionClient for OKXExecutionClient {
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
         if is_spread_instrument(cmd.instrument_id) {
             let cache = self.core.cache();
+            let denied = OrderDeniedReason::UnsupportedOrderList {
+                detail: "spread instruments are not supported in order lists".to_string(),
+            }
+            .to_string();
+
             for client_order_id in &cmd.order_list.client_order_ids {
-                let order = cache
-                    .order(client_order_id)
-                    .ok_or_else(|| anyhow::anyhow!("Order not found: {client_order_id}"))?;
-                self.emitter
-                    .emit_order_denied(&order, "OKX spread order lists are not supported");
+                let order = cache.try_order(client_order_id)?;
+                self.emitter.emit_order_denied(&order, &denied);
             }
             return Ok(());
         }
@@ -1886,31 +1881,24 @@ impl ExecutionClient for OKXExecutionClient {
             })
             .collect();
 
-        if let Some((first_offender, first_reason)) = invalid.first() {
+        if !invalid.is_empty() {
+            let order_list_id = cmd.order_list.id;
             for client_order_id in &cmd.order_list.client_order_ids {
-                let order = cache
-                    .order(client_order_id)
-                    .ok_or_else(|| anyhow::anyhow!("Order not found: {client_order_id}"))?;
-                let reason = invalid
+                let order = cache.try_order(client_order_id)?;
+                let denied = invalid
                     .iter()
                     .find(|(cid, _)| cid == client_order_id)
                     .map_or_else(
-                        || {
-                            format!(
-                                "OKX order list denied: sibling {first_offender} {first_reason}"
-                            )
-                        },
-                        |(_, r)| r.clone(),
+                        || OrderDeniedReason::OrderListDenied { order_list_id },
+                        |(_, r)| OrderDeniedReason::InvalidClientOrderId { detail: r.clone() },
                     );
-                self.emitter.emit_order_denied(&order, &reason);
+                self.emitter.emit_order_denied(&order, &denied.to_string());
             }
             return Ok(());
         }
 
         for client_order_id in &cmd.order_list.client_order_ids {
-            let order = cache
-                .order(client_order_id)
-                .ok_or_else(|| anyhow::anyhow!("Order not found: {client_order_id}"))?;
+            let order = cache.try_order(client_order_id)?;
 
             if self.is_conditional_order(order.order_type()) {
                 anyhow::bail!("Conditional orders not supported in order lists: {client_order_id}");
@@ -1928,6 +1916,9 @@ impl ExecutionClient for OKXExecutionClient {
         let mut batch_orders = Vec::new();
         let speed_bump = get_param_as_string(&cmd.params, "speed_bump");
         let outcome = get_param_as_string(&cmd.params, "outcome");
+        let rpi = get_param_as_bool(&cmd.params, "rpi");
+        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
 
         for client_order_id in &cmd.order_list.client_order_ids {
             let order = cache.order(client_order_id).expect("validated above");
@@ -1947,6 +1938,9 @@ impl ExecutionClient for OKXExecutionClient {
                 Some(order.is_reduce_only()),
                 speed_bump.clone(),
                 outcome.clone(),
+                rpi,
+                rpi_taker_access,
+                rpi_px_round,
             ));
 
             self.ws_dispatch_state.order_identities.insert(
@@ -1994,7 +1988,7 @@ impl ExecutionClient for OKXExecutionClient {
                         );
                     }
                 } else {
-                    log::error!(
+                    log::warn!(
                         "Ambiguous batch submit failure for {} orders on {instrument_id}, awaiting reconciliation: {e}",
                         client_order_ids.len()
                     );
@@ -2029,6 +2023,8 @@ impl ExecutionClient for OKXExecutionClient {
         let new_px_usd = get_param_as_string(&cmd.params, "px_usd");
         let new_px_vol = get_param_as_string(&cmd.params, "px_vol");
         let speed_bump = get_param_as_string(&cmd.params, "speed_bump");
+        let rpi_taker_access = get_param_as_bool(&cmd.params, "rpi_taker_access");
+        let rpi_px_round = get_param_as_bool(&cmd.params, "rpi_px_round");
 
         let emitter = self.emitter.clone();
         let clock = self.clock;
@@ -2046,6 +2042,8 @@ impl ExecutionClient for OKXExecutionClient {
                     new_px_usd,
                     new_px_vol,
                     speed_bump,
+                    rpi_taker_access,
+                    rpi_px_round,
                 )
                 .await;
 
@@ -2061,7 +2059,7 @@ impl ExecutionClient for OKXExecutionClient {
                         ts_event,
                     );
                 } else {
-                    log::error!(
+                    log::warn!(
                         "Ambiguous modify failure for {}, awaiting reconciliation: {e}",
                         command.client_order_id
                     );
@@ -2171,7 +2169,7 @@ impl ExecutionClient for OKXExecutionClient {
                                     regular_cancel_contexts.len()
                                 );
                             } else {
-                                log::error!(
+                                log::warn!(
                                     "Ambiguous batch cancel failure for {} orders, awaiting reconciliation: {e}",
                                     regular_cancel_contexts.len()
                                 );
@@ -2286,7 +2284,7 @@ impl ExecutionClient for OKXExecutionClient {
                             cancel_contexts.len()
                         );
                     } else {
-                        log::error!(
+                        log::warn!(
                             "Ambiguous batch cancel failure for {} orders, awaiting reconciliation: {e}",
                             cancel_contexts.len()
                         );
@@ -2350,7 +2348,7 @@ impl ExecutionClient for OKXExecutionClient {
                                 "HTTP cancel command failed local validation for {client_order_id}: {e}"
                             );
                         } else {
-                            log::error!(
+                            log::warn!(
                                 "Ambiguous HTTP cancel failure for {client_order_id}, awaiting reconciliation: {e}"
                             );
                         }
@@ -2380,6 +2378,19 @@ enum CancelAllOrdersRoute {
 
 fn is_okx_http_structured_venue_rejection(error: &OKXHttpError) -> bool {
     matches!(error, OKXHttpError::OkxError { .. })
+}
+
+fn is_okx_http_submit_rejection(error: &OKXHttpError) -> bool {
+    match error {
+        OKXHttpError::OkxError {
+            error_code,
+            message,
+        } => {
+            !matches!(error_code.as_str(), "50004" | "51149")
+                && (should_retry_error_code(error_code) || !is_ambiguous_okx_http_failure(message))
+        }
+        _ => false,
+    }
 }
 
 fn is_okx_http_local_command_failure(error: &OKXHttpError) -> bool {
@@ -2449,6 +2460,10 @@ fn get_param_as_string(params: &Option<Params>, key: &str) -> Option<String> {
                 .or_else(|| v.as_f64().map(|n| n.to_string()))
         })
     })
+}
+
+fn get_param_as_bool(params: &Option<Params>, key: &str) -> Option<bool> {
+    params.as_ref().and_then(|params| params.get_bool(key))
 }
 
 fn supports_algo_orders(instrument_type: OKXInstrumentType) -> bool {
@@ -2531,6 +2546,36 @@ mod tests {
         #[case] expected: bool,
     ) {
         assert_eq!(supports_algo_orders(instrument_type), expected);
+    }
+
+    #[rstest]
+    #[case::accepted_despite_timeout("51149", "Order timed out. Please try again.", false)]
+    #[case::documented_unknown_outcome(
+        "50004",
+        "API endpoint request timeout; please check the request result",
+        false
+    )]
+    #[case::unknown_timeout_code("59999", "Order request timed out", false)]
+    #[case::temporary_system_rejection("50013", "System busy, please retry later", true)]
+    #[case::parameter_rejection("51000", "Parameter state error", true)]
+    fn test_is_okx_http_submit_rejection(
+        #[case] error_code: &str,
+        #[case] message: &str,
+        #[case] expected: bool,
+    ) {
+        let error = OKXHttpError::OkxError {
+            error_code: error_code.to_string(),
+            message: message.to_string(),
+        };
+
+        assert_eq!(is_okx_http_submit_rejection(&error), expected);
+    }
+
+    #[rstest]
+    fn test_is_okx_http_submit_rejection_ignores_local_error() {
+        let error = OKXHttpError::ValidationError("invalid quantity".to_string());
+
+        assert!(!is_okx_http_submit_rejection(&error));
     }
 
     #[rstest]

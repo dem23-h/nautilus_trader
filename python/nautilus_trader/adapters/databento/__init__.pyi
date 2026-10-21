@@ -8,23 +8,37 @@ import typing
 from nautilus_trader import model
 
 __all__ = [
-    "DatabentoDataClient",
     "DatabentoDataClientFactory",
     "DatabentoDataLoader",
-    "DatabentoHistoricalClient",
     "DatabentoImbalance",
-    "DatabentoLiveClient",
     "DatabentoLiveClientConfig",
     "DatabentoPublisher",
     "DatabentoStatisticType",
     "DatabentoStatisticUpdateAction",
     "DatabentoStatistics",
-    "DatabentoSubscriptionAck",
     "get_databento_arrow_schema_map",
 ]
 
 @typing.final
-class DatabentoDataClient: ...
+class DatabentoDataClient:
+    def __init__(
+        self,
+        client_id: model.ClientId,
+        api_key: str,
+        publishers_filepath: str | os.PathLike | pathlib.Path,
+        use_exchange_as_venue: bool = True,
+        bars_timestamp_on_close: bool = True,
+    ) -> None: ...
+    @property
+    def client_id(self) -> model.ClientId: ...
+    @property
+    def is_connected(self) -> bool: ...
+    @property
+    def is_disconnected(self) -> bool: ...
+    @property
+    def api_key(self) -> str: ...
+    @property
+    def api_key_masked(self) -> str: ...
 
 @typing.final
 class DatabentoDataClientFactory:
@@ -57,6 +71,7 @@ class DatabentoDataLoader:
         filepath: str | os.PathLike | pathlib.Path,
         use_exchange_as_venue: bool,
         skip_on_error: bool = False,
+        expiration_overrides: typing.Mapping[str, typing.Mapping[str, str]] | None = None,
     ) -> typing.Any: ...
     def load_order_book_deltas(
         self,
@@ -239,6 +254,7 @@ class DatabentoHistoricalClient:
         end: int | None = None,
         limit: int | None = None,
         price_precision: int | None = None,
+        schema: str | None = None,
     ) -> typing.Any: ...
     def get_range_bars(
         self,
@@ -322,7 +338,7 @@ class DatabentoImbalance:
     def ts_init(self) -> int: ...
     @staticmethod
     def from_dict(values: dict) -> DatabentoImbalance: ...
-    def to_dict(self) -> typing.Any: ...
+    def to_dict(self) -> dict: ...
 
 @typing.final
 class DatabentoLiveClient:
@@ -335,6 +351,8 @@ class DatabentoLiveClient:
         bars_timestamp_on_close: bool | None = None,
         reconnect_timeout_mins: int | None = None,
     ) -> None: ...
+    @property
+    def dataset(self) -> str: ...
     def is_running(self) -> bool: ...
     def is_closed(self) -> bool: ...
     def subscribe(
@@ -351,12 +369,21 @@ class DatabentoLiveClient:
 
 @typing.final
 class DatabentoLiveClientConfig:
+    @property
+    def publishers_filepath(self) -> pathlib.Path: ...
+    @property
+    def use_exchange_as_venue(self) -> bool: ...
+    @property
+    def bars_timestamp_on_close(self) -> bool: ...
+    @property
+    def venue_dataset_map(self) -> dict[str, str]: ...
     def __init__(
         self,
         api_key: str,
         publishers_filepath: str | os.PathLike | pathlib.Path,
         use_exchange_as_venue: bool = False,
         bars_timestamp_on_close: bool = True,
+        venue_dataset_map: typing.Mapping[str, str] | None = None,
     ) -> None: ...
 
 @typing.final
@@ -393,7 +420,7 @@ class DatabentoStatistics:
     def ts_init(self) -> int: ...
     @staticmethod
     def from_dict(values: dict) -> DatabentoStatistics: ...
-    def to_dict(self) -> typing.Any: ...
+    def to_dict(self) -> dict: ...
 
 @typing.final
 class DatabentoSubscriptionAck: ...

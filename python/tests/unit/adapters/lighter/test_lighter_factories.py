@@ -107,13 +107,17 @@ def test_lighter_exec_tester_limit_sells_stay_disabled(
             captured["exec_tester_kwargs"] = kwargs
 
     class CapturingNode:
-        def add_native_strategy(self, type_name: str, config: object) -> None:
+        def add_builtin_strategy(self, type_name: str, config: object) -> None:
             captured["strategy_type_name"] = type_name
             captured["strategy_config"] = config
 
     class CapturingBuilder:
         def with_reconciliation(self, reconciliation: bool) -> "CapturingBuilder":
             captured["reconciliation"] = reconciliation
+            return self
+
+        def with_exec_engine_config(self, config: object) -> "CapturingBuilder":
+            captured["exec_engine_config"] = config
             return self
 
         def with_risk_engine_config(self, config: LiveRiskEngineConfig) -> "CapturingBuilder":

@@ -24,6 +24,8 @@ use nautilus_model::{
 };
 use sqlx::{FromRow, Row, postgres::PgRow};
 
+use crate::sql::models::i64_to_u64;
+
 #[derive(Debug)]
 pub struct PositionSnapshotModel(pub PositionSnapshot);
 
@@ -81,13 +83,15 @@ impl<'r> FromRow<'r, PgRow> for PositionSnapshotModel {
             });
         let duration_ns: Option<u64> = row
             .try_get::<Option<i64>, _>("duration_ns")?
-            .map(|value| value as u64);
+            .map(|value| i64_to_u64(value, "duration_ns"))
+            .transpose()?;
         let ts_opened = row.try_get::<String, _>("ts_opened").map(UnixNanos::from)?;
         let ts_closed: Option<UnixNanos> = row
             .try_get::<Option<String>, _>("ts_closed")?
             .map(UnixNanos::from);
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
         let ts_last = row.try_get::<String, _>("ts_last").map(UnixNanos::from)?;
+        let replay_state = row.try_get::<Option<serde_json::Value>, _>("replay_state")?;
 
         let snapshot = PositionSnapshot {
             trader_id,
@@ -116,6 +120,7 @@ impl<'r> FromRow<'r, PgRow> for PositionSnapshotModel {
             ts_closed,
             ts_last,
             ts_init,
+            replay_state,
         };
 
         Ok(Self(snapshot))

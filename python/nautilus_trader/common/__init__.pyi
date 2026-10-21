@@ -21,7 +21,6 @@ __all__ = [
     "CustomData",
     "DataActor",
     "DataActorConfig",
-    "DatabaseConfig",
     "Environment",
     "FifoCache",
     "FileWriterConfig",
@@ -36,6 +35,7 @@ __all__ = [
     "MessageBus",
     "MessageBusConfig",
     "MessageBusListener",
+    "OrderFactory",
     "SerializationEncoding",
     "Signal",
     "TimeEvent",
@@ -58,7 +58,11 @@ class BusMessage:
     @property
     def topic(self) -> str: ...
     @property
+    def payload_type(self) -> str: ...
+    @property
     def payload(self) -> bytes: ...
+    @property
+    def encoding(self) -> SerializationEncoding: ...
 
 @typing.final
 class CacheConfig:
@@ -116,66 +120,44 @@ class CustomData:
     @property
     def ts_init(self) -> int: ...
 
-@typing.final
 class DataActorConfig:
     def __init__(
         self,
         actor_id: model.ActorId | None = None,
         log_events: bool = True,
         log_commands: bool = True,
-    ) -> None: ...
-
-@typing.final
-class DatabaseConfig:
-    def __init__(
-        self,
-        database_type: str | None = None,
-        host: str | None = None,
-        port: int | None = None,
-        username: str | None = None,
-        password: str | None = None,
-        ssl: bool | None = None,
-        connection_timeout: int | None = None,
-        response_timeout: int | None = None,
-        number_of_retries: int | None = None,
-        exponent_base: int | None = None,
-        max_delay: int | None = None,
-        factor: int | None = None,
+        _kwargs: dict | None = ...,
     ) -> None: ...
     @property
-    def database_type(self) -> str: ...
+    def actor_id(self) -> model.ActorId | None: ...
+    @actor_id.setter
+    def actor_id(self, actor_id: model.ActorId | None) -> None: ...
     @property
-    def host(self) -> str | None: ...
+    def log_events(self) -> bool: ...
+    @log_events.setter
+    def log_events(self, log_events: bool) -> None: ...
     @property
-    def port(self) -> int | None: ...
-    @property
-    def username(self) -> str | None: ...
-    @property
-    def password(self) -> str | None: ...
-    @property
-    def ssl(self) -> bool: ...
-    @property
-    def connection_timeout(self) -> int: ...
-    @property
-    def response_timeout(self) -> int: ...
-    @property
-    def number_of_retries(self) -> int: ...
-    @property
-    def exponent_base(self) -> int: ...
-    @property
-    def max_delay(self) -> int: ...
-    @property
-    def factor(self) -> int: ...
+    def log_commands(self) -> bool: ...
+    @log_commands.setter
+    def log_commands(self, log_commands: bool) -> None: ...
 
 @typing.final
 class FileWriterConfig:
-    def __init__(
-        self,
+    @property
+    def directory(self) -> str | None: ...
+    @property
+    def file_name(self) -> str | None: ...
+    @property
+    def file_format(self) -> str | None: ...
+    @property
+    def file_rotate(self) -> tuple[int, int] | None: ...
+    def __new__(
+        cls,
         directory: str | None = None,
         file_name: str | None = None,
         file_format: str | None = None,
         file_rotate: tuple[int, int] | None = None,
-    ) -> None: ...
+    ) -> FileWriterConfig: ...
 
 @typing.final
 class ImportableActorConfig:
@@ -192,8 +174,30 @@ class LogGuard: ...
 
 @typing.final
 class LoggerConfig:
-    def __init__(
-        self,
+    @property
+    def stdout_level(self) -> LogLevel: ...
+    @property
+    def fileout_level(self) -> LogLevel: ...
+    @property
+    def component_levels(self) -> dict[str, str]: ...
+    @property
+    def is_colored(self) -> bool: ...
+    @property
+    def print_config(self) -> bool: ...
+    @property
+    def bypass_logging(self) -> bool: ...
+    @property
+    def log_components_only(self) -> bool: ...
+    @property
+    def file_config(self) -> FileWriterConfig | None: ...
+    @property
+    def clear_log_file(self) -> bool: ...
+    @property
+    def fileout_sync_on_flush(self) -> bool: ...
+    @property
+    def buffered_stdout(self) -> bool: ...
+    def __new__(
+        cls,
         stdout_level: LogLevel | None = None,
         fileout_level: LogLevel | None = None,
         component_levels: typing.Mapping[str, str] | None = None,
@@ -205,7 +209,7 @@ class LoggerConfig:
         clear_log_file: bool | None = None,
         fileout_sync_on_flush: bool | None = None,
         buffered_stdout: bool | None = None,
-    ) -> None: ...
+    ) -> LoggerConfig: ...
     @staticmethod
     def from_spec(spec: str) -> LoggerConfig: ...
 
@@ -213,11 +217,13 @@ class LoggerConfig:
 class MessageBusConfig:
     def __init__(
         self,
-        database: DatabaseConfig | None = None,
         encoding: SerializationEncoding | None = None,
+        encoding_market_data: SerializationEncoding | None = None,
+        encoding_builtin: SerializationEncoding | None = None,
         timestamps_as_iso8601: bool | None = None,
         buffer_interval_ms: int | None = None,
         autotrim_mins: int | None = None,
+        autotrim_maxlen: int | None = None,
         use_trader_prefix: bool | None = None,
         use_trader_id: bool | None = None,
         use_instance_id: bool | None = None,
@@ -228,15 +234,19 @@ class MessageBusConfig:
         heartbeat_interval_secs: int | None = None,
     ) -> None: ...
     @property
-    def database(self) -> DatabaseConfig | None: ...
-    @property
     def encoding(self) -> SerializationEncoding: ...
+    @property
+    def encoding_market_data(self) -> SerializationEncoding | None: ...
+    @property
+    def encoding_builtin(self) -> SerializationEncoding | None: ...
     @property
     def timestamps_as_iso8601(self) -> bool: ...
     @property
     def buffer_interval_ms(self) -> int | None: ...
     @property
     def autotrim_mins(self) -> int | None: ...
+    @property
+    def autotrim_maxlen(self) -> int | None: ...
     @property
     def use_trader_prefix(self) -> bool: ...
     @property
@@ -268,6 +278,12 @@ class Cache:
     def __init__(self, config: CacheConfig | None = None) -> None: ...
     def reset(self) -> None: ...
     def dispose(self) -> None: ...
+    def purge_closed_orders(self, ts_now: int, buffer_secs: int = 0) -> None: ...
+    def purge_closed_positions(self, ts_now: int, buffer_secs: int = 0) -> None: ...
+    def purge_order(self, client_order_id: model.ClientOrderId) -> None: ...
+    def purge_position(self, position_id: model.PositionId) -> None: ...
+    def purge_instrument(self, instrument_id: model.InstrumentId) -> None: ...
+    def purge_account_events(self, ts_now: int, lookback_secs: int = 0) -> None: ...
     def get(self, key: str) -> list[int] | None: ...
     def add(self, key: str, value: typing.Sequence[int]) -> None: ...
     def quote(
@@ -295,6 +311,9 @@ class Cache:
         self, instrument_id: model.InstrumentId
     ) -> list[model.IndexPriceUpdate] | None: ...
     def funding_rate(self, instrument_id: model.InstrumentId) -> model.FundingRateUpdate | None: ...
+    def funding_rates(
+        self, instrument_id: model.InstrumentId
+    ) -> list[model.FundingRateUpdate] | None: ...
     def instrument_status(
         self, instrument_id: model.InstrumentId
     ) -> model.InstrumentStatus | None: ...
@@ -309,9 +328,17 @@ class Cache:
     def book_update_count(self, instrument_id: model.InstrumentId) -> int: ...
     def has_quote_ticks(self, instrument_id: model.InstrumentId) -> bool: ...
     def has_trade_ticks(self, instrument_id: model.InstrumentId) -> bool: ...
+    def has_mark_prices(self, instrument_id: model.InstrumentId) -> bool: ...
+    def has_index_prices(self, instrument_id: model.InstrumentId) -> bool: ...
+    def has_funding_rates(self, instrument_id: model.InstrumentId) -> bool: ...
+    def has_instrument_statuses(self, instrument_id: model.InstrumentId) -> bool: ...
     def has_bars(self, bar_type: model.BarType) -> bool: ...
     def quote_count(self, instrument_id: model.InstrumentId) -> int: ...
     def trade_count(self, instrument_id: model.InstrumentId) -> int: ...
+    def mark_price_count(self, instrument_id: model.InstrumentId) -> int: ...
+    def index_price_count(self, instrument_id: model.InstrumentId) -> int: ...
+    def funding_rate_count(self, instrument_id: model.InstrumentId) -> int: ...
+    def instrument_status_count(self, instrument_id: model.InstrumentId) -> int: ...
     def bar_count(self, bar_type: model.BarType) -> int: ...
     def get_xrate(
         self,
@@ -482,14 +509,14 @@ class Cache:
         account_id: model.AccountId | None = None,
         side: model.OrderSide | None = None,
     ) -> int: ...
-    def order_list(self, order_list_id: model.OrderListId) -> typing.Any | None: ...
+    def order_list(self, order_list_id: model.OrderListId) -> model.OrderList | None: ...
     def order_lists(
         self,
         venue: model.Venue | None = None,
         instrument_id: model.InstrumentId | None = None,
         strategy_id: model.StrategyId | None = None,
         account_id: model.AccountId | None = None,
-    ) -> list[typing.Any]: ...
+    ) -> list[model.OrderList]: ...
     def order_list_exists(self, order_list_id: model.OrderListId) -> bool: ...
     def orders_for_exec_algorithm(
         self,
@@ -587,6 +614,7 @@ class Clock:
     def timestamp_ms(self) -> int: ...
     def timestamp(self) -> float: ...
     def utc_now(self) -> datetime.datetime: ...
+    def set_time(self, to_time_ns: int) -> None: ...
     def timer_names(self) -> list[str]: ...
     def timer_count(self) -> int: ...
     def register_default_handler(self, callback: typing.Any) -> None: ...
@@ -630,9 +658,8 @@ class Clock:
     def cancel_timer(self, name: str) -> None: ...
     def cancel_timers(self) -> None: ...
 
-@typing.final
 class DataActor:
-    def __init__(self, config: DataActorConfig | None = None) -> None: ...
+    def __init__(self, config: typing.Any | None = None) -> None: ...
     @property
     def clock(self) -> Clock: ...
     @property
@@ -641,6 +668,8 @@ class DataActor:
     def log(self) -> Logger: ...
     @property
     def actor_id(self) -> model.ActorId: ...
+    @property
+    def config(self) -> typing.Any | None: ...
     @property
     def trader_id(self) -> model.TraderId | None: ...
     def state(self) -> ComponentState: ...
@@ -652,6 +681,8 @@ class DataActor:
     def is_disposed(self) -> bool: ...
     def start(self) -> None: ...
     def stop(self) -> None: ...
+    def save(self) -> dict: ...
+    def load(self, state: dict) -> None: ...
     def resume(self) -> None: ...
     def reset(self) -> None: ...
     def dispose(self) -> None: ...
@@ -662,6 +693,18 @@ class DataActor:
     def publish_signal(self, name: str, value: typing.Any, ts_event: int = 0) -> None: ...
     def add_synthetic(self, synthetic: model.SyntheticInstrument) -> None: ...
     def update_synthetic(self, synthetic: model.SyntheticInstrument) -> None: ...
+    @property
+    def registered_indicators(self) -> list: ...
+    def indicators_initialized(self) -> bool: ...
+    def register_indicator_for_quote_ticks(
+        self, instrument_id: model.InstrumentId, indicator: typing.Any
+    ) -> None: ...
+    def register_indicator_for_trade_ticks(
+        self, instrument_id: model.InstrumentId, indicator: typing.Any
+    ) -> None: ...
+    def register_indicator_for_bars(
+        self, bar_type: model.BarType, indicator: typing.Any
+    ) -> None: ...
     def on_start(self) -> None: ...
     def on_stop(self) -> None: ...
     def on_resume(self) -> None: ...
@@ -669,6 +712,8 @@ class DataActor:
     def on_dispose(self) -> None: ...
     def on_degrade(self) -> None: ...
     def on_fault(self) -> None: ...
+    def on_save(self) -> dict: ...
+    def on_load(self, state: dict) -> None: ...
     def on_time_event(self, event: TimeEvent) -> None: ...
     def on_data(self, data: typing.Any) -> None: ...
     def on_signal(self, signal: Signal) -> None: ...
@@ -677,6 +722,7 @@ class DataActor:
     def on_trade(self, trade: model.TradeTick) -> None: ...
     def on_bar(self, bar: model.Bar) -> None: ...
     def on_book_deltas(self, deltas: model.OrderBookDeltas) -> None: ...
+    def on_book_depth(self, depth: model.OrderBookDepth10) -> None: ...
     def on_book(self, book: model.OrderBook) -> None: ...
     def on_mark_price(self, mark_price: model.MarkPriceUpdate) -> None: ...
     def on_index_price(self, index_price: model.IndexPriceUpdate) -> None: ...
@@ -709,6 +755,14 @@ class DataActor:
         instrument_id: model.InstrumentId,
         book_type: model.BookType,
         depth: int | None = None,
+        client_id: model.ClientId | None = None,
+        managed: bool = False,
+        params: dict | None = None,
+    ) -> None: ...
+    def subscribe_book_depth10(
+        self,
+        instrument_id: model.InstrumentId,
+        book_type: model.BookType,
         client_id: model.ClientId | None = None,
         managed: bool = False,
         params: dict | None = None,
@@ -784,8 +838,6 @@ class DataActor:
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> None: ...
-    def subscribe_order_fills(self, instrument_id: model.InstrumentId) -> None: ...
-    def subscribe_order_cancels(self, instrument_id: model.InstrumentId) -> None: ...
     def unsubscribe_data(
         self,
         data_type: model.DataType,
@@ -806,6 +858,12 @@ class DataActor:
         params: dict | None = None,
     ) -> None: ...
     def unsubscribe_book_deltas(
+        self,
+        instrument_id: model.InstrumentId,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> None: ...
+    def unsubscribe_book_depth10(
         self,
         instrument_id: model.InstrumentId,
         client_id: model.ClientId | None = None,
@@ -875,30 +933,28 @@ class DataActor:
     def unsubscribe_option_chain(
         self, series_id: model.OptionSeriesId, client_id: model.ClientId | None = None
     ) -> None: ...
-    def unsubscribe_order_fills(self, instrument_id: model.InstrumentId) -> None: ...
-    def unsubscribe_order_cancels(self, instrument_id: model.InstrumentId) -> None: ...
     def request_data(
         self,
         data_type: model.DataType,
         client_id: model.ClientId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         params: dict | None = None,
     ) -> str: ...
     def request_instrument(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> str: ...
     def request_instruments(
         self,
         venue: model.Venue | None = None,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> str: ...
@@ -909,11 +965,30 @@ class DataActor:
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> str: ...
+    def request_book_deltas(
+        self,
+        instrument_id: model.InstrumentId,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+        limit: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
+    def request_book_depth(
+        self,
+        instrument_id: model.InstrumentId,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
+        limit: int | None = None,
+        depth: int | None = None,
+        client_id: model.ClientId | None = None,
+        params: dict | None = None,
+    ) -> str: ...
     def request_quotes(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
@@ -921,8 +996,8 @@ class DataActor:
     def request_trades(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
@@ -930,8 +1005,8 @@ class DataActor:
     def request_funding_rates(
         self,
         instrument_id: model.InstrumentId,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
@@ -939,13 +1014,15 @@ class DataActor:
     def request_bars(
         self,
         bar_type: model.BarType,
-        start: int | None = None,
-        end: int | None = None,
+        start: datetime.datetime | None = None,
+        end: datetime.datetime | None = None,
         limit: int | None = None,
         client_id: model.ClientId | None = None,
         params: dict | None = None,
     ) -> str: ...
     def on_historical_data(self, data: typing.Any) -> None: ...
+    def on_historical_book_deltas(self, deltas: typing.Sequence[model.OrderBookDelta]) -> None: ...
+    def on_historical_book_depth(self, depths: typing.Sequence[model.OrderBookDepth10]) -> None: ...
     def on_historical_quotes(self, quotes: typing.Sequence[model.QuoteTick]) -> None: ...
     def on_historical_trades(self, trades: typing.Sequence[model.TradeTick]) -> None: ...
     def on_historical_funding_rates(
@@ -1064,7 +1141,7 @@ class GreeksCalculator:
         vega_time_weight_base: int | None = None,
         vol_index_instrument_id: model.InstrumentId | None = None,
         vol_beta_weights: typing.Mapping[model.InstrumentId, float] | None = None,
-    ) -> model.GreeksData: ...
+    ) -> model.GreeksData | None: ...
     def modify_greeks(
         self,
         delta_input: float,
@@ -1141,7 +1218,7 @@ class MessageBus:
         instance_id: core.UUID4 | None = None,
         name: str | None = None,
         serializer: typing.Any | None = None,
-        database: typing.Any | None = None,
+        backing: typing.Any | None = None,
         config: typing.Any | None = None,
     ) -> None: ...
     @property
@@ -1179,6 +1256,244 @@ class MessageBus:
     def dispose(self) -> None: ...
     def add_streaming_type(self, cls: typing.Any) -> None: ...
     def add_listener(self, listener: typing.Any) -> None: ...
+
+@typing.final
+class OrderFactory:
+    def __init__(
+        self,
+        trader_id: model.TraderId,
+        strategy_id: model.StrategyId,
+        clock: Clock,
+        use_uuid_client_order_ids: bool = False,
+        use_hyphens_in_client_order_ids: bool = True,
+    ) -> None: ...
+    @property
+    def trader_id(self) -> model.TraderId: ...
+    @property
+    def strategy_id(self) -> model.StrategyId: ...
+    def get_client_order_id_count(self) -> int: ...
+    def get_order_list_id_count(self) -> int: ...
+    def generate_client_order_id(self) -> model.ClientOrderId: ...
+    def generate_order_list_id(self) -> model.OrderListId: ...
+    def reset(self) -> None: ...
+    def market(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        time_in_force: model.TimeInForce | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def limit(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        price: model.Price,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        post_only: bool | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def stop_market(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        trigger_price: model.Price,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def stop_limit(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        price: model.Price,
+        trigger_price: model.Price,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        post_only: bool | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def market_to_limit(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def market_if_touched(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        trigger_price: model.Price,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def limit_if_touched(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        price: model.Price,
+        trigger_price: model.Price,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        post_only: bool | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def trailing_stop_market(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        trailing_offset: decimal.Decimal,
+        trailing_offset_type: model.TrailingOffsetType | None = None,
+        activation_price: model.Price | None = None,
+        trigger_price: model.Price | None = None,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def trailing_stop_limit(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        price: model.Price | None,
+        limit_offset: decimal.Decimal,
+        trailing_offset: decimal.Decimal,
+        trailing_offset_type: model.TrailingOffsetType | None = None,
+        activation_price: model.Price | None = None,
+        trigger_price: model.Price | None = None,
+        trigger_type: model.TriggerType | None = None,
+        time_in_force: model.TimeInForce | None = None,
+        expire_time: int | None = None,
+        post_only: bool | None = None,
+        reduce_only: bool | None = None,
+        quote_quantity: bool | None = None,
+        display_qty: model.Quantity | None = None,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tags: typing.Sequence[str] | None = None,
+        client_order_id: model.ClientOrderId | None = None,
+    ) -> typing.Any: ...
+    def bracket(
+        self,
+        instrument_id: model.InstrumentId,
+        order_side: model.OrderSide,
+        quantity: model.Quantity,
+        quote_quantity: bool = False,
+        emulation_trigger: model.TriggerType | None = None,
+        trigger_instrument_id: model.InstrumentId | None = None,
+        contingency_type: model.ContingencyType = model.ContingencyType.OUO,
+        entry_order_type: model.OrderType = model.OrderType.MARKET,
+        entry_price: model.Price | None = None,
+        entry_trigger_price: model.Price | None = None,
+        expire_time: int | None = None,
+        time_in_force: model.TimeInForce = model.TimeInForce.GTC,
+        entry_post_only: bool = False,
+        entry_exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        entry_exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        entry_tags: typing.Sequence[str] | None = None,
+        entry_client_order_id: model.ClientOrderId | None = None,
+        tp_order_type: model.OrderType = model.OrderType.LIMIT,
+        tp_price: model.Price | None = None,
+        tp_trigger_price: model.Price | None = None,
+        tp_trigger_type: model.TriggerType = model.TriggerType.DEFAULT,
+        tp_activation_price: model.Price | None = None,
+        tp_trailing_offset: decimal.Decimal | None = None,
+        tp_trailing_offset_type: model.TrailingOffsetType = model.TrailingOffsetType.PRICE,
+        tp_limit_offset: decimal.Decimal | None = None,
+        tp_time_in_force: model.TimeInForce = model.TimeInForce.GTC,
+        tp_post_only: bool = True,
+        tp_exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        tp_exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        tp_tags: typing.Sequence[str] | None = None,
+        tp_client_order_id: model.ClientOrderId | None = None,
+        sl_order_type: model.OrderType = model.OrderType.STOP_MARKET,
+        sl_trigger_price: model.Price | None = None,
+        sl_trigger_type: model.TriggerType = model.TriggerType.DEFAULT,
+        sl_activation_price: model.Price | None = None,
+        sl_trailing_offset: decimal.Decimal | None = None,
+        sl_trailing_offset_type: model.TrailingOffsetType = model.TrailingOffsetType.PRICE,
+        sl_time_in_force: model.TimeInForce = model.TimeInForce.GTC,
+        sl_exec_algorithm_id: model.ExecAlgorithmId | None = None,
+        sl_exec_algorithm_params: typing.Mapping[str, str] | None = None,
+        sl_tags: typing.Sequence[str] | None = None,
+        sl_client_order_id: model.ClientOrderId | None = None,
+    ) -> list: ...
 
 @typing.final
 class Signal:
@@ -1315,8 +1630,10 @@ class LogLevel(enum.Enum):
 
 @typing.final
 class SerializationEncoding(enum.Enum):
-    MSG_PACK = ...
     JSON = ...
+    MSG_PACK = ...
+    CAPNP = ...
+    SBE = ...
 
     def __hash__(self) -> int: ...
 

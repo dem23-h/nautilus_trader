@@ -3,6 +3,7 @@
 import decimal
 import typing
 
+from nautilus_trader import analysis
 from nautilus_trader import model
 
 __all__ = [
@@ -21,6 +22,8 @@ class PortfolioConfig:
     @property
     def convert_to_account_base_currency(self) -> bool: ...
     @property
+    def equity_curve(self) -> bool: ...
+    @property
     def min_account_state_logging_interval_ms(self) -> int | None: ...
     @property
     def snapshot_interval_ms(self) -> int | None: ...
@@ -32,6 +35,7 @@ class PortfolioConfig:
         use_mark_xrates: bool | None = None,
         bar_updates: bool | None = None,
         convert_to_account_base_currency: bool | None = None,
+        equity_curve: bool | None = None,
         min_account_state_logging_interval_ms: int | None = None,
         debug: bool | None = None,
         snapshot_interval_ms: int | None = None,
@@ -83,6 +87,8 @@ class Portfolio:
         self, venue: model.Venue | None = None, account_id: model.AccountId | None = None
     ) -> dict: ...
     def missing_price_instruments(self, venue: model.Venue) -> list[model.InstrumentId]: ...
+    def build_snapshot(self, account_id: model.AccountId) -> model.PortfolioSnapshot | None: ...
+    def snapshots(self, account_id: model.AccountId) -> list[model.PortfolioSnapshot]: ...
     def realized_pnl(
         self,
         instrument_id: model.InstrumentId,
@@ -123,3 +129,4 @@ class Portfolio:
         self, instrument_id: model.InstrumentId, account_id: model.AccountId | None = None
     ) -> bool: ...
     def is_completely_flat(self, account_id: model.AccountId | None = None) -> bool: ...
+    def statistics(self) -> analysis.PortfolioStatistics: ...

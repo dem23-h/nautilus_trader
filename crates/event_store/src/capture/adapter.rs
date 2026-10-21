@@ -33,14 +33,16 @@
 //! tests.
 
 use std::{
+    collections::VecDeque,
     fmt::Debug,
     sync::{
-        Arc,
+        Arc, Mutex, PoisonError,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
 
-use nautilus_core::UnixNanos;
+use ahash::AHashSet;
+use nautilus_core::{UUID4, UnixNanos};
 
 use crate::{
     capture::{encoder::EncodeError, registry::EncoderRegistry},
@@ -48,6 +50,10 @@ use crate::{
     headers::Headers,
     writer::{EntryDraft, EventStoreWriter, HaltCallback, HaltReason, SubmitError},
 };
+
+// Duplicate dispatches of the same message land within one engine cycle (endpoint send
+// followed by topic publish), so a small dedup window suffices and keeps memory flat.
+const RECENT_IDENTITY_CAPACITY: usize = 128;
 
 /// Errors returned by [`BusCaptureAdapter::capture`].
 ///
@@ -86,6 +92,32 @@ pub struct BusCaptureAdapter {
     halt: HaltCallback,
     halted: AtomicBool,
     submit_counter: Option<Arc<AtomicU64>>,
+    recent_identities: Mutex<RecentIdentities>,
+}
+
+// Insertion-ordered set of recently captured message identities with FIFO eviction.
+#[derive(Debug, Default)]
+struct RecentIdentities {
+    order: VecDeque<UUID4>,
+    seen: AHashSet<UUID4>,
+}
+
+impl RecentIdentities {
+    // Returns false when `identity` was already noted; records it otherwise.
+    fn note_fresh(&mut self, identity: UUID4) -> bool {
+        if self.seen.contains(&identity) {
+            return false;
+        }
+
+        if self.order.len() == RECENT_IDENTITY_CAPACITY
+            && let Some(evicted) = self.order.pop_front()
+        {
+            self.seen.remove(&evicted);
+        }
+        self.order.push_back(identity);
+        self.seen.insert(identity);
+        true
+    }
 }
 
 impl Debug for BusCaptureAdapter {
@@ -116,6 +148,7 @@ impl BusCaptureAdapter {
             halt,
             halted: AtomicBool::new(false),
             submit_counter: None,
+            recent_identities: Mutex::new(RecentIdentities::default()),
         }
     }
 
@@ -149,7 +182,10 @@ impl BusCaptureAdapter {
     /// Looks up the encoder for `T`, builds an [`EntryDraft`], and forwards it to the
     /// writer. Returns `Ok(false)` when the type has no registered encoder so the adapter
     /// can be wired into bus dispatch paths that carry a mix of state-affecting and
-    /// non-state-affecting messages without surfacing per-message errors.
+    /// non-state-affecting messages without surfacing per-message errors, and when the
+    /// message's registered identity was already captured on another dispatch hop (the
+    /// same order event reaches the tap via the portfolio endpoint send and the strategy
+    /// topic publish; the log records it once).
     ///
     /// `topic` is the bus topic the message was dispatched on, `headers` are the
     /// dispatch-time correlation headers (defaulting to [`Headers::empty`] until header
@@ -196,9 +232,17 @@ impl BusCaptureAdapter {
             return Err(CaptureError::Halted);
         }
 
+        // Encode before noting the identity: a rejected encode must be re-attempted
+        // on the message's next dispatch hop, not dropped as a duplicate.
         let Some((payload_type, encoded)) = self.registry.encode_any(message)? else {
             return Ok(false);
         };
+
+        if let Some(identity) = self.registry.identity_for_any(message)
+            && !self.note_fresh_identity(identity)
+        {
+            return Ok(false);
+        }
 
         let draft = EntryDraft {
             headers,
@@ -221,6 +265,15 @@ impl BusCaptureAdapter {
                 Err(CaptureError::Submit(e))
             }
         }
+    }
+
+    fn note_fresh_identity(&self, identity: UUID4) -> bool {
+        // The dedup window is a cache: on the (panic-only) poisoned path the prior state
+        // is still internally consistent, so recover the guard rather than propagate.
+        self.recent_identities
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .note_fresh(identity)
     }
 
     fn fail_stop(&self, err: &SubmitError) {
@@ -259,14 +312,14 @@ mod tests {
     use std::{
         sync::{
             Arc, Mutex,
-            atomic::{AtomicU64, Ordering},
+            atomic::{AtomicU64, AtomicUsize, Ordering},
         },
         time::Duration,
     };
 
     use bytes::Bytes;
     use indexmap::IndexMap;
-    use nautilus_core::{UnixNanos, time::get_atomic_clock_static};
+    use nautilus_core::{UUID4, UnixNanos, time::get_atomic_clock_static};
     use rstest::{fixture, rstest};
     use ustr::Ustr;
 
@@ -296,6 +349,12 @@ mod tests {
 
     #[derive(Debug)]
     struct FailingMessage;
+
+    #[derive(Debug)]
+    struct StubIdentifiedCommand {
+        id: UUID4,
+        payload: String,
+    }
 
     fn manifest(run_id: &str) -> RunManifest {
         RunManifest {
@@ -628,6 +687,111 @@ mod tests {
                 UnixNanos::from(501),
             )
             .expect("capture after encoder error");
+        drain(&writer, 1);
+        let backend = backend.lock().expect("backend");
+        assert_eq!(backend.high_watermark().expect("hwm"), 1);
+    }
+
+    #[rstest]
+    fn capture_dedupes_second_dispatch_hop_by_identity(
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        let (halt, _captured) = captured_halt;
+        let (writer, backend) = writer_with_open_run("run-dedup", Arc::clone(&halt));
+
+        let mut registry = EncoderRegistry::new();
+        registry.register::<StubIdentifiedCommand, _>(Ustr::from("StubIdentified"), |c| {
+            Ok(EncodedPayload::new(
+                Bytes::copy_from_slice(c.payload.as_bytes()),
+                Vec::new(),
+            ))
+        });
+        registry.register_identity::<StubIdentifiedCommand, _>(|c| Some(c.id));
+        let adapter = BusCaptureAdapter::new(Arc::clone(&writer), Arc::new(registry), halt);
+
+        let command = StubIdentifiedCommand {
+            id: UUID4::new(),
+            payload: "queued-command".to_string(),
+        };
+        let first = adapter
+            .capture::<StubIdentifiedCommand>(
+                Topic::from("DataEngine.queue_execute"),
+                &command,
+                Headers::empty(),
+                UnixNanos::from(100),
+            )
+            .expect("first hop");
+        let second = adapter
+            .capture::<StubIdentifiedCommand>(
+                Topic::from("DataEngine.execute"),
+                &command,
+                Headers::empty(),
+                UnixNanos::from(101),
+            )
+            .expect("second hop");
+
+        assert!(first, "first dispatch hop must capture");
+        assert!(
+            !second,
+            "second dispatch hop of the same identity must dedupe"
+        );
+        drain(&writer, 1);
+        let backend = backend.lock().expect("backend");
+        assert_eq!(backend.high_watermark().expect("hwm"), 1);
+    }
+
+    #[rstest]
+    fn capture_retries_encode_on_next_hop_after_encoder_failure(
+        captured_halt: (HaltCallback, Arc<Mutex<Vec<HaltReason>>>),
+    ) {
+        // The identity is noted only after a successful encode, so the next hop
+        // re-attempts a failed encode instead of deduping it.
+        let (halt, _captured) = captured_halt;
+        let (writer, backend) = writer_with_open_run("run-encode-retry", Arc::clone(&halt));
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_for_encoder = Arc::clone(&attempts);
+        let mut registry = EncoderRegistry::new();
+        registry.register::<StubIdentifiedCommand, _>(Ustr::from("StubIdentified"), move |c| {
+            let attempt = attempts_for_encoder.fetch_add(1, Ordering::AcqRel);
+            if attempt == 0 {
+                return Err(EncodeError::Serialize(
+                    "transient encoder failure".to_string(),
+                ));
+            }
+            Ok(EncodedPayload::new(
+                Bytes::copy_from_slice(c.payload.as_bytes()),
+                Vec::new(),
+            ))
+        });
+        registry.register_identity::<StubIdentifiedCommand, _>(|c| Some(c.id));
+        let adapter = BusCaptureAdapter::new(Arc::clone(&writer), Arc::new(registry), halt);
+
+        let command = StubIdentifiedCommand {
+            id: UUID4::new(),
+            payload: "retry-me".to_string(),
+        };
+        let err = adapter
+            .capture::<StubIdentifiedCommand>(
+                Topic::from("DataEngine.queue_execute"),
+                &command,
+                Headers::empty(),
+                UnixNanos::from(100),
+            )
+            .expect_err("first encode must fail");
+        assert!(matches!(err, CaptureError::Encode(_)));
+
+        let retried = adapter
+            .capture::<StubIdentifiedCommand>(
+                Topic::from("DataEngine.execute"),
+                &command,
+                Headers::empty(),
+                UnixNanos::from(101),
+            )
+            .expect("second hop re-attempts encode");
+
+        assert!(retried, "encode retry must capture, was deduped");
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
         drain(&writer, 1);
         let backend = backend.lock().expect("backend");
         assert_eq!(backend.high_watermark().expect("hwm"), 1);

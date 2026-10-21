@@ -24,8 +24,8 @@ use nautilus_common::{
     clock::Clock,
     factories::OrderEventFactory,
     messages::execution::{
-        BatchCancelOrders, CancelAllOrders, CancelOrder, ModifyOrder, QueryAccount, QueryOrder,
-        SubmitOrder, SubmitOrderList, TradingCommand,
+        BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, ModifyOrder,
+        QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList, TradingCommand,
     },
     msgbus::{self, MessagingSwitchboard},
 };
@@ -71,7 +71,7 @@ impl Debug for BacktestExecutionClient {
         f.debug_struct(stringify!(BacktestExecutionClient))
             .field("client_id", &self.core.client_id)
             .field("routing", &self.routing)
-            .finish()
+            .finish_non_exhaustive()
     }
 }
 
@@ -119,12 +119,8 @@ impl BacktestExecutionClient {
         }
     }
 
-    fn get_order(&self, client_order_id: &ClientOrderId) -> anyhow::Result<OrderAny> {
-        self.cache
-            .borrow()
-            .order(client_order_id)
-            .map(|o| o.clone())
-            .ok_or_else(|| anyhow::anyhow!("Order not found in cache for {client_order_id}"))
+    fn get_order(&self, client_order_id: ClientOrderId) -> anyhow::Result<OrderAny> {
+        Ok(self.cache.borrow().try_order_owned(&client_order_id)?)
     }
 
     /// Drain buffered order events, sending each to the exec engine.
@@ -194,7 +190,7 @@ impl ExecutionClient for BacktestExecutionClient {
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
         // Buffer the OrderSubmitted event for deferred processing to avoid
         // RefCell re-entrancy (exec_engine holds a borrow during execute)
-        let order = self.get_order(&cmd.client_order_id)?;
+        let order = self.get_order(cmd.client_order_id)?;
         let ts_init = self.clock.borrow().timestamp_ns();
         let event = self.factory.generate_order_submitted(&order, ts_init);
         self.queued_events.borrow_mut().push(event);
@@ -243,6 +239,17 @@ impl ExecutionClient for BacktestExecutionClient {
         Ok(())
     }
 
+    fn batch_modify_orders(&self, cmd: BatchModifyOrders) -> anyhow::Result<()> {
+        if let Some(exchange) = self.exchange.upgrade() {
+            exchange
+                .borrow_mut()
+                .send(TradingCommand::ModifyOrders(cmd));
+        } else {
+            log::error!("batch_modify_orders: SimulatedExchange has been dropped");
+        }
+        Ok(())
+    }
+
     fn cancel_order(&self, cmd: CancelOrder) -> anyhow::Result<()> {
         if let Some(exchange) = self.exchange.upgrade() {
             exchange.borrow_mut().send(TradingCommand::CancelOrder(cmd));
@@ -267,7 +274,7 @@ impl ExecutionClient for BacktestExecutionClient {
         if let Some(exchange) = self.exchange.upgrade() {
             exchange
                 .borrow_mut()
-                .send(TradingCommand::BatchCancelOrders(cmd));
+                .send(TradingCommand::CancelOrders(cmd));
         } else {
             log::error!("batch_cancel_orders: SimulatedExchange has been dropped");
         }
@@ -275,22 +282,118 @@ impl ExecutionClient for BacktestExecutionClient {
     }
 
     fn query_account(&self, cmd: QueryAccount) -> anyhow::Result<()> {
-        if let Some(exchange) = self.exchange.upgrade() {
-            exchange
-                .borrow_mut()
-                .send(TradingCommand::QueryAccount(cmd));
-        } else {
-            log::error!("query_account: SimulatedExchange has been dropped");
-        }
+        log::warn!("Backtest execution client does not support account queries: {cmd}");
         Ok(())
     }
 
     fn query_order(&self, cmd: QueryOrder) -> anyhow::Result<()> {
-        if let Some(exchange) = self.exchange.upgrade() {
-            exchange.borrow_mut().send(TradingCommand::QueryOrder(cmd));
-        } else {
-            log::error!("query_order: SimulatedExchange has been dropped");
-        }
+        log::warn!("Backtest execution client does not support order queries: {cmd}");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_common::{clock::TestClock, messages::execution::QueryOrder};
+    use nautilus_core::UUID4;
+    use nautilus_execution::models::latency::StaticLatencyModel;
+    use nautilus_model::{
+        enums::{AccountType, BookType, OmsType},
+        identifiers::{InstrumentId, StrategyId},
+        stubs::TestDefault,
+        types::{Currency, Money},
+    };
+    use rstest::rstest;
+
+    use super::*;
+    use crate::config::SimulatedVenueConfig;
+
+    fn setup_client_with_latency() -> (BacktestExecutionClient, Rc<RefCell<SimulatedExchange>>) {
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let clock: Rc<RefCell<dyn Clock>> = Rc::new(RefCell::new(TestClock::new()));
+        let latency_model = StaticLatencyModel::new(
+            UnixNanos::default(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+            UnixNanos::default(),
+        );
+        let config = SimulatedVenueConfig::builder()
+            .venue(Venue::new("SIM"))
+            .oms_type(OmsType::Netting)
+            .account_type(AccountType::Margin)
+            .book_type(BookType::L2_MBP)
+            .starting_balances(vec![Money::new(1_000.0, Currency::USD())])
+            .latency_model(Box::new(latency_model))
+            .build()
+            .unwrap();
+        let exchange = Rc::new(RefCell::new(
+            SimulatedExchange::new(config, cache.clone(), clock.clone()).unwrap(),
+        ));
+        let client = BacktestExecutionClient::new(
+            TraderId::test_default(),
+            AccountId::test_default(),
+            &exchange,
+            cache,
+            clock,
+            None,
+            None,
+        );
+
+        (client, exchange)
+    }
+
+    fn query_order() -> QueryOrder {
+        QueryOrder::new(
+            TraderId::test_default(),
+            None,
+            StrategyId::test_default(),
+            InstrumentId::from("AUD/USD.SIM"),
+            ClientOrderId::from("O-001"),
+            None,
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )
+    }
+
+    fn query_account() -> QueryAccount {
+        QueryAccount::new(
+            TraderId::test_default(),
+            None,
+            AccountId::test_default(),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        )
+    }
+
+    #[rstest]
+    fn test_query_order_is_not_forwarded_to_exchange() {
+        let (client, exchange) = setup_client_with_latency();
+
+        // Hold an immutable exchange borrow across the call: if the client
+        // forwards, send()'s `exchange.borrow_mut()` panics here. This makes the
+        // test bite on a client-only revert rather than being masked by the
+        // exchange-side query guard.
+        let exchange_ref = exchange.borrow();
+        let result = client.query_order(query_order());
+
+        assert!(result.is_ok());
+        assert_eq!(exchange_ref.max_inflight_command_ts(), None);
+    }
+
+    #[rstest]
+    fn test_query_account_is_not_forwarded_to_exchange() {
+        let (client, exchange) = setup_client_with_latency();
+
+        // See test_query_order_is_not_forwarded_to_exchange: the held borrow
+        // makes a forwarding attempt panic before the exchange guard can mask it.
+        let exchange_ref = exchange.borrow();
+        let result = client.query_account(query_account());
+
+        assert!(result.is_ok());
+        assert_eq!(exchange_ref.max_inflight_command_ts(), None);
     }
 }

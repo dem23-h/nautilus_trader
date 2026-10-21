@@ -49,7 +49,7 @@ use crate::{
             OKX_FIELD_CLORDID, OKX_FIELD_SCODE, OKX_FIELD_SMSG, OKX_FIELD_SUBCODE,
             OKX_POST_ONLY_CANCEL_REASON, OKX_POST_ONLY_CANCEL_SOURCE, OKX_SUCCESS_CODE,
         },
-        enums::OKXOrderStatus,
+        enums::{OKXOrderStatus, OKXOrderType},
         parse::{
             is_market_price, parse_client_order_id, parse_millisecond_timestamp, parse_price,
             parse_quantity,
@@ -59,7 +59,7 @@ use crate::{
     websocket::{
         client::PendingOrderInfo,
         enums::OKXWsOperation,
-        handler::is_post_only_auto_cancel,
+        handler::{is_post_only_auto_cancel, is_unfilled_rpi_cancel},
         messages::{ExecutionReport, OKXOrderMsg, OKXWsMessage},
         parse::{
             OrderStateSnapshot, ParsedOrderEvent, parse_algo_order_msg, parse_order_event,
@@ -178,7 +178,9 @@ pub struct WsDispatchState {
     pub emitted_accepted: BoundedDedup<ClientOrderId>,
     pub triggered_orders: BoundedDedup<ClientOrderId>,
     pub filled_orders: BoundedDedup<ClientOrderId>,
+    pub terminal_orders: BoundedDedup<ClientOrderId>,
     pub emitted_trades: BoundedDedup<TradeId>,
+    post_only_rejections: BoundedDedup<Ustr>,
     pub(crate) pending_orders: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) pending_cancels: Arc<DashMap<String, PendingOrderInfo>>,
     pub(crate) pending_amends: Arc<DashMap<String, PendingOrderInfo>>,
@@ -191,7 +193,9 @@ impl Default for WsDispatchState {
             emitted_accepted: BoundedDedup::new(DEDUP_CAPACITY),
             triggered_orders: BoundedDedup::new(DEDUP_CAPACITY),
             filled_orders: BoundedDedup::new(DEDUP_CAPACITY),
+            terminal_orders: BoundedDedup::new(DEDUP_CAPACITY),
             emitted_trades: BoundedDedup::new(DEDUP_CAPACITY),
+            post_only_rejections: BoundedDedup::new(DEDUP_CAPACITY),
             pending_orders: Arc::new(DashMap::new()),
             pending_cancels: Arc::new(DashMap::new()),
             pending_amends: Arc::new(DashMap::new()),
@@ -221,12 +225,16 @@ impl WsDispatchState {
         self.emitted_accepted.insert(cid);
     }
 
+    pub(crate) fn insert_triggered(&self, cid: ClientOrderId) {
+        self.triggered_orders.insert(cid);
+    }
+
     pub(crate) fn insert_filled(&self, cid: ClientOrderId) {
         self.filled_orders.insert(cid);
     }
 
-    pub(crate) fn insert_triggered(&self, cid: ClientOrderId) {
-        self.triggered_orders.insert(cid);
+    pub(crate) fn insert_terminal(&self, cid: ClientOrderId) {
+        self.terminal_orders.insert(cid);
     }
 
     /// Returns `true` if this trade was already emitted (duplicate).
@@ -477,7 +485,7 @@ pub fn dispatch_ws_message(
             op,
             error,
         } => {
-            log::error!(
+            log::warn!(
                 "WebSocket send failed without structured venue response: \
                  request_id={request_id}, client_order_id={client_order_id:?}, \
                  op={op:?}, awaiting reconciliation: {error}"
@@ -512,7 +520,9 @@ pub fn dispatch_ws_message(
         OKXWsMessage::ChannelData { channel, .. } => {
             log::debug!("Ignoring data channel message on execution client: {channel:?}");
         }
-        OKXWsMessage::BookData { .. } | OKXWsMessage::Instruments(_) => {
+        OKXWsMessage::BookData { .. }
+        | OKXWsMessage::RpiBookData { .. }
+        | OKXWsMessage::Instruments(_) => {
             log::debug!("Ignoring data message on execution client");
         }
         OKXWsMessage::Error(e) => {
@@ -600,15 +610,32 @@ fn dispatch_order_messages(
         };
 
         if let Some(ident) = identity {
-            if is_post_only_auto_cancel(msg) {
+            let is_post_only_cancel = is_post_only_auto_cancel(msg);
+
+            if is_post_only_cancel
+                || (!state.emitted_accepted.contains(&client_order_id)
+                    && is_unfilled_rpi_cancel(msg))
+            {
+                if is_post_only_cancel {
+                    state.post_only_rejections.insert(msg.ord_id);
+                }
+
                 let ts_event = parse_millisecond_timestamp(msg.u_time);
+                let reason = if msg.ord_type == OKXOrderType::Rpi {
+                    msg.cancel_source_reason
+                        .as_deref()
+                        .filter(|reason| !reason.is_empty())
+                        .unwrap_or("RPI order canceled before acceptance")
+                } else {
+                    "Post-only order would have taken liquidity"
+                };
                 let rejected = OrderRejected::new(
                     emitter.trader_id(),
                     ident.strategy_id,
                     instrument.id(),
                     client_order_id,
                     account_id,
-                    Ustr::from("Post-only order would have taken liquidity"),
+                    Ustr::from(reason),
                     UUID4::new(),
                     ts_event,
                     ts_init,
@@ -664,6 +691,12 @@ fn dispatch_order_messages(
                 }
                 Err(e) => log::error!("Failed to parse order event for {client_order_id}: {e}"),
             }
+        } else if is_post_only_auto_cancel(msg) && state.post_only_rejections.contains(&msg.ord_id)
+        {
+            log::debug!(
+                "Skipping replayed post-only rejection for {client_order_id}: ord_id={}",
+                msg.ord_id
+            );
         } else {
             log::debug!(
                 "Untracked order {client_order_id} (ord_id={}), sending as report for reconciliation",
@@ -835,6 +868,7 @@ fn dispatch_parsed_order_event(
             if state.emitted_accepted.contains(&client_order_id)
                 || state.filled_orders.contains(&client_order_id)
                 || state.triggered_orders.contains(&client_order_id)
+                || state.terminal_orders.contains(&client_order_id)
             {
                 log::debug!("Skipping duplicate Accepted for {client_order_id}");
                 return;
@@ -955,6 +989,7 @@ fn dispatch_parsed_order_event(
     }
 
     if is_terminal {
+        state.insert_terminal(client_order_id);
         state.order_identities.remove(&client_order_id);
         state.emitted_accepted.remove(&client_order_id);
         order_state_cache.remove(&client_order_id);
@@ -1023,6 +1058,7 @@ fn fill_report_to_order_filled(
         false,
         report.venue_position_id,
         Some(report.commission),
+        None,
     )
 }
 
@@ -1165,12 +1201,13 @@ pub fn dispatch_execution_reports(
                         // Guard form reformats awkwardly across multiple lines
                         #[allow(clippy::collapsible_match)]
                         OrderStatus::Accepted => {
-                            if state.filled_orders.contains(&cid)
+                            if state.terminal_orders.contains(&cid)
+                                || state.filled_orders.contains(&cid)
                                 || state.triggered_orders.contains(&cid)
                             {
                                 log::debug!(
                                     "Skipping stale OrderStatusReport(Accepted) \
-                                     for {cid} (already triggered/filled)"
+                                     for {cid} (order already terminal)"
                                 );
                                 continue;
                             }
@@ -1187,9 +1224,11 @@ pub fn dispatch_execution_reports(
                         }
                         OrderStatus::Filled => {
                             state.insert_filled(cid);
+                            state.insert_terminal(cid);
                             state.triggered_orders.remove(&cid);
                         }
                         OrderStatus::Canceled | OrderStatus::Expired | OrderStatus::Rejected => {
+                            state.insert_terminal(cid);
                             state.triggered_orders.remove(&cid);
                             state.filled_orders.remove(&cid);
                         }
@@ -1279,7 +1318,7 @@ pub fn emit_batch_cancel_failure(
     _clock: &'static AtomicTime,
 ) {
     for ctx in contexts {
-        log::error!(
+        log::warn!(
             "Ambiguous algo batch cancel failure for {}, awaiting reconciliation: {error}",
             ctx.client_order_id
         );

@@ -15,9 +15,39 @@
 
 //! Connection mode enumeration for socket clients.
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU8, Ordering},
+};
 
 use strum::{AsRefStr, Display, EnumString};
+
+/// Irreversible validity token for a single connection's read task.
+#[derive(Clone, Debug)]
+pub(crate) struct ReadSessionFence {
+    valid: Arc<AtomicBool>,
+}
+
+impl ReadSessionFence {
+    /// Creates a valid fence for a newly spawned read task.
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self {
+            valid: Arc::new(AtomicBool::new(true)),
+        }
+    }
+
+    /// Invalidates the associated read session.
+    pub(crate) fn invalidate(&self) {
+        self.valid.store(false, Ordering::SeqCst);
+    }
+
+    /// Returns whether the associated read session is still current.
+    #[must_use]
+    pub(crate) fn is_valid(&self) -> bool {
+        self.valid.load(Ordering::SeqCst)
+    }
+}
 
 /// Connection mode for a socket client.
 ///
@@ -66,6 +96,36 @@ impl ConnectionMode {
         Self::from_u8(value.load(Ordering::SeqCst))
     }
 
+    /// Atomically transitions to `Reconnect`, but only from `Active`.
+    ///
+    /// Returns `true` if this call performed the transition. A concurrent
+    /// `Disconnect`/`Closed` (or an in-flight `Reconnect`) is left untouched,
+    /// so a writer detecting a dead connection cannot resurrect a client that
+    /// is being torn down.
+    pub fn request_reconnect(value: &AtomicU8) -> bool {
+        value
+            .compare_exchange(
+                Self::Active.as_u8(),
+                Self::Reconnect.as_u8(),
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            )
+            .is_ok()
+    }
+
+    /// Atomically transitions to `Disconnect` from any non-`Closed` state.
+    ///
+    /// Returns `true` if the mode is now `Disconnect`; `false` if the
+    /// connection was already `Closed` (terminal state is preserved so status
+    /// queries keep reporting `Closed`).
+    pub fn request_disconnect(value: &AtomicU8) -> bool {
+        value
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |mode| {
+                (!Self::from_u8(mode).is_closed()).then_some(Self::Disconnect.as_u8())
+            })
+            .is_ok()
+    }
+
     /// Convert a [`ConnectionMode`] to a u8, useful when storing to an `AtomicU8`.
     #[inline]
     #[must_use]
@@ -99,5 +159,44 @@ impl ConnectionMode {
     #[must_use]
     pub const fn is_closed(&self) -> bool {
         matches!(self, Self::Closed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    #[case(ConnectionMode::Active, true, ConnectionMode::Reconnect)]
+    #[case(ConnectionMode::Reconnect, false, ConnectionMode::Reconnect)]
+    #[case(ConnectionMode::Disconnect, false, ConnectionMode::Disconnect)]
+    #[case(ConnectionMode::Closed, false, ConnectionMode::Closed)]
+    fn request_reconnect_transitions(
+        #[case] start: ConnectionMode,
+        #[case] expected_result: bool,
+        #[case] expected_mode: ConnectionMode,
+    ) {
+        let mode = AtomicU8::new(start.as_u8());
+
+        assert_eq!(ConnectionMode::request_reconnect(&mode), expected_result);
+        assert_eq!(ConnectionMode::from_atomic(&mode), expected_mode);
+    }
+
+    #[rstest]
+    #[case(ConnectionMode::Active, true, ConnectionMode::Disconnect)]
+    #[case(ConnectionMode::Reconnect, true, ConnectionMode::Disconnect)]
+    #[case(ConnectionMode::Disconnect, true, ConnectionMode::Disconnect)]
+    #[case(ConnectionMode::Closed, false, ConnectionMode::Closed)]
+    fn request_disconnect_transitions(
+        #[case] start: ConnectionMode,
+        #[case] expected_result: bool,
+        #[case] expected_mode: ConnectionMode,
+    ) {
+        let mode = AtomicU8::new(start.as_u8());
+
+        assert_eq!(ConnectionMode::request_disconnect(&mode), expected_result);
+        assert_eq!(ConnectionMode::from_atomic(&mode), expected_mode);
     }
 }

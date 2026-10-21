@@ -23,9 +23,10 @@ pub mod dst;
 pub mod listener;
 pub mod runner;
 pub mod runtime;
+pub mod task;
 pub mod timer;
 
-pub use clock::{LiveClock, TimeEventStream};
+pub use clock::LiveClock;
 pub use listener::MessageBusListener;
 pub use runner::{
     get_data_event_sender, get_exec_event_sender, set_data_event_sender, set_exec_event_sender,

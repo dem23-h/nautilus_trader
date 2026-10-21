@@ -49,7 +49,7 @@ The following normalized Tardis Machine formats are supported by NautilusTrader.
 [Tardis data type reference](https://docs.tardis.dev/tardis-machine/data-types) for field schemas.
 
 | Tardis format       | Nautilus data type                                                |
-|:--------------------|:------------------------------------------------------------------|
+| :------------------ | :---------------------------------------------------------------- |
 | `book_change`       | `OrderBookDelta`                                                  |
 | `book_snapshot_*`   | `OrderBookDepth10` or `OrderBookDeltas`                           |
 | `quote`             | `QuoteTick`                                                       |
@@ -82,7 +82,7 @@ The adapter converts Tardis trade bar intervals and suffixes to Nautilus `BarTyp
 This includes the following:
 
 | Tardis suffix | Meaning         | Nautilus bar aggregation |
-|:--------------|:----------------|:-------------------------|
+| :------------ | :-------------- | :----------------------- |
 | `ms`          | Milliseconds    | `MILLISECOND`            |
 | `s`           | Seconds         | `SECOND`                 |
 | `m`           | Minutes         | `MINUTE`                 |
@@ -121,47 +121,47 @@ For detailed symbology documentation per exchange:
 Some exchanges on Tardis are partitioned into multiple venues.
 The table below outlines the mappings between Nautilus venues and corresponding Tardis exchanges:
 
-| Nautilus venue          | Tardis exchange(s)                                    |
-|:------------------------|:------------------------------------------------------|
-| `ASCENDEX`              | `ascendex`                                            |
-| `BINANCE`               | `binance`, `binance-dex`, `binance-futures`, `binance-options` |
-| `BINANCE_DELIVERY`      | `binance-delivery` (*COIN‑margined contracts*)        |
-| `BINANCE_US`            | `binance-us`                                          |
-| `BITFINEX`              | `bitfinex`, `bitfinex-derivatives`                    |
-| `BITFLYER`              | `bitflyer`                                            |
-| `BITGET`                | `bitget`, `bitget-futures`                            |
-| `BITMEX`                | `bitmex`                                              |
-| `BITNOMIAL`             | `bitnomial`                                           |
-| `BITSTAMP`              | `bitstamp`                                            |
-| `BLOCKCHAIN_COM`        | `blockchain-com`                                      |
-| `BYBIT`                 | `bybit`, `bybit-options`, `bybit-spot`                |
-| `COINBASE`              | `coinbase`                                            |
-| `COINBASE_INTX`         | `coinbase-international`                              |
-| `COINFLEX`              | `coinflex` (*for historical research*)                |
-| `CRYPTO_COM`            | `crypto-com`                                          |
-| `CRYPTOFACILITIES`      | `cryptofacilities`                                    |
-| `DELTA`                 | `delta`                                               |
-| `DERIBIT`               | `deribit`                                             |
-| `DYDX`                  | `dydx`                                                |
-| `DYDX_V4`               | `dydx-v4`                                             |
-| `FTX`                   | `ftx`, `ftx-us` (*historical research*)               |
-| `GATE_IO`               | `gate-io`, `gate-io-futures`                          |
-| `GEMINI`                | `gemini`                                              |
-| `HITBTC`                | `hitbtc`                                              |
-| `HUOBI`                 | `huobi`, `huobi-dm`, `huobi-dm-linear-swap`, `huobi-dm-options` |
-| `HUOBI_DELIVERY`        | `huobi-dm-swap`                                       |
-| `HYPERLIQUID`           | `hyperliquid`                                         |
-| `KRAKEN`                | `kraken`                                              |
-| `KUCOIN`                | `kucoin`, `kucoin-futures`                            |
-| `MANGO`                 | `mango`                                               |
-| `OKCOIN`                | `okcoin`                                              |
-| `OKEX`                  | `okex`, `okex-futures`, `okex-options`, `okex-spreads`, `okex-swap` |
-| `PHEMEX`                | `phemex`                                              |
-| `POLONIEX`              | `poloniex`                                            |
-| `SERUM`                 | `serum` (*historical research*)                       |
-| `STAR_ATLAS`            | `star-atlas`                                          |
-| `UPBIT`                 | `upbit`                                               |
-| `WOO_X`                 | `woo-x`                                               |
+| Nautilus venue     | Tardis exchange(s)                                                  |
+| :----------------- | :------------------------------------------------------------------ |
+| `ASCENDEX`         | `ascendex`                                                          |
+| `BINANCE`          | `binance`, `binance-dex`, `binance-futures`, `binance-options`      |
+| `BINANCE_DELIVERY` | `binance-delivery` (*COIN‑margined contracts*)                      |
+| `BINANCE_US`       | `binance-us`                                                        |
+| `BITFINEX`         | `bitfinex`, `bitfinex-derivatives`                                  |
+| `BITFLYER`         | `bitflyer`                                                          |
+| `BITGET`           | `bitget`, `bitget-futures`                                          |
+| `BITMEX`           | `bitmex`                                                            |
+| `BITNOMIAL`        | `bitnomial`                                                         |
+| `BITSTAMP`         | `bitstamp`                                                          |
+| `BLOCKCHAIN_COM`   | `blockchain-com`                                                    |
+| `BYBIT`            | `bybit`, `bybit-options`, `bybit-spot`                              |
+| `COINBASE`         | `coinbase`                                                          |
+| `COINBASE_INTX`    | `coinbase-international`                                            |
+| `COINFLEX`         | `coinflex` (*for historical research*)                              |
+| `CRYPTO_COM`       | `crypto-com`                                                        |
+| `CRYPTOFACILITIES` | `cryptofacilities`                                                  |
+| `DELTA`            | `delta`                                                             |
+| `DERIBIT`          | `deribit`                                                           |
+| `DYDX`             | `dydx`                                                              |
+| `DYDX_V4`          | `dydx-v4`                                                           |
+| `FTX`              | `ftx`, `ftx-us` (*historical research*)                             |
+| `GATE_IO`          | `gate-io`, `gate-io-futures`                                        |
+| `GEMINI`           | `gemini`                                                            |
+| `HITBTC`           | `hitbtc`                                                            |
+| `HUOBI`            | `huobi`, `huobi-dm`, `huobi-dm-linear-swap`, `huobi-dm-options`     |
+| `HUOBI_DELIVERY`   | `huobi-dm-swap`                                                     |
+| `HYPERLIQUID`      | `hyperliquid`                                                       |
+| `KRAKEN`           | `kraken`                                                            |
+| `KUCOIN`           | `kucoin`, `kucoin-futures`                                          |
+| `MANGO`            | `mango`                                                             |
+| `OKCOIN`           | `okcoin`                                                            |
+| `OKEX`             | `okex`, `okex-futures`, `okex-options`, `okex-spreads`, `okex-swap` |
+| `PHEMEX`           | `phemex`                                                            |
+| `POLONIEX`         | `poloniex`                                                          |
+| `SERUM`            | `serum` (*historical research*)                                     |
+| `STAR_ATLAS`       | `star-atlas`                                                        |
+| `UPBIT`            | `upbit`                                                             |
+| `WOO_X`            | `woo-x`                                                             |
 
 Tardis also exposes legacy Binance exchanges such as `binance-european-options` and
 `binance-jersey`.
@@ -196,7 +196,7 @@ The end-to-end `run_tardis_machine_replay` data pipeline function uses a specifi
 - Connect to the Tardis Machine server.
 - Request and parse all necessary instrument definitions from the Tardis instruments metadata API.
 - Stream all requested instruments and data types for the specified time ranges from Tardis Machine.
-- For each instrument, data type and date (UTC), generate a catalog-compatible `.parquet` file.
+- For each instrument, data type, and date (UTC), generate a catalog-compatible `.parquet` file.
 - Disconnect from the Tardis Machine server, and terminate the program.
 
 **File naming convention**
@@ -282,7 +282,7 @@ The `book_snapshot_output` configuration option controls how Tardis `book_snapsh
 converted and stored.
 
 | Value     | Nautilus type      | Output directory     | Description                           |
-|:----------|:-------------------|:---------------------|:--------------------------------------|
+| :-------- | :----------------- | :------------------- | :------------------------------------ |
 | `deltas`  | `OrderBookDeltas`  | `order_book_deltas/` | Price level updates.                  |
 | `depth10` | `OrderBookDepth10` | `order_book_depths/` | Snapshots with up to 10 price levels. |
 
@@ -421,6 +421,49 @@ Configure option fees explicitly on the simulated venue with structural fee mode
 as `CappedOptionFeeModel` or `TieredNotionalOptionFeeModel`. There is no automatic
 Tardis exchange to fee model mapping.
 
+### Option-chain CSV catalog conversion
+
+For historical option chains from downloadable Tardis CSV files, use
+`TardisCSVDataLoader.convert_options_chain_csv(...)` to convert `options_chain` rows into
+Nautilus catalog data. This path does not call Tardis Machine or the instrument metadata API, so
+it is useful when you already have Tardis CSV files or want a no-API-key catalog bootstrap from
+downloaded data.
+
+The converter writes `OptionGreeks` for every selected row. With the default
+`extract_bbo_as_quotes=True`, complete best bid/offer rows also write `QuoteTick`. Keep this
+enabled for option-chain backtests: greeks-only catalogs do not provide quotes, so the chain
+manager cannot publish populated `OptionChainSlice` snapshots for strikes without BBO data.
+
+Instrument derivation currently supports Deribit options. For other option venues, set
+`write_instruments=False` before conversion and load the instruments through another source
+before backtesting. Leaving it enabled for a non-Deribit file can fail after data files have
+been written to the catalog. Pass daily `options_chain` CSV paths in chronological order. The
+`underlyings` filter matches symbol prefixes such as `["BTC-"]`. Set `snapshot_interval_ms` to
+keep the last row per instrument per interval within each input file, or use `None` to write
+every selected row. Rows must be ordered by `local_timestamp` within each file when thinning.
+
+Provide explicit `price_precision` and `size_precision` on the loader for deterministic quote
+metadata. Inferred precision can increase as later rows are read, so data written earlier in a
+file can keep lower precision metadata.
+
+```python
+from pathlib import Path
+
+from nautilus_trader.adapters.tardis import TardisCSVDataLoader
+
+
+loader = TardisCSVDataLoader(
+    price_precision=4,
+    size_precision=1,
+)
+loader.convert_options_chain_csv(
+    filepaths=[Path("deribit_options_chain_2020-06-08.csv")],
+    catalog_path=Path("catalog"),
+    underlyings=["BTC-"],
+    snapshot_interval_ms=60_000,
+)
+```
+
 ## Loading Tardis CSV data
 
 Tardis-format CSV data can be loaded using either Python or Rust. The loader reads the CSV text data
@@ -433,6 +476,11 @@ maximum number of rows loaded.
 :::note
 Loading mixed-instrument CSV files is challenging due to precision requirements and is not
 recommended. Use single-instrument CSV files instead.
+
+The `load_options_chain`, `stream_options_chain`, and `convert_options_chain_csv` methods are
+the exception: Tardis `options_chain` files are mixed-instrument chain files, and these paths
+track precision per instrument. Explicit precisions are still recommended for deterministic
+output.
 :::
 
 ### Loading CSV data in Python
@@ -518,8 +566,9 @@ The Python streaming functionality is available for the high-volume CSV types:
 - Quote ticks (`stream_quotes`).
 - Trade ticks (`stream_trades`).
 - Order book depth snapshots (`stream_depth10`).
+- Options chain rows (`stream_options_chain`).
 
-Rust also exposes streaming functions for batched deltas and funding rates.
+Rust also exposes streaming functions for these CSV types, plus batched deltas and funding rates.
 
 ### Streaming CSV data in Python
 

@@ -530,7 +530,7 @@ pub fn parse_peg_offset_value(params: Option<&Params>) -> anyhow::Result<Option<
 /// Derives a deterministic [`TradeId`] for BitMEX trades that arrive without a
 /// `trdMatchID` (e.g. certain historical or bucketed rows).
 ///
-/// The hash combines the symbol, timestamp, price, size and side so replayed
+/// The hash combines the symbol, timestamp, price, size, and side so replayed
 /// data yields the same identifier across runs. FNV-1a is stable across
 /// architectures and crate versions; the 0x1f delimiter keeps variable-length
 /// fields from colliding.
@@ -691,6 +691,7 @@ mod tests {
             None, // margin_maint
             None, // maker_fee
             None, // taker_fee
+            None, // tick_scheme
             None, // info
             UnixNanos::from(0),
             UnixNanos::from(0),

@@ -30,6 +30,7 @@ use std::{
 
 use ahash::{AHashMap, AHashSet};
 use chrono::{DateTime, Utc};
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     AtomicMap, AtomicTime, consts::NAUTILUS_USER_AGENT, env::get_or_env_var_opt, nanos::UnixNanos,
     time::get_atomic_clock_realtime,
@@ -63,9 +64,9 @@ use super::{
         BybitInstrumentSpot, BybitInstrumentSpotResponse, BybitKlinesResponse,
         BybitNoConvertRepayResponse, BybitOpenOrdersResponse, BybitOrder,
         BybitOrderHistoryResponse, BybitOrderbookResponse, BybitPlaceOrderResponse,
-        BybitPositionListResponse, BybitServerTimeResponse, BybitSetLeverageResponse,
-        BybitSetMarginModeResponse, BybitSetTradingStopResponse, BybitSubApiKeyInfo,
-        BybitSubApiKeysResponse, BybitSubMember, BybitSubMembersPagedResponse,
+        BybitPositionListResponse, BybitRepayResponse, BybitServerTimeResponse,
+        BybitSetLeverageResponse, BybitSetMarginModeResponse, BybitSetTradingStopResponse,
+        BybitSubApiKeyInfo, BybitSubApiKeysResponse, BybitSubMember, BybitSubMembersPagedResponse,
         BybitSubMembersResponse, BybitSwitchModeResponse, BybitTickerData, BybitTickerOption,
         BybitTickersOptionResponse, BybitTradeHistoryResponse, BybitTradesResponse,
         BybitUpdateMasterApiResponse, BybitUpdateSubApiResponse, BybitWalletBalanceResponse,
@@ -77,12 +78,12 @@ use super::{
         BybitCancelAllOrdersParamsBuilder, BybitCancelOrderParamsBuilder, BybitFeeRateParams,
         BybitFeeRateParamsBuilder, BybitFundingParams, BybitFundingParamsBuilder,
         BybitInstrumentsInfoParams, BybitKlinesParams, BybitKlinesParamsBuilder,
-        BybitNoConvertRepayParamsBuilder, BybitOpenOrdersParamsBuilder,
+        BybitNativeTpSlParams, BybitNoConvertRepayParamsBuilder, BybitOpenOrdersParamsBuilder,
         BybitOrderHistoryParamsBuilder, BybitOrderbookParams, BybitOrderbookParamsBuilder,
-        BybitPlaceOrderParamsBuilder, BybitPositionListParams, BybitSetLeverageParamsBuilder,
-        BybitSetMarginModeParamsBuilder, BybitSetTradingStopParams, BybitSubApiKeysParams,
-        BybitSubMembersPageParams, BybitSwitchModeParamsBuilder, BybitTickersParams,
-        BybitTradeHistoryParams, BybitTradesParams, BybitTradesParamsBuilder,
+        BybitPlaceOrderParamsBuilder, BybitPositionListParams, BybitRepayParamsBuilder,
+        BybitSetLeverageParamsBuilder, BybitSetMarginModeParamsBuilder, BybitSetTradingStopParams,
+        BybitSubApiKeysParams, BybitSubMembersPageParams, BybitSwitchModeParamsBuilder,
+        BybitTickersParams, BybitTradeHistoryParams, BybitTradesParams, BybitTradesParamsBuilder,
         BybitUpdateMasterApiParams, BybitUpdateSubApiParams, BybitWalletBalanceParams,
     },
 };
@@ -92,15 +93,16 @@ use crate::common::{
     enums::{
         BybitAccountType, BybitBboSideType, BybitContractType, BybitEnvironment, BybitMarginMode,
         BybitOpenOnly, BybitOrderFilter, BybitOrderSide, BybitOrderType, BybitPositionIdx,
-        BybitPositionMode, BybitProductType,
+        BybitPositionMode, BybitProductType, BybitRepayStatus, BybitTpSlMode,
     },
     models::{BybitCursorListResponse, BybitErrorCheck, BybitResponseCheck},
     parse::{
-        bar_spec_to_bybit_interval, make_bybit_symbol, map_time_in_force, parse_account_state,
-        parse_fill_report, parse_funding_rate, parse_inverse_instrument, parse_kline_bar,
-        parse_linear_instrument, parse_option_instrument, parse_order_status_report,
-        parse_orderbook, parse_position_status_report, parse_spot_instrument, parse_trade_tick,
-        spot_leverage, spot_market_unit, trigger_direction,
+        bar_spec_to_bybit_interval, bybit_rejection_due_post_only, make_bybit_symbol,
+        map_time_in_force, parse_account_state, parse_fill_report, parse_funding_rate,
+        parse_inverse_instrument, parse_kline_bar, parse_linear_instrument,
+        parse_option_instrument, parse_order_status_report, parse_orderbook,
+        parse_position_status_report, parse_spot_instrument, parse_trade_tick, spot_leverage,
+        spot_market_unit, trigger_direction,
     },
     symbol::BybitSymbol,
     urls::bybit_http_base_url,
@@ -137,7 +139,8 @@ pub static BYBIT_REPAY_QUOTA: LazyLock<Quota> = LazyLock::new(|| {
 });
 
 const BYBIT_GLOBAL_RATE_KEY: &str = "bybit:global";
-const BYBIT_REPAY_ROUTE_KEY: &str = "bybit:/v5/account/no-convert-repay";
+const BYBIT_REPAY_ROUTE_KEY: &str = "bybit:/v5/account/repay";
+const BYBIT_NO_CONVERT_REPAY_ROUTE_KEY: &str = "bybit:/v5/account/no-convert-repay";
 
 /// Raw HTTP client for low-level Bybit API operations.
 ///
@@ -382,6 +385,10 @@ impl BybitRawHttpClient {
         vec![
             (BYBIT_GLOBAL_RATE_KEY.to_string(), *BYBIT_REST_QUOTA),
             (BYBIT_REPAY_ROUTE_KEY.to_string(), *BYBIT_REPAY_QUOTA),
+            (
+                BYBIT_NO_CONVERT_REPAY_ROUTE_KEY.to_string(),
+                *BYBIT_REPAY_QUOTA,
+            ),
         ]
     }
 
@@ -1340,7 +1347,7 @@ impl BybitRawHttpClient {
     /// Returns an error if:
     /// - Credentials are missing.
     /// - The request fails.
-    /// - Called between 04:00-05:30 UTC (interest calculation window).
+    /// - Called during the hourly interest-calculation window (mm:04:00-mm:05:30 UTC each hour).
     /// - Insufficient spot balance for repayment.
     ///
     /// # Panics
@@ -1379,6 +1386,58 @@ impl BybitRawHttpClient {
                 Some(body),
                 true,
             )
+            .await;
+
+        if let Err(ref e) = result
+            && let Ok(params_json) = serde_json::to_string(&params)
+        {
+            log::error!("Repay request failed with params {params_json}: {e}");
+        }
+
+        result
+    }
+
+    /// Manually repays borrowed coins, converting other assets if required.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - Called during the hourly interest-calculation window (mm:04:00-mm:05:30 UTC each hour).
+    /// - Insufficient balance for repayment.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the parameter builder fails (should never happen with valid inputs).
+    ///
+    /// # References
+    ///
+    /// - <https://bybit-exchange.github.io/docs/v5/account/repay>
+    pub async fn repay(
+        &self,
+        coin: Option<&str>,
+        amount: Option<&str>,
+    ) -> Result<BybitRepayResponse, BybitHttpError> {
+        let mut builder = BybitRepayParamsBuilder::default();
+
+        if let Some(coin) = coin {
+            builder.coin(coin.to_string());
+        }
+
+        if let Some(amt) = amount {
+            builder.amount(amt.to_string());
+        }
+
+        let params = builder.build().expect("Failed to build BybitRepayParams");
+
+        if let Ok(params_json) = serde_json::to_string(&params) {
+            log::debug!("Repay request params: {params_json}");
+        }
+
+        let body = serde_json::to_vec(&params)?;
+        let result = self
+            .send_request::<_, ()>(Method::POST, "/v5/account/repay", None, Some(body), true)
             .await;
 
         if let Err(ref e) = result
@@ -2256,7 +2315,7 @@ impl BybitHttpClient {
     /// Returns an error if:
     /// - Credentials are missing.
     /// - The request fails.
-    /// - Called between 04:00-05:30 UTC (interest calculation window).
+    /// - Called during the hourly interest-calculation window (mm:04:00-mm:05:30 UTC each hour).
     /// - Insufficient spot balance for repayment.
     pub async fn repay_spot_borrow(
         &self,
@@ -2264,10 +2323,55 @@ impl BybitHttpClient {
         amount: Option<Quantity>,
     ) -> anyhow::Result<BybitNoConvertRepayResponse> {
         let amount_str = amount.as_ref().map(|q| q.to_string());
-        self.inner
+        let response = self
+            .inner
             .no_convert_repay(coin, amount_str.as_deref())
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to repay spot borrow for {coin}: {e}"))
+            .map_err(|e| anyhow::anyhow!("Failed to repay spot borrow for {coin}: {e}"))?;
+        Self::ensure_repay_accepted(coin, response.result.result_status)?;
+        Ok(response)
+    }
+
+    /// Repays spot borrows for a specific coin, converting other assets if required.
+    ///
+    /// Unlike [`Self::repay_spot_borrow`], this uses the venue's manual repay endpoint,
+    /// which may draw on other holdings when the debt coin's spot balance is insufficient.
+    ///
+    /// # Parameters
+    ///
+    /// - `coin`: The coin to repay (e.g., "BTC", "ETH")
+    /// - `amount`: Optional amount to repay. If None, repays all outstanding borrows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - Credentials are missing.
+    /// - The request fails.
+    /// - Called during the hourly interest-calculation window (mm:04:00-mm:05:30 UTC each hour).
+    /// - Insufficient balance for repayment.
+    pub async fn repay_spot_borrow_with_conversion(
+        &self,
+        coin: &str,
+        amount: Option<Quantity>,
+    ) -> anyhow::Result<BybitRepayResponse> {
+        let amount_str = amount.as_ref().map(|q| q.to_string());
+        let response = self
+            .inner
+            .repay(Some(coin), amount_str.as_deref())
+            .await
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to repay spot borrow (with conversion) for {coin}: {e}")
+            })?;
+        Self::ensure_repay_accepted(coin, response.result.result_status)?;
+        Ok(response)
+    }
+
+    fn ensure_repay_accepted(coin: &str, status: BybitRepayStatus) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            status != BybitRepayStatus::Failed,
+            "Bybit repay for {coin} returned result status {status}"
+        );
+        Ok(())
     }
 
     /// Generate SPOT position reports from wallet balances.
@@ -2424,6 +2528,7 @@ impl BybitHttpClient {
         position_idx: Option<BybitPositionIdx>,
         bbo_side_type: Option<BybitBboSideType>,
         bbo_level: Option<String>,
+        native_tp_sl: Option<&BybitNativeTpSlParams>,
     ) -> anyhow::Result<OrderStatusReport> {
         let instrument = self.instrument_from_cache(&instrument_id.symbol)?;
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())?;
@@ -2481,6 +2586,63 @@ impl BybitHttpClient {
         order_entry.bbo_side_type(bbo_side_type);
         order_entry.bbo_level(bbo_level);
 
+        if let Some(tp_sl) = native_tp_sl {
+            if let Some(ref tp) = tp_sl.take_profit {
+                order_entry.take_profit(Some(tp.clone()));
+            }
+
+            if let Some(ref sl) = tp_sl.stop_loss {
+                order_entry.stop_loss(Some(sl.clone()));
+            }
+
+            if let Some(tp_trigger) = tp_sl.tp_trigger_by {
+                order_entry.tp_trigger_by(Some(tp_trigger));
+            }
+
+            if let Some(sl_trigger) = tp_sl.sl_trigger_by {
+                order_entry.sl_trigger_by(Some(sl_trigger));
+            }
+
+            if let Some(tp_ot) = tp_sl.tp_order_type {
+                order_entry.tp_order_type(Some(tp_ot));
+            }
+
+            if let Some(sl_ot) = tp_sl.sl_order_type {
+                order_entry.sl_order_type(Some(sl_ot));
+            }
+
+            if let Some(ref tp_lp) = tp_sl.tp_limit_price {
+                order_entry.tp_limit_price(Some(tp_lp.clone()));
+            }
+
+            if let Some(ref sl_lp) = tp_sl.sl_limit_price {
+                order_entry.sl_limit_price(Some(sl_lp.clone()));
+            }
+
+            // Default to `Full` when TP or SL is set without an explicit mode, mirroring the WS
+            // path, so Bybit accepts the field instead of rejecting it.
+            let mode = tp_sl.tpsl_mode.or_else(|| {
+                (tp_sl.take_profit.is_some() || tp_sl.stop_loss.is_some())
+                    .then_some(BybitTpSlMode::Full)
+            });
+
+            if let Some(m) = mode {
+                order_entry.tpsl_mode(Some(m));
+            }
+
+            if let Some(close) = tp_sl.close_on_trigger {
+                order_entry.close_on_trigger(Some(close));
+            }
+
+            if let Some(ref iv) = tp_sl.order_iv {
+                order_entry.order_iv(Some(iv.clone()));
+            }
+
+            if let Some(mmp) = tp_sl.mmp {
+                order_entry.mmp(Some(mmp));
+            }
+        }
+
         let order_entry = order_entry.build().build_anyhow()?;
 
         let mut params = BybitPlaceOrderParamsBuilder::default();
@@ -2508,10 +2670,13 @@ impl BybitHttpClient {
             .map_err(|source| BybitSubmitOrderError::PostSubmitLookup { source })?;
 
         // Only bail on rejection if there are no fills
-        // If the order has fills (cum_exec_qty > 0), let the parser remap Rejected -> Canceled
-        if order.order_status == crate::common::enums::BybitOrderStatus::Rejected
-            && (order.cum_exec_qty.as_str() == "0" || order.cum_exec_qty.is_empty())
-        {
+        // If the order has fills (cum_exec_qty > 0), let the parser remap Rejected -> Canceled.
+        // A post-only order that would take liquidity is reported as Cancelled with
+        // rejectReason=EC_PostOnlyWillTakeLiquidity (not Rejected), so treat that as a rejection too.
+        let is_rejection = order.order_status == crate::common::enums::BybitOrderStatus::Rejected
+            || (order.order_status == crate::common::enums::BybitOrderStatus::Canceled
+                && bybit_rejection_due_post_only(order.reject_reason.as_str()));
+        if is_rejection && (order.cum_exec_qty.as_str() == "0" || order.cum_exec_qty.is_empty()) {
             return Err(BybitSubmitOrderError::Rejected {
                 reason: order.reject_reason.to_string(),
             }
@@ -3391,6 +3556,134 @@ impl BybitHttpClient {
         Ok(instruments)
     }
 
+    /// Requests full instrument definitions and their market statuses in a single endpoint pass.
+    ///
+    /// Both are parsed from the same `/v5/market/instruments-info` response, avoiding a second
+    /// round-trip when a caller needs definitions and statuses together (e.g. the polling loop
+    /// serving both instrument and status subscriptions).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails or parsing fails.
+    pub async fn request_instruments_with_statuses(
+        &self,
+        product_type: BybitProductType,
+    ) -> anyhow::Result<(
+        Vec<InstrumentAny>,
+        AHashMap<InstrumentId, MarketStatusAction>,
+    )> {
+        let ts_init = self.generate_ts_init();
+        let mut statuses = AHashMap::new();
+
+        let default_fee_rate = |symbol: Ustr| BybitFeeRate {
+            symbol,
+            taker_fee_rate: "0.001".to_string(),
+            maker_fee_rate: "0.001".to_string(),
+            base_coin: None,
+        };
+
+        // A perp with a non-zero delivery time is scheduled for delisting.
+        let perp_status = |status: MarketStatusAction, is_scheduled_perp: bool| {
+            if status == MarketStatusAction::Trading && is_scheduled_perp {
+                MarketStatusAction::PreClose
+            } else {
+                status
+            }
+        };
+
+        let instruments = match product_type {
+            BybitProductType::Spot => {
+                let fee_map = self.fetch_fee_map(product_type, None).await?;
+                self.paginate_instruments::<BybitInstrumentSpot, _>(
+                    product_type,
+                    &None::<String>,
+                    None,
+                    |def| {
+                        let id = InstrumentId::new(
+                            Symbol::from(make_bybit_symbol(def.symbol, product_type)),
+                            *BYBIT_VENUE,
+                        );
+                        statuses.insert(id, MarketStatusAction::from(def.status));
+                        let fee = fee_map
+                            .get(&def.symbol)
+                            .cloned()
+                            .unwrap_or_else(|| default_fee_rate(def.symbol));
+                        parse_spot_instrument(def, &fee, ts_init, ts_init).ok()
+                    },
+                )
+                .await?
+            }
+            BybitProductType::Linear => {
+                let fee_map = self.fetch_fee_map(product_type, None).await?;
+                self.paginate_instruments::<BybitInstrumentLinear, _>(
+                    product_type,
+                    &None::<String>,
+                    None,
+                    |def| {
+                        let id = InstrumentId::new(
+                            Symbol::from(make_bybit_symbol(def.symbol, product_type)),
+                            *BYBIT_VENUE,
+                        );
+                        let scheduled = def.contract_type == BybitContractType::LinearPerpetual
+                            && def.delivery_time != "0";
+                        statuses.insert(id, perp_status(def.status.into(), scheduled));
+                        let fee = fee_map
+                            .get(&def.symbol)
+                            .cloned()
+                            .unwrap_or_else(|| default_fee_rate(def.symbol));
+                        parse_linear_instrument(def, &fee, ts_init, ts_init).ok()
+                    },
+                )
+                .await?
+            }
+            BybitProductType::Inverse => {
+                let fee_map = self.fetch_fee_map(product_type, None).await?;
+                self.paginate_instruments::<BybitInstrumentInverse, _>(
+                    product_type,
+                    &None::<String>,
+                    None,
+                    |def| {
+                        let id = InstrumentId::new(
+                            Symbol::from(make_bybit_symbol(def.symbol, product_type)),
+                            *BYBIT_VENUE,
+                        );
+                        let scheduled = def.contract_type == BybitContractType::InversePerpetual
+                            && def.delivery_time != "0";
+                        statuses.insert(id, perp_status(def.status.into(), scheduled));
+                        let fee = fee_map
+                            .get(&def.symbol)
+                            .cloned()
+                            .unwrap_or_else(|| default_fee_rate(def.symbol));
+                        parse_inverse_instrument(def, &fee, ts_init, ts_init).ok()
+                    },
+                )
+                .await?
+            }
+            BybitProductType::Option => {
+                let fee_map = self.fetch_option_fee_map(None).await?;
+                self.paginate_instruments::<BybitInstrumentOption, _>(
+                    product_type,
+                    &None::<String>,
+                    None,
+                    |def| {
+                        let id = InstrumentId::new(
+                            Symbol::from(make_bybit_symbol(def.symbol, product_type)),
+                            *BYBIT_VENUE,
+                        );
+                        statuses.insert(id, MarketStatusAction::from(def.status));
+                        let fee = fee_map.get(&def.base_coin);
+                        parse_option_instrument(def, fee, ts_init, ts_init).ok()
+                    },
+                )
+                .await?
+            }
+        };
+
+        self.cache_instruments(&instruments);
+
+        Ok((instruments, statuses))
+    }
+
     /// Request ticker information for market data.
     ///
     /// Fetches ticker data from Bybit's `/v5/market/tickers` endpoint and returns
@@ -3490,7 +3783,7 @@ impl BybitHttpClient {
         instrument_id: InstrumentId,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<TradeTick>> {
-        let instrument = self.instrument_from_cache(&instrument_id.symbol)?;
+        let instrument = self.instrument_from_cache_by_id(instrument_id)?;
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())?;
 
         let mut params_builder = BybitTradesParamsBuilder::default();
@@ -3535,7 +3828,7 @@ impl BybitHttpClient {
         end: Option<DateTime<Utc>>,
         limit: Option<u32>,
     ) -> anyhow::Result<Vec<FundingRateUpdate>> {
-        let instrument = self.instrument_from_cache(&instrument_id.symbol)?;
+        let instrument = self.instrument_from_cache_by_id(instrument_id)?;
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())?;
 
         let start_ms = start.map(|dt| dt.timestamp_millis());
@@ -3661,7 +3954,7 @@ impl BybitHttpClient {
         instrument_id: InstrumentId,
         limit: Option<u32>,
     ) -> anyhow::Result<OrderBookDeltas> {
-        let instrument = self.instrument_from_cache(&instrument_id.symbol)?;
+        let instrument = self.instrument_from_cache_by_id(instrument_id)?;
         let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())?;
 
         let mut params_builder = BybitOrderbookParamsBuilder::default();
@@ -3712,8 +4005,9 @@ impl BybitHttpClient {
         limit: Option<u32>,
         timestamp_on_close: bool,
     ) -> anyhow::Result<Vec<Bar>> {
-        let instrument = self.instrument_from_cache(&bar_type.instrument_id().symbol)?;
-        let bybit_symbol = BybitSymbol::new(bar_type.instrument_id().symbol.as_str())?;
+        let instrument_id = bar_type.instrument_id();
+        let instrument = self.instrument_from_cache_by_id(instrument_id)?;
+        let bybit_symbol = BybitSymbol::new(instrument_id.symbol.as_str())?;
 
         // Convert Nautilus BarSpec to Bybit interval
         let interval = bar_spec_to_bybit_interval(
@@ -3853,6 +4147,14 @@ impl BybitHttpClient {
         }
 
         Ok(all_bars)
+    }
+
+    fn instrument_from_cache_by_id(
+        &self,
+        instrument_id: InstrumentId,
+    ) -> anyhow::Result<InstrumentAny> {
+        self.get_instrument(&instrument_id.symbol.inner())
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id).into())
     }
 
     /// Requests trading fee rates for the specified product type and optional filters.

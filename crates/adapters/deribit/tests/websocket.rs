@@ -97,7 +97,8 @@ fn create_btc_perpetual() -> InstrumentAny {
         None, // margin_maint
         None, // maker_fee
         None, // taker_fee
-        None,
+        None, // tick_scheme
+        None, // info
         UnixNanos::default(),
         UnixNanos::default(),
     ))
@@ -617,6 +618,7 @@ fn create_test_client(ws_url: &str) -> DeribitWebSocketClient {
         None,                        // api_key
         None,                        // api_secret
         30,                          // heartbeat_interval
+        None,                        // auth_timeout_secs
         DeribitEnvironment::Testnet, // environment,
         TransportBackend::default(),
         None, // proxy_url
@@ -678,6 +680,7 @@ async fn test_wait_until_active_timeout() {
         None,                        // api_key
         None,                        // api_secret
         30,                          // heartbeat_interval
+        None,                        // auth_timeout_secs
         DeribitEnvironment::Testnet, // environment,
         TransportBackend::default(),
         None, // proxy_url
@@ -1618,6 +1621,7 @@ fn create_authenticated_client(ws_url: &str) -> DeribitWebSocketClient {
         Some("test_api_key".to_string()),
         Some("test_api_secret".to_string()),
         30,                          // heartbeat_interval
+        None,                        // auth_timeout_secs
         DeribitEnvironment::Testnet, // environment,
         TransportBackend::default(),
         None, // proxy_url

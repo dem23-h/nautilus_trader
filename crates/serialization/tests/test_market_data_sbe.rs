@@ -24,20 +24,23 @@
 use nautilus_model::{
     data::{
         Bar, BarSpecification, BarType, BookOrder, FundingRateUpdate, IndexPriceUpdate,
-        InstrumentClose, InstrumentStatus, MarkPriceUpdate, OrderBookDelta, OrderBookDeltas,
-        OrderBookDepth10, QuoteTick, TradeTick,
+        InstrumentClose, InstrumentStatus, MarkPriceUpdate, OptionGreekValues, OptionGreeks,
+        OrderBookDelta, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
         stubs::{
             stub_bar, stub_delta, stub_deltas, stub_depth10, stub_instrument_close,
             stub_instrument_status, stub_trade_ethusdt_buyer,
         },
     },
     enums::{
-        AggregationSource, BarAggregation, BookAction, MarketStatusAction, OrderSide, PriceType,
+        AggregationSource, BarAggregation, BookAction, GreeksConvention, MarketStatusAction,
+        OrderSide, PriceType,
     },
     identifiers::InstrumentId,
     types::{Price, Quantity},
 };
-use nautilus_serialization::sbe::{DataAny, FromSbe, FromSbeReuse, SbeEncodeError, ToSbe};
+use nautilus_serialization::sbe::{
+    DataAny, FromSbe, FromSbeReuse, SbeDecodeError, SbeEncodeError, ToSbe,
+};
 use rstest::rstest;
 use rust_decimal_macros::dec;
 use ustr::Ustr;
@@ -81,6 +84,11 @@ sbe_roundtrip_test!(
     IndexPriceUpdate
 );
 sbe_roundtrip_test!(
+    test_option_greeks_roundtrip,
+    sample_option_greeks(),
+    OptionGreeks
+);
+sbe_roundtrip_test!(
     test_instrument_close_roundtrip,
     stub_instrument_close(),
     InstrumentClose
@@ -92,6 +100,23 @@ fn test_book_order_roundtrip() {
         OrderSide::Buy,
         Price::from("100.50"),
         Quantity::from("10"),
+        123_456,
+    );
+
+    let bytes = value.to_sbe().unwrap();
+    let decoded = BookOrder::from_sbe(&bytes).unwrap();
+
+    assert_book_order_fields(&value, &decoded);
+}
+
+#[rstest]
+fn test_sbe_resolved_raw_width_roundtrip() {
+    // Price and Quantity raws exceed 64 bits only under high precision, so this pins decode to
+    // the model's resolved alias rather than this crate's own feature.
+    let value = BookOrder::new(
+        OrderSide::Buy,
+        Price::from("50000.00"),
+        Quantity::from("20000.00"),
         123_456,
     );
 
@@ -250,6 +275,119 @@ fn test_funding_rate_update_zero_values_roundtrip() {
 
     assert_eq!(decoded.interval, Some(0));
     assert_eq!(decoded.next_funding_ns, Some(0.into()));
+}
+
+#[rstest]
+fn test_funding_rate_update_reserved_interval_returns_encode_error() {
+    let value = FundingRateUpdate::new(
+        InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+        dec!(0.0001),
+        Some(u16::MAX),
+        None,
+        9876543210.into(),
+        9876543211.into(),
+    );
+
+    let result = value.to_sbe();
+
+    assert_eq!(
+        result,
+        Err(SbeEncodeError::ReservedValue {
+            field: "FundingRateUpdate.interval",
+        })
+    );
+}
+
+#[rstest]
+fn test_funding_rate_update_reserved_next_funding_returns_encode_error() {
+    let value = FundingRateUpdate::new(
+        InstrumentId::from("ETHUSDT-PERP.BINANCE"),
+        dec!(0.0001),
+        None,
+        Some(u64::MAX.into()),
+        9876543210.into(),
+        9876543211.into(),
+    );
+
+    let result = value.to_sbe();
+
+    assert_eq!(
+        result,
+        Err(SbeEncodeError::ReservedValue {
+            field: "FundingRateUpdate.next_funding_ns",
+        })
+    );
+}
+
+#[rstest]
+fn test_option_greeks_roundtrip_without_optional_fields() {
+    let value = OptionGreeks {
+        instrument_id: InstrumentId::from("ETH-30JUN23-2000-C.DERIBIT"),
+        convention: GreeksConvention::BlackScholes,
+        greeks: OptionGreekValues {
+            delta: 0.12,
+            gamma: 0.002,
+            vega: 8.0,
+            theta: -0.45,
+            rho: 0.06,
+        },
+        mark_iv: None,
+        bid_iv: None,
+        ask_iv: None,
+        underlying_price: None,
+        open_interest: None,
+        ts_event: 2234567890.into(),
+        ts_init: 2234567891.into(),
+    };
+
+    let bytes = value.to_sbe().unwrap();
+    let decoded = OptionGreeks::from_sbe(&bytes).unwrap();
+
+    assert_eq!(value, decoded);
+}
+
+#[rstest]
+fn test_option_greeks_roundtrip_with_zero_optional_fields() {
+    let value = OptionGreeks {
+        instrument_id: InstrumentId::from("ETH-30JUN23-2000-C.DERIBIT"),
+        convention: GreeksConvention::BlackScholes,
+        greeks: OptionGreekValues {
+            delta: 0.12,
+            gamma: 0.002,
+            vega: 8.0,
+            theta: -0.45,
+            rho: 0.06,
+        },
+        mark_iv: Some(0.0),
+        bid_iv: Some(0.0),
+        ask_iv: Some(0.0),
+        underlying_price: Some(0.0),
+        open_interest: Some(0.0),
+        ts_event: 2234567890.into(),
+        ts_init: 2234567891.into(),
+    };
+
+    let bytes = value.to_sbe().unwrap();
+    let decoded = OptionGreeks::from_sbe(&bytes).unwrap();
+
+    assert_eq!(value, decoded);
+}
+
+#[rstest]
+fn test_option_greeks_rejects_unknown_optional_mask_bits() {
+    const OPTION_GREEKS_OPTIONAL_MASK_OFFSET: usize = 9;
+
+    let mut bytes = sample_option_greeks().to_sbe().unwrap();
+    bytes[OPTION_GREEKS_OPTIONAL_MASK_OFFSET] |= 0b1000_0000;
+
+    let err = OptionGreeks::from_sbe(&bytes).unwrap_err();
+
+    assert_eq!(
+        err,
+        SbeDecodeError::InvalidValue {
+            field: "OptionGreeks.optional_mask",
+        }
+    );
 }
 
 #[rstest]
@@ -433,8 +571,13 @@ fn test_data_any_index_price_roundtrip() {
 }
 
 #[rstest]
-fn test_data_any_instrument_close_roundtrip() {
-    assert_data_any_roundtrip_matches_capnp_parity(DataAny::from(stub_instrument_close()));
+fn test_data_any_funding_rate_roundtrip() {
+    assert_data_any_roundtrip_matches_capnp_parity(DataAny::from(sample_funding_rate_update()));
+}
+
+#[rstest]
+fn test_data_any_option_greeks_roundtrip() {
+    assert_data_any_roundtrip_matches_capnp_parity(DataAny::from(sample_option_greeks()));
 }
 
 #[rstest]
@@ -443,8 +586,8 @@ fn test_data_any_instrument_status_roundtrip() {
 }
 
 #[rstest]
-fn test_data_any_funding_rate_roundtrip() {
-    assert_data_any_roundtrip_matches_capnp_parity(DataAny::from(sample_funding_rate_update()));
+fn test_data_any_instrument_close_roundtrip() {
+    assert_data_any_roundtrip_matches_capnp_parity(DataAny::from(stub_instrument_close()));
 }
 
 #[rstest]
@@ -504,6 +647,27 @@ fn sample_funding_rate_update() -> FundingRateUpdate {
         1234567890.into(),
         1234567891.into(),
     )
+}
+
+fn sample_option_greeks() -> OptionGreeks {
+    OptionGreeks {
+        instrument_id: InstrumentId::from("BTC-30JUN23-40000-C.DERIBIT"),
+        convention: GreeksConvention::PriceAdjusted,
+        greeks: OptionGreekValues {
+            delta: 0.525,
+            gamma: 0.00032,
+            vega: 12.25,
+            theta: -0.72,
+            rho: 0.18,
+        },
+        mark_iv: Some(0.52),
+        bid_iv: None,
+        ask_iv: Some(0.54),
+        underlying_price: Some(41_500.25),
+        open_interest: None,
+        ts_event: 1234567892.into(),
+        ts_init: 1234567893.into(),
+    }
 }
 
 fn assert_book_order_fields(expected: &BookOrder, actual: &BookOrder) {
@@ -604,14 +768,17 @@ fn assert_data_any_roundtrip_matches_capnp_parity(value: DataAny) {
         (DataAny::IndexPrice(expected), DataAny::IndexPrice(actual)) => {
             assert_eq!(expected, actual);
         }
-        (DataAny::InstrumentClose(expected), DataAny::InstrumentClose(actual)) => {
+        (DataAny::FundingRate(expected), DataAny::FundingRate(actual)) => {
+            assert_funding_rate_update_fields(&expected, &actual);
+        }
+        (DataAny::OptionGreeks(expected), DataAny::OptionGreeks(actual)) => {
             assert_eq!(expected, actual);
         }
         (DataAny::InstrumentStatus(expected), DataAny::InstrumentStatus(actual)) => {
             assert_instrument_status_matches_capnp_parity(&expected, &actual);
         }
-        (DataAny::FundingRate(expected), DataAny::FundingRate(actual)) => {
-            assert_funding_rate_update_fields(&expected, &actual);
+        (DataAny::InstrumentClose(expected), DataAny::InstrumentClose(actual)) => {
+            assert_eq!(expected, actual);
         }
         (DataAny::OrderBookDelta(expected), DataAny::OrderBookDelta(actual)) => {
             assert_order_book_delta_fields(&expected, &actual);

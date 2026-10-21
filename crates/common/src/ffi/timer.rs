@@ -164,7 +164,7 @@ impl Drop for TimeEventHandler_API {
                 entry.1 -= 1;
                 return;
             }
-            // This was the final handler – remove entry and drop Arc under GIL
+            // This was the final handler - remove entry and drop Arc under GIL
             let (arc, _) = map.remove(&key).unwrap();
             Python::attach(|_| drop(arc));
         }
@@ -189,11 +189,6 @@ impl Clone for TimeEventHandler_API {
             callback_ptr: self.callback_ptr,
         }
     }
-}
-
-#[cfg(not(feature = "python"))]
-impl Drop for TimeEventHandler_API {
-    fn drop(&mut self) {}
 }
 
 impl TimeEventHandler_API {

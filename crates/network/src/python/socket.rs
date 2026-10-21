@@ -15,8 +15,8 @@
 
 use std::{sync::atomic::Ordering, time::Duration};
 
-use nautilus_core::python::{clone_py_object, to_pyruntime_err};
-use pyo3::{Py, prelude::*};
+use nautilus_core::python::{clone_py_object, to_pyruntime_err, to_pyvalue_err};
+use pyo3::{Py, prelude::*, types::PyBytes};
 use tokio_tungstenite::tungstenite::stream::Mode;
 
 use crate::{
@@ -46,7 +46,7 @@ impl SocketConfig {
         reconnect_max_attempts: Option<u32>,
         idle_timeout_ms: Option<u64>,
         certs_dir: Option<String>,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let mode = if ssl { Mode::Tls } else { Mode::Plain };
 
         // Create function pointer that calls Python handler
@@ -59,7 +59,7 @@ impl SocketConfig {
             });
         });
 
-        Self {
+        let config = Self {
             url,
             mode,
             suffix,
@@ -74,7 +74,95 @@ impl SocketConfig {
             reconnect_max_attempts,
             idle_timeout_ms,
             certs_dir,
-        }
+        };
+        config.validate().map_err(to_pyvalue_err)?;
+        Ok(config)
+    }
+
+    #[getter]
+    #[pyo3(name = "url")]
+    fn py_url(&self) -> &str {
+        &self.url
+    }
+
+    #[getter]
+    #[pyo3(name = "ssl")]
+    fn py_ssl(&self) -> bool {
+        matches!(self.mode, Mode::Tls)
+    }
+
+    #[getter]
+    #[pyo3(name = "suffix")]
+    fn py_suffix(&self, py: Python<'_>) -> Py<PyBytes> {
+        PyBytes::new(py, &self.suffix).into()
+    }
+
+    #[getter]
+    #[pyo3(name = "has_handler")]
+    fn py_has_handler(&self) -> bool {
+        self.message_handler.is_some()
+    }
+
+    #[getter]
+    #[pyo3(name = "heartbeat")]
+    fn py_heartbeat(&self, py: Python<'_>) -> Option<(u64, Py<PyBytes>)> {
+        self.heartbeat
+            .as_ref()
+            .map(|(interval_secs, payload)| (*interval_secs, PyBytes::new(py, payload).into()))
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_timeout_ms")]
+    const fn py_reconnect_timeout_ms(&self) -> Option<u64> {
+        self.reconnect_timeout_ms
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_delay_initial_ms")]
+    const fn py_reconnect_delay_initial_ms(&self) -> Option<u64> {
+        self.reconnect_delay_initial_ms
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_delay_max_ms")]
+    const fn py_reconnect_delay_max_ms(&self) -> Option<u64> {
+        self.reconnect_delay_max_ms
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_backoff_factor")]
+    const fn py_reconnect_backoff_factor(&self) -> Option<f64> {
+        self.reconnect_backoff_factor
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_jitter_ms")]
+    const fn py_reconnect_jitter_ms(&self) -> Option<u64> {
+        self.reconnect_jitter_ms
+    }
+
+    #[getter]
+    #[pyo3(name = "connection_max_retries")]
+    const fn py_connection_max_retries(&self) -> Option<u32> {
+        self.connection_max_retries
+    }
+
+    #[getter]
+    #[pyo3(name = "reconnect_max_attempts")]
+    const fn py_reconnect_max_attempts(&self) -> Option<u32> {
+        self.reconnect_max_attempts
+    }
+
+    #[getter]
+    #[pyo3(name = "idle_timeout_ms")]
+    const fn py_idle_timeout_ms(&self) -> Option<u64> {
+        self.idle_timeout_ms
+    }
+
+    #[getter]
+    #[pyo3(name = "certs_dir")]
+    fn py_certs_dir(&self) -> Option<&str> {
+        self.certs_dir.as_deref()
     }
 }
 
@@ -82,6 +170,10 @@ impl SocketConfig {
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 impl SocketClient {
     /// Connect to the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns any error connecting to the server.
     #[staticmethod]
     #[pyo3(name = "connect")]
     #[pyo3(signature = (config, post_connection=None, post_reconnection=None, post_disconnection=None))]
@@ -205,7 +297,11 @@ impl SocketClient {
                     log::warn!("Cannot reconnect - socket closed");
                 }
                 ConnectionMode::Active => {
-                    connection_mode.store(ConnectionMode::Reconnect.as_u8(), Ordering::SeqCst);
+                    // CAS so a concurrent close cannot be overwritten back to Reconnect
+                    if !ConnectionMode::request_reconnect(&connection_mode) {
+                        log::warn!("Cannot reconnect - socket no longer active");
+                        return Ok(());
+                    }
                     state_notify.notify_one();
 
                     let fallback_interval = Duration::from_millis(100);
@@ -264,7 +360,8 @@ impl SocketClient {
                     log::debug!("Socket already disconnecting");
                 }
                 _ => {
-                    connection_mode.store(ConnectionMode::Disconnect.as_u8(), Ordering::SeqCst);
+                    // Preserve a CLOSED terminal state reached concurrently
+                    ConnectionMode::request_disconnect(&connection_mode);
                     state_notify.notify_one();
 
                     let timeout = tokio::time::timeout(Duration::from_secs(5), async {
@@ -275,7 +372,7 @@ impl SocketClient {
                     .await;
 
                     if timeout.is_err() {
-                        log::error!("Timeout waiting for socket to close, forcing closed state");
+                        log::warn!("Timeout waiting for socket to close, forcing closed state");
                         connection_mode.store(ConnectionMode::Closed.as_u8(), Ordering::SeqCst);
                     }
                 }

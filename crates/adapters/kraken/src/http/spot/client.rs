@@ -29,6 +29,7 @@ use ahash::AHashMap;
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use indexmap::IndexMap;
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     AtomicMap, AtomicTime, UUID4, consts::NAUTILUS_USER_AGENT, datetime::NANOSECONDS_IN_SECOND,
     nanos::UnixNanos, time::get_atomic_clock_realtime,
@@ -75,7 +76,10 @@ use crate::{
         },
         urls::get_kraken_http_base_url,
     },
-    http::error::{KrakenHttpError, kraken_http_should_retry},
+    http::{
+        apply_count_limit,
+        error::{KrakenHttpError, kraken_http_should_retry},
+    },
 };
 
 /// Default Kraken Spot REST API rate limit (requests per second).
@@ -1380,7 +1384,7 @@ impl KrakenSpotHttpClient {
             {
                 Ok(tokenized_pairs) => {
                     if !tokenized_pairs.is_empty() {
-                        log::info!("Fetched {} tokenized asset pairs", tokenized_pairs.len());
+                        log::debug!("Fetched {} tokenized asset pairs", tokenized_pairs.len());
                     }
                     let tokenized_instruments: Vec<InstrumentAny> =
                         tokenized_pairs
@@ -1440,9 +1444,9 @@ impl KrakenSpotHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}",
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1469,12 +1473,6 @@ impl KrakenSpotHttpClient {
                             continue;
                         }
                         trades.push(trade_tick);
-
-                        if let Some(limit_count) = limit
-                            && trades.len() >= limit_count as usize
-                        {
-                            return Ok(trades);
-                        }
                     }
                     Err(e) => {
                         log::warn!("Failed to parse trade tick: {e}");
@@ -1482,6 +1480,9 @@ impl KrakenSpotHttpClient {
                 }
             }
         }
+
+        // Count-only keeps the most recent `limit` trades, not the oldest
+        apply_count_limit(&mut trades, start, limit);
 
         Ok(trades)
     }
@@ -1498,9 +1499,9 @@ impl KrakenSpotHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1549,12 +1550,6 @@ impl KrakenSpotHttpClient {
                             continue;
                         }
                         bars.push(bar);
-
-                        if let Some(limit_count) = limit
-                            && bars.len() >= limit_count as usize
-                        {
-                            return Ok(bars);
-                        }
                     }
                     Err(e) => {
                         log::warn!("Failed to parse bar: {e}");
@@ -1562,6 +1557,10 @@ impl KrakenSpotHttpClient {
                 }
             }
         }
+
+        // Kraken returns the page oldest-first; keep the most recent `limit`
+        // bars for count-only requests rather than the oldest (issue #4254).
+        apply_count_limit(&mut bars, start, limit);
 
         Ok(bars)
     }
@@ -1575,9 +1574,9 @@ impl KrakenSpotHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1602,8 +1601,16 @@ impl KrakenSpotHttpClient {
         for (i, level) in book_data.bids.iter().enumerate() {
             let price_str = level.first().and_then(|v| v.as_str()).unwrap_or("0");
             let size_str = level.get(1).and_then(|v| v.as_str()).unwrap_or("0");
-            let price = Price::new(price_str.parse::<f64>().unwrap_or(0.0), price_precision);
-            let size = Quantity::new(size_str.parse::<f64>().unwrap_or(0.0), size_precision);
+            let price = Price::from_decimal_dp(
+                Decimal::from_str_exact(price_str).unwrap_or(Decimal::ZERO),
+                price_precision,
+            )
+            .map_err(|e| KrakenHttpError::ParseError(e.to_string()))?;
+            let size = Quantity::from_decimal_dp(
+                Decimal::from_str_exact(size_str).unwrap_or(Decimal::ZERO),
+                size_precision,
+            )
+            .map_err(|e| KrakenHttpError::ParseError(e.to_string()))?;
             let order = BookOrder::new(OrderSide::Buy, price, size, i as u64);
             book.add(order, 0, 0, ts_event);
         }
@@ -1613,8 +1620,16 @@ impl KrakenSpotHttpClient {
         for (i, level) in book_data.asks.iter().enumerate() {
             let price_str = level.first().and_then(|v| v.as_str()).unwrap_or("0");
             let size_str = level.get(1).and_then(|v| v.as_str()).unwrap_or("0");
-            let price = Price::new(price_str.parse::<f64>().unwrap_or(0.0), price_precision);
-            let size = Quantity::new(size_str.parse::<f64>().unwrap_or(0.0), size_precision);
+            let price = Price::from_decimal_dp(
+                Decimal::from_str_exact(price_str).unwrap_or(Decimal::ZERO),
+                price_precision,
+            )
+            .map_err(|e| KrakenHttpError::ParseError(e.to_string()))?;
+            let size = Quantity::from_decimal_dp(
+                Decimal::from_str_exact(size_str).unwrap_or(Decimal::ZERO),
+                size_precision,
+            )
+            .map_err(|e| KrakenHttpError::ParseError(e.to_string()))?;
             let order = BookOrder::new(OrderSide::Sell, price, size, (bids_len + i) as u64);
             book.add(order, 0, 0, ts_event);
         }
@@ -2066,11 +2081,7 @@ impl KrakenSpotHttpClient {
         for (_, (signed_qty, inst_id)) in agg {
             let instrument = self
                 .get_cached_instrument(&inst_id.symbol.inner())
-                .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "OpenPositions: instrument disappeared from cache for {inst_id}"
-                    )
-                })?;
+                .ok_or_else(|| InstrumentLookupError::not_found(inst_id))?;
 
             let side = if signed_qty.is_sign_positive() && !signed_qty.is_zero() {
                 PositionSideSpecified::Long
@@ -2132,15 +2143,15 @@ impl KrakenSpotHttpClient {
     ) -> anyhow::Result<Vec<PositionStatusReport>> {
         let balances_raw = self.inner.get_balance().await?;
         let ts_init = self.generate_ts_init();
-        let mut wallet_by_coin: HashMap<Ustr, f64> = HashMap::new();
+        let mut wallet_by_coin: HashMap<Ustr, Decimal> = HashMap::new();
 
         for (currency_code, amount_str) in &balances_raw {
-            let balance = match amount_str.parse::<f64>() {
+            let balance = match Decimal::from_str_exact(amount_str) {
                 Ok(b) => b,
                 Err(_) => continue,
             };
 
-            if balance == 0.0 {
+            if balance.is_zero() {
                 continue;
             }
 
@@ -2157,16 +2168,16 @@ impl KrakenSpotHttpClient {
                 };
 
                 let coin = Ustr::from(normalize_currency_code(base_currency.code.as_str()));
-                let wallet_balance = wallet_by_coin.get(&coin).copied().unwrap_or(0.0);
+                let wallet_balance = wallet_by_coin.get(&coin).copied().unwrap_or(Decimal::ZERO);
 
-                let side = if wallet_balance > 0.0 {
+                let side = if wallet_balance > Decimal::ZERO {
                     PositionSideSpecified::Long
                 } else {
                     PositionSideSpecified::Flat
                 };
 
                 let abs_balance = wallet_balance.abs();
-                let quantity = Quantity::new(abs_balance, instrument.size_precision());
+                let quantity = Quantity::from_decimal_dp(abs_balance, instrument.size_precision())?;
 
                 let report = PositionStatusReport::new(
                     account_id,
@@ -2198,14 +2209,15 @@ impl KrakenSpotHttpClient {
                 };
 
                 let coin = Ustr::from(normalize_currency_code(base_currency.code.as_str()));
-                let wallet_balance = wallet_by_coin.get(&coin).copied().unwrap_or(0.0);
+                let wallet_balance = wallet_by_coin.get(&coin).copied().unwrap_or(Decimal::ZERO);
 
-                if wallet_balance == 0.0 {
+                if wallet_balance.is_zero() {
                     continue;
                 }
 
                 let side = PositionSideSpecified::Long;
-                let quantity = Quantity::new(wallet_balance, instrument.size_precision());
+                let quantity =
+                    Quantity::from_decimal_dp(wallet_balance, instrument.size_precision())?;
 
                 if quantity.is_zero() {
                     continue;
@@ -2478,7 +2490,7 @@ impl KrakenSpotHttpClient {
     ) -> anyhow::Result<VenueOrderId> {
         let _ = self
             .get_cached_instrument(&instrument_id.symbol.inner())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let txid = venue_order_id.as_ref().map(|id| id.to_string());
         let cl_ord_id = client_order_id.as_ref().map(truncate_cl_ord_id);
@@ -2539,7 +2551,7 @@ impl KrakenSpotHttpClient {
     ) -> anyhow::Result<()> {
         let _ = self
             .get_cached_instrument(&instrument_id.symbol.inner())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let txid = venue_order_id.as_ref().map(|id| id.to_string());
         let cl_ord_id = client_order_id.as_ref().map(truncate_cl_ord_id);
@@ -2612,7 +2624,7 @@ impl KrakenSpotHttpClient {
     ) -> anyhow::Result<KrakenSpotAddOrderParams> {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let raw_symbol = instrument.raw_symbol().inner();
         let asset_class = Self::asset_class_for(&instrument);
@@ -3091,6 +3103,7 @@ mod tests {
             8,
             Price::from("0.1"),
             Quantity::from("0.00000001"),
+            None,
             None,
             None,
             None,

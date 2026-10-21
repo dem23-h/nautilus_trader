@@ -47,11 +47,11 @@ class AccountOrderRef(NamedTuple):
 
 def get_venue_order_id(order_id: int, perm_id: int) -> VenueOrderId:
     """
-    Get venue order ID, using permId for external orders (orderId=0).
+    Get venue order ID, preferring IB's permanent order ID.
 
-    IB assigns orderId=0 to external orders (placed via TWS or other clients) and
-    completed orders. Since multiple orders can have orderId=0, we use the unique
-    permId to identify them.
+    IB order IDs are only unique within an API client/session, so once a permId
+    is available it is used as the stable venue order ID. A raw orderId is only
+    used as a temporary fallback while IB has not yet assigned a permId.
 
     Parameters
     ----------
@@ -65,9 +65,9 @@ def get_venue_order_id(order_id: int, perm_id: int) -> VenueOrderId:
     VenueOrderId
 
     """
-    if order_id != 0:
-        return VenueOrderId(str(order_id))
-    return VenueOrderId(f"PERM-{perm_id}")
+    if perm_id != 0:
+        return VenueOrderId(f"PERM-{perm_id}")
+    return VenueOrderId(str(order_id))
 
 
 class IBPosition(NamedTuple):
@@ -525,7 +525,12 @@ class BaseMixin:
     _msgbus: MessageBus
     _host: str
     _port: int
+    _configured_client_id: int
     _client_id: int
+    _client_id_collision_count: int
+    _client_id_reuse_limit: int
+    _max_client_id_offset: int
+    _fetch_all_open_orders: bool
     _request_timeout_secs: int
     _requests: Requests
     _instrument_provider: (
@@ -554,9 +559,14 @@ class BaseMixin:
     # Connection
     _reconnect_attempts: int
     _reconnect_delay: int
+    _reconnect_delay_max: int
+    _reconnect_jitter_secs: int
     _max_reconnect_attempts: int
     _indefinite_reconnect: bool
     _last_disconnection_ns: int | None
+    _next_client_id: Callable
+    _data_farm_degraded_since_ns: int | None
+    _data_farm_resubscription_task: Any  # asyncio.Task | None
 
     # MarketData
     _bar_type_to_last_bar: dict[str, BarData | None]

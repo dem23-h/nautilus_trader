@@ -27,13 +27,18 @@ use nautilus_model::{
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, MarginBalance, Money, Price, Quantity},
 };
+use rust_decimal::Decimal;
 
 use super::log_not_implemented;
 use crate::messages::execution::{
-    BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
+    BatchCancelOrders, BatchModifyOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
     GenerateOrderStatusReport, GenerateOrderStatusReports, GeneratePositionStatusReports,
     ModifyOrder, QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
 };
+
+/// Default maximum absolute position difference tolerated during reconciliation.
+pub const DEFAULT_POSITION_RECONCILIATION_TOLERANCE: Decimal =
+    Decimal::from_parts(1, 0, 0, false, 8);
 
 /// Defines the interface for an execution client managing order operations.
 ///
@@ -50,6 +55,11 @@ pub trait ExecutionClient {
     fn oms_type(&self) -> OmsType;
     fn get_account(&self) -> Option<AccountAny>;
 
+    /// Returns the maximum absolute position difference tolerated during reconciliation.
+    fn position_reconciliation_tolerance(&self) -> Decimal {
+        DEFAULT_POSITION_RECONCILIATION_TOLERANCE
+    }
+
     /// Returns whether this client can execute orders for the given instrument venue.
     ///
     /// Single-venue clients should use the default behavior. Routing brokers can
@@ -60,6 +70,10 @@ pub trait ExecutionClient {
     }
 
     /// Generates and publishes the account state event.
+    ///
+    /// Implementations may publish synchronously. Callers must release shared state borrows,
+    /// including clock and cache borrows, before calling this method because subscribers may
+    /// access the same state.
     ///
     /// # Errors
     ///
@@ -160,6 +174,21 @@ pub trait ExecutionClient {
     /// Returns an error if modification fails.
     fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
         log_not_implemented(&cmd);
+        Ok(())
+    }
+
+    /// Modifies a batch of orders.
+    ///
+    /// The default implementation fans out to [`Self::modify_order`] so existing execution
+    /// clients remain compatible until they add native batch support.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if any child modification fails.
+    fn batch_modify_orders(&self, cmd: BatchModifyOrders) -> anyhow::Result<()> {
+        for modify in cmd.modifies {
+            self.modify_order(modify)?;
+        }
         Ok(())
     }
 
@@ -317,5 +346,137 @@ pub trait ExecutionClient {
         liquidity_side: LiquiditySide,
     ) -> Option<Money> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{cell::RefCell, rc::Rc};
+
+    use nautilus_core::UUID4;
+    use nautilus_model::{
+        enums::OmsType,
+        identifiers::{TraderId, Venue},
+    };
+    use rstest::rstest;
+
+    use super::*;
+
+    struct RecordingExecutionClient {
+        modified_order_ids: Rc<RefCell<Vec<ClientOrderId>>>,
+    }
+
+    impl RecordingExecutionClient {
+        fn new(modified_order_ids: Rc<RefCell<Vec<ClientOrderId>>>) -> Self {
+            Self { modified_order_ids }
+        }
+    }
+
+    #[async_trait(?Send)]
+    impl ExecutionClient for RecordingExecutionClient {
+        fn is_connected(&self) -> bool {
+            true
+        }
+
+        fn client_id(&self) -> ClientId {
+            ClientId::from("TEST")
+        }
+
+        fn account_id(&self) -> AccountId {
+            AccountId::from("TEST-001")
+        }
+
+        fn venue(&self) -> Venue {
+            Venue::from("SIM")
+        }
+
+        fn oms_type(&self) -> OmsType {
+            OmsType::Netting
+        }
+
+        fn get_account(&self) -> Option<AccountAny> {
+            None
+        }
+
+        fn generate_account_state(
+            &self,
+            _balances: Vec<AccountBalance>,
+            _margins: Vec<MarginBalance>,
+            _reported: bool,
+            _ts_event: UnixNanos,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn start(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn modify_order(&self, cmd: ModifyOrder) -> anyhow::Result<()> {
+            self.modified_order_ids
+                .borrow_mut()
+                .push(cmd.client_order_id);
+
+            Ok(())
+        }
+    }
+
+    #[rstest]
+    fn batch_modify_orders_default_fans_out_to_modify_order() {
+        let modified_order_ids = Rc::new(RefCell::new(Vec::new()));
+        let client = RecordingExecutionClient::new(modified_order_ids.clone());
+        let instrument_id = InstrumentId::from("AUD/USD.SIM");
+        let order1 = ClientOrderId::from("O-DEFAULT-BATCH-001");
+        let order2 = ClientOrderId::from("O-DEFAULT-BATCH-002");
+        let command = BatchModifyOrders::new(
+            TraderId::from("TRADER-001"),
+            Some(ClientId::from("TEST")),
+            StrategyId::from("S-001"),
+            instrument_id,
+            vec![
+                ModifyOrder::new(
+                    TraderId::from("TRADER-001"),
+                    Some(ClientId::from("TEST")),
+                    StrategyId::from("S-001"),
+                    instrument_id,
+                    order1,
+                    None,
+                    Some(Quantity::from("10")),
+                    Some(Price::from("1.00010")),
+                    None,
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    None,
+                    None,
+                ),
+                ModifyOrder::new(
+                    TraderId::from("TRADER-001"),
+                    Some(ClientId::from("TEST")),
+                    StrategyId::from("S-001"),
+                    instrument_id,
+                    order2,
+                    None,
+                    Some(Quantity::from("20")),
+                    Some(Price::from("1.00020")),
+                    None,
+                    UUID4::new(),
+                    UnixNanos::default(),
+                    None,
+                    None,
+                ),
+            ],
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        client.batch_modify_orders(command).unwrap();
+
+        assert_eq!(modified_order_ids.borrow().as_slice(), &[order1, order2]);
     }
 }

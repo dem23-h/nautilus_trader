@@ -24,24 +24,29 @@ CI/CD, testing, publishing, and automation within the NautilusTrader repository.
 
 - **build.yml**: main CI pipeline - plan, pre-commit, cargo-deny, Rust tests, Python tests,
   wheel builds, artifact uploads, release asset uploads, Trusted Publishing to PyPI and crates.io,
-  release attestations, registry verification, release checksum publication, and final GitHub
-  release publication and attestation verification. Uses Depot 8-core runners for Linux and Windows
-  builds. Includes a plan step that skips builds on docs-only changes and skips Rust tests on
-  Python-only changes.
-- **build-v2.yml**: CI pipeline for the v2 Rust-native system. Uses Depot 8-core runners for Linux builds.
+  release preflights, release attestations, registry verification, release checksum publication,
+  final release asset verification, and final GitHub release publication and attestation
+  verification. The nightly merge builds and publishes wheels for every supported platform.
+  A dedicated Linux x86 job runs the workspace Rust suite once, and the required Python wheel jobs
+  fail when that prerequisite fails. The plan step skips builds on docs-only changes and skips Rust
+  tests on Python-only changes.
+- **build-v2.yml**: CI pipeline for the v2 Rust-native system. Runs for every pull request targeting
+  `develop`; its plan step skips builds for docs-only changes. The main build workflow owns the
+  shared workspace Rust suite. This workflow runs Linux x86 builds on the self-hosted `build-v2`
+  pool and the full Python test suite against wheels for every supported platform during the
+  nightly merge. It owns cross-platform nightly validation outside the v1 wheel publication jobs.
 - **build-docs.yml**: dispatches documentation build on `master` and `nightly` pushes.
 - **cli-binaries.yml**: builds and publishes CLI binaries for multiple platforms.
 - **codeql-analysis.yml**: CodeQL security scans for Python and Rust on PRs to `master`, pushes to
   `nightly`, and manual dispatch.
-- **copilot-setup-steps.yml**: environment setup for GitHub Copilot coding agent.
 - **coverage.yml**: coverage report generation, currently paused and runs only on `workflow_dispatch`.
 - **docker.yml**: builds and pushes multi-platform Docker images (`nautilus_trader`, `jupyterlab`)
   using Buildx and native ARM runners.
 - **nightly-docs-features-check.yml**: nightly docs.rs build checks and crate feature compatibility verification.
 - **nightly-merge.yml**: auto-merges `develop` into `nightly` when CI succeeds.
-- **nightly-tests.yml**: extended test suites too slow for PR builds - turmoil network tests plus
-  macOS, Windows, and Linux ARM build-and-test jobs that run daily at 12:00 UTC to give early
-  visibility on develop before `nightly-merge` at 14:00 UTC.
+- **nightly-tests.yml**: extended turmoil network tests plus Cargo publish-plan and dry-run checks
+  that run daily at 12:00 UTC to give early visibility on `develop` before `nightly-merge` at
+  14:00 UTC. It does not repeat the v1 platform build-and-test matrices.
 - **performance.yml**: Rust/Python benchmarks on `nightly`, reporting to CodSpeed.
 - **security-audit.yml**: nightly supply chain security checks (cargo-audit, cargo-deny,
   cargo-vet, pip-audit, osv-scanner, and Zizmor).
@@ -108,20 +113,30 @@ CI/CD, testing, publishing, and automation within the NautilusTrader repository.
   OIDC trusted publishing. The trusted publisher on crates.io must be configured per crate for
   repo `nautechsystems/nautilus_trader`, workflow `build.yml`, and environment `release`; the
   job uses a short-lived token from `rust-lang/crates-io-auth-action` and no long-lived cargo token.
-- **Post-publish verification**: `publish-release-integrity` verifies PyPI files against
-  `dist-manifest.json`, verifies PyPI provenance publisher metadata, verifies crates.io entries
-  were trusted-published by this repository, records whether each crate matches the release commit
-  or was already published, uploads `crates-manifest.json`, attaches attestation siblings, and
-  cleans up release workflow artifacts. `publish-github-release` then publishes the draft release
-  and verifies GitHub's release attestation.
-- **Caching**: Rust target directory cache (`Swatinem/rust-cache`), prek hook environments, and test
-  data caches speed up workflows while preserving hermetic builds. Rust cache saves are restricted
-  to push events to prevent PR cache pollution.
+- **Post-publish verification**: `publish-release-integrity` generates the release manifest, then
+  verifies PyPI files against `dist-manifest.json`, verifies PyPI provenance publisher metadata, and
+  verifies crates.io entries were trusted-published by this repository before attaching checksum
+  assets to the draft release. These verifier calls retry transient Sigstore/Rekor/TUF lag, while
+  provenance and identity mismatches fail fast. The job records whether each crate matches the
+  release commit, was already published, or matched an explicit
+  `CRATES_IO_MANUAL_PUBLISH_EXCEPTIONS` `crate@version` entry for emergency token-publish recovery.
+  Manual entries are recorded in `crates-manifest.json` with
+  `release_status: "manual_token_publish"`. Malformed or unused exception entries fail the job. The
+  job uploads `crates-manifest.json`, attaches attestation siblings, and cleans up release workflow
+  artifacts. `publish-github-release` verifies the final draft asset set, publishes the draft
+  release, and verifies GitHub's release attestation.
+- **Caching**: The dedicated Linux x86 Rust job restores its action cache for untrusted PRs and
+  produces it from trusted `develop` and `test-ci` pushes. Its other self-hosted runs use a
+  persistent target. Linux x86 wheel jobs disable action caching and use persistent targets for
+  trusted pushes. Other wheel-matrix Rust caches save only on pushes. Prek hook environments use a
+  separate cache. The active large Parquet fixtures save after the Rust tests on a cache miss.
 - **Concurrency**: PR CI runs are cancelled when a new push arrives to the same PR. Push events to
   mainline branches are never cancelled.
-- **Runners**: Linux and Windows builds use Depot 8-core runners (32 GB RAM, 150 GB SSD). macOS
-  builds use GitHub free runners. Lightweight jobs (plan, cargo-deny, cargo-vet, publish) use
-  GitHub free runners. Custom runner labels are declared in `.github/actionlint.yaml`.
+- **Runners**: Trusted Linux x86 build and test jobs, including `test-ci`, use the self-hosted build
+  pools. Untrusted PRs use GitHub-hosted runners under the policy below. Depot 8-core runners cover
+  platforms without self-hosted capacity, such as Linux ARM and Windows cross-platform builds.
+  macOS and lightweight jobs use GitHub runners. The scheduled `nightly-tests.yml` workflow uses no
+  Depot runners. Custom runner labels are declared in `.github/actionlint.yaml`.
 
 ### Runtime hardening
 
@@ -131,9 +146,12 @@ CI/CD, testing, publishing, and automation within the NautilusTrader repository.
   declare a GitHub Environment can override the repo or org value with an environment-scoped variable. The
   publish environments (`r2-develop`, `r2-nightly`, `release`) can use this override too. Security audit
   jobs read repo and org variables directly and run in audit mode for fork PRs when variables are absent.
-- **Fork PR handling**: `build.yml` falls back to `egress-policy: audit` for fork PRs. Forks cannot
-  access repo or org variables, so the allow lists would be empty and block all network access. Fork PRs
-  run with read-only permissions and no access to secrets, so audit mode is safe.
+- **Untrusted PR handling**: `build.yml` and `build-v2.yml` use self-hosted runners only for
+  same-repository, non-Dependabot PRs with a known author. Fork and missing-origin PRs use
+  GitHub-hosted runners with `egress-policy: audit` because they cannot read the repository or
+  organization endpoint variables. Dependabot and missing-author PRs also use GitHub-hosted
+  runners, but retain the configured egress policy, which defaults to `block`. These jobs run with
+  read-only permissions and no access to Actions secrets.
 
 ### Security gate override
 

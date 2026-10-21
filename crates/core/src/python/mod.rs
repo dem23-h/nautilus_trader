@@ -31,6 +31,27 @@
 //! consumed from the `nautilus_trader` Python package without sacrificing type-safety or
 //! performance.
 
+/// Implements read-only Python getters for cloneable configuration fields.
+#[macro_export]
+macro_rules! impl_pyo3_config_getters {
+    ($config:ty { $($field:ident: $field_type:ty),+ $(,)? }) => {
+        #[pyo3_stub_gen::derive::gen_stub_pymethods]
+        #[pyo3::pymethods]
+        #[allow(
+            clippy::clone_on_copy,
+            reason = "one macro handles Copy and owned configuration fields"
+        )]
+        impl $config {
+            $(
+                #[getter]
+                fn $field(&self) -> $field_type {
+                    self.$field.clone()
+                }
+            )+
+        }
+    };
+}
+
 pub mod casing;
 pub mod datetime;
 pub mod enums;
@@ -42,10 +63,10 @@ pub mod string;
 pub mod uuid;
 pub mod version;
 
-use std::fmt::Display;
+use std::{convert::Infallible, fmt::Display};
 
 use pyo3::{
-    Py,
+    BoundObject, Py,
     conversion::IntoPyObjectExt,
     exceptions::{
         PyException, PyKeyError, PyNotImplementedError, PyRuntimeError, PyTypeError, PyValueError,
@@ -59,6 +80,7 @@ use pyo3_stub_gen::derive::gen_stub_pyfunction;
 use crate::{
     UUID4,
     consts::{NAUTILUS_USER_AGENT, NAUTILUS_VERSION},
+    correctness::CorrectnessError,
     datetime::{
         MILLISECONDS_IN_SECOND, NANOSECONDS_IN_MICROSECOND, NANOSECONDS_IN_MILLISECOND,
         NANOSECONDS_IN_SECOND,
@@ -107,18 +129,18 @@ pub fn call_python_threadsafe(
     }
 }
 
-/// Extend `IntoPyObjectExt` helper trait to unwrap `Py<PyAny>` after conversion.
+/// Extends `IntoPyObjectExt` with an infallible conversion to `Py<PyAny>`.
 pub trait IntoPyObjectNautilusExt<'py>: IntoPyObjectExt<'py> {
-    /// Convert `self` into a [`Py<PyAny>`] while *panicking* if the conversion fails.
-    ///
-    /// This is a convenience wrapper around [`IntoPyObjectExt::into_py_any`] that avoids the
-    /// cumbersome `Result` handling when we are certain that the conversion cannot fail (for
-    /// instance when we are converting primitives or other types that already implement the
-    /// necessary PyO3 traits).
+    /// Converts `self` into a [`Py<PyAny>`] when the underlying conversion is infallible.
     #[inline]
-    fn into_py_any_unwrap(self, py: Python<'py>) -> Py<PyAny> {
-        self.into_py_any(py)
-            .expect("Failed to convert type to Py<PyAny>")
+    fn into_py_any_unwrap(self, py: Python<'py>) -> Py<PyAny>
+    where
+        Self: IntoPyObject<'py, Error = Infallible>,
+    {
+        match self.into_pyobject(py) {
+            Ok(obj) => obj.into_any().unbind(),
+            Err(never) => match never {},
+        }
     }
 }
 
@@ -135,6 +157,16 @@ pub fn get_pytype_name<'py>(obj: &Bound<'py, PyAny>) -> PyResult<Bound<'py, PySt
 
 /// Converts any type that implements `Display` to a Python `ValueError`.
 pub fn to_pyvalue_err(e: impl Display) -> PyErr {
+    PyValueError::new_err(e.to_string())
+}
+
+/// Converts a correctness check failure to a Python `ValueError`.
+#[must_use]
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Result::map_err passes owned errors to conversion functions"
+)]
+pub fn correctness_error_to_pyvalue_err(e: CorrectnessError) -> PyErr {
     PyValueError::new_err(e.to_string())
 }
 
@@ -217,4 +249,40 @@ pub fn core(_: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(datetime::py_last_weekday_nanos, m)?)?;
     m.add_function(wrap_pyfunction!(datetime::py_is_within_last_24_hours, m)?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Once;
+
+    use pyo3::{Python, exceptions::PyValueError};
+    use rstest::rstest;
+
+    use super::*;
+
+    fn ensure_python_initialized() {
+        static INIT: Once = Once::new();
+        INIT.call_once(|| {
+            Python::initialize();
+        });
+    }
+
+    #[rstest]
+    fn test_correctness_error_to_pyvalue_err_preserves_display_text() {
+        ensure_python_initialized();
+
+        let error = CorrectnessError::EmptyString {
+            param: "value".to_string(),
+        };
+
+        Python::attach(|py| {
+            let py_err = correctness_error_to_pyvalue_err(error);
+
+            assert!(py_err.is_instance_of::<PyValueError>(py));
+            assert_eq!(
+                py_err.value(py).to_string(),
+                "invalid string for 'value', was empty"
+            );
+        });
+    }
 }

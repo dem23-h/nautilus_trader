@@ -21,6 +21,7 @@ use datafusion::{
     physical_plan::SendableRecordBatchStream, prelude::*,
 };
 use futures::StreamExt;
+use nautilus_common::live::get_runtime;
 use nautilus_core::{UnixNanos, ffi::cvec::CVec};
 use nautilus_model::data::{Data, HasTsInit};
 use nautilus_serialization::arrow::{
@@ -68,7 +69,7 @@ pub type QueryResult = KMerge<EagerStream<std::vec::IntoIter<Data>>, Data, TsIni
 )]
 pub struct DataBackendSession {
     pub chunk_size: usize,
-    pub runtime: Arc<tokio::runtime::Runtime>,
+    pub runtime: tokio::runtime::Handle,
     session_ctx: SessionContext,
     batch_streams: Vec<EagerStream<IntoIter<Data>>>,
     registered_tables: AHashSet<String>,
@@ -78,10 +79,6 @@ impl DataBackendSession {
     /// Creates a new [`DataBackendSession`] instance.
     #[must_use]
     pub fn new(chunk_size: usize) -> Self {
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .unwrap();
         let session_cfg = SessionConfig::new()
             .set_str("datafusion.optimizer.repartition_file_scans", "false")
             .set_str("datafusion.optimizer.prefer_existing_sort", "true");
@@ -90,7 +87,7 @@ impl DataBackendSession {
             session_ctx,
             batch_streams: Vec::default(),
             chunk_size,
-            runtime: Arc::new(runtime),
+            runtime: get_runtime().handle().clone(),
             registered_tables: AHashSet::new(),
         }
     }
@@ -100,7 +97,12 @@ impl DataBackendSession {
         self.session_ctx.register_object_store(url, object_store);
     }
 
-    /// Register an object store with the session context from a URI with optional storage options
+    /// Register an object store with the session context from a URI with optional storage options.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the object store URI cannot be normalized or the backend
+    /// cannot be created.
     pub fn register_object_store_from_uri(
         &mut self,
         uri: &str,
@@ -116,6 +118,11 @@ impl DataBackendSession {
         Ok(())
     }
 
+    /// Writes encoded data to a streaming sink.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if Arrow encoding or stream writing fails.
     pub fn write_data<T: EncodeToRecordBatch>(
         data: &[T],
         metadata: &AHashMap<String, String>,
@@ -143,6 +150,11 @@ impl DataBackendSession {
     ///
     /// The file data must be ordered by the `ts_init` in ascending order for this
     /// to work correctly.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if parquet registration, SQL planning, stream execution, or
+    /// data decoding setup fails.
     pub fn add_file<T>(
         &mut self,
         table_name: &str,
@@ -167,19 +179,19 @@ impl DataBackendSession {
                 }]],
                 ..Default::default()
             };
-            self.runtime.block_on(self.session_ctx.register_parquet(
-                table_name,
-                file_path,
-                parquet_options,
-            ))?;
+            super::block_on(
+                &self.runtime,
+                self.session_ctx
+                    .register_parquet(table_name, file_path, parquet_options),
+            )?;
 
             self.registered_tables.insert(table_name.to_string());
 
             // Only add batch stream for newly registered tables to avoid duplicates
             let default_query = format!("SELECT * FROM {table_name} ORDER BY ts_init");
             let sql_query = sql_query.unwrap_or(&default_query);
-            let query = self.runtime.block_on(self.session_ctx.sql(sql_query))?;
-            let batch_stream = self.runtime.block_on(query.execute_stream())?;
+            let query = super::block_on(&self.runtime, self.session_ctx.sql(sql_query))?;
+            let batch_stream = super::block_on(&self.runtime, query.execute_stream())?;
             self.add_batch_stream::<T>(batch_stream, custom_type_name.map(String::from));
         }
 
@@ -187,6 +199,11 @@ impl DataBackendSession {
     }
 
     /// Registers a Parquet file and executes a query, returning the raw record batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if parquet registration, SQL planning, stream execution, or
+    /// batch collection fails.
     pub fn collect_query_batches(
         &mut self,
         table_name: &str,
@@ -203,21 +220,21 @@ impl DataBackendSession {
                 }]],
                 ..Default::default()
             };
-            self.runtime.block_on(self.session_ctx.register_parquet(
-                table_name,
-                file_path,
-                parquet_options,
-            ))?;
+            super::block_on(
+                &self.runtime,
+                self.session_ctx
+                    .register_parquet(table_name, file_path, parquet_options),
+            )?;
 
             self.registered_tables.insert(table_name.to_string());
         }
 
         let default_query = format!("SELECT * FROM {table_name} ORDER BY ts_init");
         let sql_query = sql_query.unwrap_or(&default_query);
-        let query = self.runtime.block_on(self.session_ctx.sql(sql_query))?;
-        let mut batch_stream = self.runtime.block_on(query.execute_stream())?;
+        let query = super::block_on(&self.runtime, self.session_ctx.sql(sql_query))?;
+        let mut batch_stream = super::block_on(&self.runtime, query.execute_stream())?;
 
-        self.runtime.block_on(async {
+        super::block_on(&self.runtime, async {
             let mut batches = Vec::new();
             while let Some(batch) = batch_stream.next().await {
                 batches.push(batch?);
@@ -331,7 +348,7 @@ pub fn build_query(
     pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.persistence")
 )]
 pub struct DataQueryResult {
-    pub chunk: Option<CVec>,
+    chunk: Option<CVec>,
     pub result: QueryResult,
     pub acc: Vec<Data>,
     pub size: usize,
@@ -352,31 +369,25 @@ impl DataQueryResult {
     /// Set new `CVec` backed chunk from data
     ///
     /// It also drops previously allocated chunk
-    pub fn set_chunk(&mut self, data: Vec<Data>) -> CVec {
+    pub fn set_chunk(&mut self, data: Vec<Data>) -> &CVec {
         self.drop_chunk();
 
-        let chunk: CVec = data.into();
-        self.chunk = Some(chunk);
-        chunk
+        self.chunk.insert(data.into())
     }
 
     /// Chunks generated by iteration must be dropped after use, otherwise
     /// it will leak memory. Current chunk is held by the reader,
     /// drop if exists and reset the field.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stored chunk has invalid length, capacity, or pointer
+    /// invariants.
     pub fn drop_chunk(&mut self) {
-        if let Some(CVec { ptr, len, cap }) = self.chunk.take() {
-            assert!(
-                len <= cap,
-                "drop_chunk: len ({len}) > cap ({cap}) - memory corruption or wrong chunk type"
-            );
-            assert!(
-                len == 0 || !ptr.is_null(),
-                "drop_chunk: null ptr with non-zero len ({len}) - memory corruption"
-            );
-
-            // SAFETY: `ptr`, `len`, and `cap` originate from a valid `CVec` and the
-            // assertions above verify the invariants required by `Vec::from_raw_parts`.
-            let data: Vec<Data> = unsafe { Vec::from_raw_parts(ptr.cast::<Data>(), len, cap) };
+        if let Some(chunk) = self.chunk.take() {
+            // SAFETY: `chunk` was created from `Vec<Data>` in `set_chunk`, remains uniquely owned
+            // by this result, and is removed from the field before reconstruction.
+            let data = unsafe { chunk.into_vec::<Data>() };
             drop(data);
         }
     }
@@ -405,5 +416,22 @@ impl Drop for DataQueryResult {
     fn drop(&mut self) {
         self.drop_chunk();
         self.result.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nautilus_common::live::get_runtime;
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn data_backend_sessions_share_global_runtime() {
+        let first = DataBackendSession::new(10);
+        let second = DataBackendSession::new(10);
+
+        assert_eq!(first.runtime.id(), second.runtime.id());
+        assert_eq!(first.runtime.id(), get_runtime().handle().id());
     }
 }

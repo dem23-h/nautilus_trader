@@ -78,6 +78,50 @@ impl TradesParams {
     }
 }
 
+/// Query parameters for the aggregate trades endpoint.
+#[derive(Debug, Clone, Serialize)]
+pub struct AggTradesParams {
+    /// Trading pair symbol.
+    pub symbol: String,
+    /// Aggregate trade ID to begin from, inclusive.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "fromId")]
+    pub from_id: Option<i64>,
+    /// Start time in milliseconds, inclusive.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "startTime")]
+    pub start_time: Option<i64>,
+    /// End time in milliseconds, inclusive.
+    #[serde(skip_serializing_if = "Option::is_none", rename = "endTime")]
+    pub end_time: Option<i64>,
+    /// Number of aggregate trades to return (default 500, max 1000).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u32>,
+}
+
+#[cfg(test)]
+mod market_data_tests {
+    use rstest::rstest;
+
+    use super::*;
+
+    #[rstest]
+    fn test_agg_trades_params_serialization() {
+        let params = AggTradesParams {
+            symbol: "ETHUSDT".to_string(),
+            from_id: Some(123),
+            start_time: Some(1_700_000_000_001),
+            end_time: Some(1_700_000_000_999),
+            limit: Some(456),
+        };
+
+        let serialized = serde_urlencoded::to_string(&params).unwrap();
+
+        assert_eq!(
+            serialized,
+            "symbol=ETHUSDT&fromId=123&startTime=1700000000001&endTime=1700000000999&limit=456"
+        );
+    }
+}
+
 /// Query parameters for new order submission.
 #[derive(Debug, Clone, Serialize)]
 pub struct NewOrderParams {
@@ -525,6 +569,61 @@ impl NewOcoOrderParams {
     }
 }
 
+/// Query parameters for new OCO order list.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewOcoOrderListParams {
+    /// Trading pair symbol.
+    pub symbol: String,
+    /// Client order ID for the entire list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub list_client_order_id: Option<String>,
+    /// Order side.
+    pub side: BinanceSide,
+    /// Quantity for both legs.
+    pub quantity: String,
+    /// Above leg order type.
+    pub above_type: BinanceSpotOrderType,
+    /// Client order ID for the above leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub above_client_order_id: Option<String>,
+    /// Iceberg quantity for the above leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub above_iceberg_qty: Option<String>,
+    /// Limit price for the above leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub above_price: Option<String>,
+    /// Stop price for the above leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub above_stop_price: Option<String>,
+    /// Time in force for the above leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub above_time_in_force: Option<BinanceTimeInForce>,
+    /// Below leg order type.
+    pub below_type: BinanceSpotOrderType,
+    /// Client order ID for the below leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub below_client_order_id: Option<String>,
+    /// Iceberg quantity for the below leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub below_iceberg_qty: Option<String>,
+    /// Limit price for the below leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub below_price: Option<String>,
+    /// Stop price for the below leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub below_stop_price: Option<String>,
+    /// Time in force for the below leg.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub below_time_in_force: Option<BinanceTimeInForce>,
+    /// Response type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_order_resp_type: Option<BinanceOrderResponseType>,
+    /// Self-trade prevention mode.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub self_trade_prevention_mode: Option<BinanceSelfTradePreventionMode>,
+}
+
 /// Query parameters for canceling an order list (OCO).
 #[derive(Debug, Clone, Serialize)]
 pub struct CancelOrderListParams {
@@ -623,6 +722,23 @@ pub struct AccountInfoParams {
     /// Omit zero balances from response.
     #[serde(skip_serializing_if = "Option::is_none", rename = "omitZeroBalances")]
     pub omit_zero_balances: Option<bool>,
+}
+
+/// Query parameters for account-specific symbol commission rates.
+#[derive(Debug, Clone, Serialize)]
+pub struct AccountCommissionParams {
+    /// Venue symbol.
+    pub symbol: String,
+}
+
+impl AccountCommissionParams {
+    /// Creates commission query parameters for `symbol`.
+    #[must_use]
+    pub fn new(symbol: impl Into<String>) -> Self {
+        Self {
+            symbol: symbol.into(),
+        }
+    }
 }
 
 impl AccountInfoParams {

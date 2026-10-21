@@ -39,6 +39,7 @@ use nautilus_model::{
 };
 use nautilus_network::{
     backoff::ExponentialBackoff,
+    http::USER_AGENT,
     mode::ConnectionMode,
     websocket::{
         AuthTracker, PingHandler, SubscriptionState, TransportBackend, WebSocketClient,
@@ -108,6 +109,7 @@ pub struct BybitWebSocketClient {
     requires_auth: bool,
     auth_tracker: AuthTracker,
     heartbeat: Option<u64>,
+    auth_wait_timeout: Duration,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
     cmd_tx: Arc<tokio::sync::RwLock<tokio::sync::mpsc::UnboundedSender<HandlerCommand>>>,
     out_rx: Option<Arc<tokio::sync::mpsc::UnboundedReceiver<BybitWsMessage>>>,
@@ -150,6 +152,7 @@ impl Clone for BybitWebSocketClient {
             requires_auth: self.requires_auth,
             auth_tracker: self.auth_tracker.clone(),
             heartbeat: self.heartbeat,
+            auth_wait_timeout: self.auth_wait_timeout,
             connection_mode: Arc::clone(&self.connection_mode),
             cmd_tx: Arc::clone(&self.cmd_tx),
             out_rx: None, // Each clone gets its own receiver
@@ -185,6 +188,12 @@ impl BybitWebSocketClient {
         )
     }
 
+    /// Sets the timeout for waiting on (re)authentication before failing an
+    /// authenticated operation. Defaults to `AUTH_WAIT_TIMEOUT` (5s).
+    pub fn set_auth_wait_timeout(&mut self, timeout: Duration) {
+        self.auth_wait_timeout = timeout;
+    }
+
     /// Creates a new Bybit public WebSocket client targeting the specified product/environment.
     #[must_use]
     pub fn new_public_with(
@@ -208,6 +217,7 @@ impl BybitWebSocketClient {
             requires_auth: false,
             auth_tracker: AuthTracker::new(),
             heartbeat: Some(heartbeat),
+            auth_wait_timeout: AUTH_WAIT_TIMEOUT,
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
@@ -260,6 +270,7 @@ impl BybitWebSocketClient {
             requires_auth: true,
             auth_tracker: AuthTracker::new(),
             heartbeat: Some(heartbeat),
+            auth_wait_timeout: AUTH_WAIT_TIMEOUT,
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
@@ -312,6 +323,7 @@ impl BybitWebSocketClient {
             requires_auth: true,
             auth_tracker: AuthTracker::new(),
             heartbeat: Some(heartbeat),
+            auth_wait_timeout: AUTH_WAIT_TIMEOUT,
             connection_mode,
             cmd_tx: Arc::new(tokio::sync::RwLock::new(cmd_tx)),
             out_rx: None,
@@ -596,7 +608,11 @@ impl BybitWebSocketClient {
 
                         // Forward to out_tx so caller sees the Reconnected message
                         if out_tx.send(BybitWsMessage::Reconnected).is_err() {
-                            log::debug!("Receiver dropped, stopping");
+                            if handler.is_stopped() {
+                                log::debug!("Receiver dropped, stopping");
+                            } else {
+                                log::error!("Receiver dropped, stopping");
+                            }
                             break;
                         }
                     }
@@ -608,13 +624,21 @@ impl BybitWebSocketClient {
                         }
 
                         if out_tx.send(BybitWsMessage::Auth(auth.clone())).is_err() {
-                            log::error!("Failed to send message (receiver dropped)");
+                            if handler.is_stopped() {
+                                log::debug!("Failed to send message (receiver dropped)");
+                            } else {
+                                log::error!("Failed to send message (receiver dropped)");
+                            }
                             break;
                         }
                     }
                     Some(msg) => {
                         if out_tx.send(msg).is_err() {
-                            log::error!("Failed to send message (receiver dropped)");
+                            if handler.is_stopped() {
+                                log::debug!("Failed to send message (receiver dropped)");
+                            } else {
+                                log::error!("Failed to send message (receiver dropped)");
+                            }
                             break;
                         }
                     }
@@ -1255,7 +1279,7 @@ impl BybitWebSocketClient {
         }
 
         tokio::select! {
-            authenticated = self.auth_tracker.wait_for_authenticated(AUTH_WAIT_TIMEOUT) => {
+            authenticated = self.auth_tracker.wait_for_authenticated(self.auth_wait_timeout) => {
                 if authenticated {
                     Ok(())
                 } else {
@@ -1878,7 +1902,7 @@ impl BybitWebSocketClient {
     fn default_headers() -> Vec<(String, String)> {
         vec![
             ("Content-Type".to_string(), "application/json".to_string()),
-            ("User-Agent".to_string(), NAUTILUS_USER_AGENT.to_string()),
+            (USER_AGENT.to_string(), NAUTILUS_USER_AGENT.to_string()),
         ]
     }
 

@@ -40,11 +40,11 @@ class _CaptureNode:
     def __init__(self, captured: dict[str, object]) -> None:
         self._captured = captured
 
-    def add_native_actor(self, type_name: str, config: object) -> None:
+    def add_builtin_actor(self, type_name: str, config: object) -> None:
         self._captured["actor_type_name"] = type_name
         self._captured["actor_config"] = config
 
-    def add_native_strategy(self, type_name: str, config: object) -> None:
+    def add_builtin_strategy(self, type_name: str, config: object) -> None:
         self._captured["strategy_type_name"] = type_name
         self._captured["strategy_config"] = config
 
@@ -60,8 +60,20 @@ class _CaptureBuilder:
         self._captured["reconciliation"] = reconciliation
         return self
 
+    def with_exec_engine_config(self, config: object) -> "_CaptureBuilder":
+        self._captured["exec_engine_config"] = config
+        return self
+
     def with_risk_engine_config(self, config: object) -> "_CaptureBuilder":
         self._captured["risk_engine_config"] = config
+        return self
+
+    def with_timeout_disconnection_secs(self, timeout_secs: int) -> "_CaptureBuilder":
+        self._captured["timeout_disconnection_secs"] = timeout_secs
+        return self
+
+    def with_delay_post_stop_secs(self, delay_secs: int) -> "_CaptureBuilder":
+        self._captured["delay_post_stop_secs"] = delay_secs
         return self
 
     def add_data_client(self, *args: object) -> "_CaptureBuilder":

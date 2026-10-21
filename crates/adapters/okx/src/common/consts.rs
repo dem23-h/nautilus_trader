@@ -24,7 +24,7 @@ use nautilus_model::{
 };
 use ustr::Ustr;
 
-use super::enums::OKXInstrumentType;
+use super::enums::{OKXBookChannel, OKXInstrumentType, OKXVipLevel};
 
 /// Venue identifier string.
 pub const OKX: &str = "OKX";
@@ -55,6 +55,9 @@ pub const OKX_WS_HEARTBEAT_SECS: u64 = 20;
 
 /// OKX success response code for WebSocket operations.
 pub const OKX_SUCCESS_CODE: &str = "0";
+
+/// OKX WebSocket code indicating a service upgrade and required reconnect.
+pub const OKX_SERVICE_UPGRADE_RECONNECT_CODE: &str = "64008";
 
 /// JSON field key for sub-error code in order operation responses.
 pub const OKX_FIELD_SCODE: &str = "sCode";
@@ -170,6 +173,7 @@ pub static OKX_RETRY_ERROR_CODES: LazyLock<AHashSet<&'static str>> = LazyLock::n
     // WebSocket connection issues (temporary)
     codes.insert("60001"); // OK not received in time
     codes.insert("60005"); // Connection closed as there was no data transmission in the last 30 seconds
+    codes.insert(OKX_SERVICE_UPGRADE_RECONNECT_CODE); // Service upgrade, please reconnect
 
     codes
 });
@@ -250,11 +254,36 @@ pub fn resolve_book_depth(raw_depth: usize) -> usize {
     }
 }
 
+pub(crate) fn select_book_channel(depth: usize, vip: OKXVipLevel) -> OKXBookChannel {
+    match depth {
+        50 if vip >= OKXVipLevel::Vip4 => OKXBookChannel::Books50L2Tbt,
+        0 | 400 if vip >= OKXVipLevel::Vip5 => OKXBookChannel::BookL2Tbt,
+        0 | 50 | 400 => OKXBookChannel::Book,
+        _ => unreachable!("book depth must be resolved before channel selection"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[rstest]
+    #[case::auto_default(0, OKXVipLevel::Vip0, OKXBookChannel::Book)]
+    #[case::auto_vip4(0, OKXVipLevel::Vip4, OKXBookChannel::Book)]
+    #[case::auto_vip5(0, OKXVipLevel::Vip5, OKXBookChannel::BookL2Tbt)]
+    #[case::depth_50_vip3(50, OKXVipLevel::Vip3, OKXBookChannel::Book)]
+    #[case::depth_50_vip4(50, OKXVipLevel::Vip4, OKXBookChannel::Books50L2Tbt)]
+    #[case::depth_400_vip4(400, OKXVipLevel::Vip4, OKXBookChannel::Book)]
+    #[case::depth_400_vip5(400, OKXVipLevel::Vip5, OKXBookChannel::BookL2Tbt)]
+    fn test_select_book_channel(
+        #[case] depth: usize,
+        #[case] vip: OKXVipLevel,
+        #[case] expected: OKXBookChannel,
+    ) {
+        assert_eq!(select_book_channel(depth, vip), expected);
+    }
 
     #[rstest]
     #[case("54084", true)]
@@ -263,6 +292,15 @@ mod tests {
     #[case("", false)]
     fn test_is_slippage_rejection(#[case] code: &str, #[case] expected: bool) {
         assert_eq!(is_slippage_rejection(code), expected);
+    }
+
+    #[rstest]
+    #[case("50001", true)]
+    #[case("60005", true)]
+    #[case(OKX_SERVICE_UPGRADE_RECONNECT_CODE, true)]
+    #[case("60012", false)]
+    fn test_should_retry_error_code(#[case] code: &str, #[case] expected: bool) {
+        assert_eq!(should_retry_error_code(code), expected);
     }
 
     #[rstest]

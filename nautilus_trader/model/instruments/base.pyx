@@ -186,8 +186,6 @@ cdef class Instrument(Data):
         If `min_notional` is negative (< 0).
     ValueError
         If `max_price` is not positive (> 0).
-    ValueError
-        If `min_price` is negative (< 0).
 
     """
 
@@ -255,9 +253,6 @@ cdef class Instrument(Data):
 
         if max_price is not None:
             Condition.positive(max_price, "max_price")
-
-        if min_price is not None:
-            Condition.not_negative(min_price, "min_price")
 
         Condition.type(margin_init, Decimal, "margin_init")
         Condition.not_negative(margin_init, "margin_init")
@@ -469,6 +464,17 @@ cdef class Instrument(Data):
             InstrumentClass.OPTION_SPREAD,
         )
 
+    cpdef bint allows_negative_price(self):
+        """
+        Return whether the instrument allows negative prices.
+
+        Returns
+        -------
+        bool
+
+        """
+        return self.instrument_class in NEGATIVE_PRICE_INSTRUMENT_CLASSES
+
     cpdef list legs(self):
         """
         Return the list of leg tuples (instrument_id, ratio) for this spread.
@@ -563,7 +569,7 @@ cdef class Instrument(Data):
 
         Parameters
         ----------
-        value : integer, float, str or Decimal
+        value : integer, float, str, or Decimal
             The value of the price.
 
         Returns
@@ -751,7 +757,7 @@ cdef class Instrument(Data):
 
         Parameters
         ----------
-        value : integer, float, str or Decimal
+        value : integer, float, str, or Decimal
             The value of the quantity.
         round_down : bool, default False
             If True, always rounds down to the nearest valid increment.

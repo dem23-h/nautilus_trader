@@ -19,6 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
+from nautilus_trader.adapters.polymarket.common.gamma_markets import _request_markets_keyset_page
 from nautilus_trader.adapters.polymarket.common.gamma_markets import fetch_fee_schedules
 from nautilus_trader.adapters.polymarket.common.gamma_markets import iter_markets
 from nautilus_trader.adapters.polymarket.common.gamma_markets import (
@@ -95,7 +96,7 @@ def test_normalize_gamma_market_to_clob_format() -> None:
     assert normalized["question"] == "Fed rate hike in 2025?"
     assert normalized["minimum_tick_size"] == 0.001
     assert normalized["minimum_order_size"] == 5
-    assert normalized["end_date_iso"] == "2025-12-10"
+    assert normalized["end_date_iso"] == "2025-12-10T12:00:00Z"
     assert normalized["maker_base_fee"] == 0
     assert normalized["taker_base_fee"] == 0
     assert normalized["active"] is True
@@ -123,9 +124,62 @@ def test_normalize_gamma_market_with_defaults() -> None:
     assert normalized["minimum_tick_size"] == 0.001  # Default
     assert normalized["minimum_order_size"] == 5  # Default
     assert normalized["end_date_iso"] == "2025-12-31"
+    assert normalized["game_start_time"] is None  # No eventStartTime/startDateIso present
     assert normalized["maker_base_fee"] == 0  # Default
     assert normalized["taker_base_fee"] == 0  # Default
     assert normalized["active"] is False  # Default
+
+
+def test_normalize_gamma_market_uses_full_timestamps_for_updown_market() -> None:
+    """
+    Up/Down markets carry the precise resolution time in `endDate` and the window start
+    in `eventStartTime`; the date-only `*Iso` variants must not be used or
+    `expiration_ns` truncates to midnight.
+
+    Regression test for
+    https://github.com/nautechsystems/nautilus_trader/issues/4278.
+
+    """
+    # Arrange - Bitcoin Up/Down market resolving at 09:25 UTC
+    gamma_market = {
+        "conditionId": "0xabc",
+        "question": "Bitcoin Up or Down - March 12, 9:25AM UTC?",
+        "endDate": "2026-03-12T09:25:00Z",
+        "endDateIso": "2026-03-12",
+        "eventStartTime": "2026-03-12T09:20:00Z",
+        "startDate": "2026-03-11T09:29:01.328428Z",
+        "startDateIso": "2026-03-11",
+        "clobTokenIds": '["111", "222"]',
+        "outcomes": '["Up", "Down"]',
+    }
+
+    # Act
+    normalized = normalize_gamma_market_to_clob_format(gamma_market)
+
+    # Assert
+    assert normalized["end_date_iso"] == "2026-03-12T09:25:00Z"
+    assert normalized["game_start_time"] == "2026-03-12T09:20:00Z"
+
+
+def test_normalize_gamma_market_falls_back_to_date_only_fields() -> None:
+    """
+    When the full-timestamp fields are absent, normalization falls back to the date-only
+    `*Iso` variants rather than dropping the values.
+    """
+    # Arrange
+    gamma_market = {
+        "conditionId": "0xdef",
+        "question": "Test market?",
+        "endDateIso": "2025-12-31",
+        "startDateIso": "2025-12-01",
+    }
+
+    # Act
+    normalized = normalize_gamma_market_to_clob_format(gamma_market)
+
+    # Assert
+    assert normalized["end_date_iso"] == "2025-12-31"
+    assert normalized["game_start_time"] == "2025-12-01"
 
 
 def test_parse_clob_token_ids_and_outcomes() -> None:
@@ -264,38 +318,98 @@ async def test_fetch_fee_schedules_omits_markets_without_schedule() -> None:
     assert result == {"0xaaa": {"rate": 0.03}}
 
 
-_REQUEST_MARKETS_PAGE = (
-    "nautilus_trader.adapters.polymarket.common.gamma_markets._request_markets_page"
+_REQUEST_MARKETS_KEYSET_PAGE = (
+    "nautilus_trader.adapters.polymarket.common.gamma_markets._request_markets_keyset_page"
 )
 
 
 @pytest.mark.asyncio
-async def test_iter_markets_paginates_at_100_per_page() -> None:
+async def test_iter_markets_paginates_with_keyset_at_100_per_page() -> None:
     """
-    Gamma `/markets` silently caps responses at 100 items per page; the loop must
-    paginate at 100 (not 500) and stop only when a page is short or empty.
+    Gamma `/markets/keyset` caps responses at 100 items per page.
     """
-    # Arrange: page 1 = 100 markets, page 2 = 100 markets, page 3 = 37 markets
+    # Arrange
     mock_client = AsyncMock()
     page_1 = [{"conditionId": f"0xa{i:063x}"} for i in range(100)]
     page_2 = [{"conditionId": f"0xb{i:063x}"} for i in range(100)]
     page_3 = [{"conditionId": f"0xc{i:063x}"} for i in range(37)]
-    pages = [page_1, page_2, page_3]
+    pages = [(page_1, "cursor-1"), (page_2, "cursor-2"), (page_3, None)]
 
-    captured_offsets: list[int] = []
+    captured_cursors: list[str | None] = []
     captured_limits: list[int] = []
 
     async def fake_page(**kwargs):
-        captured_offsets.append(kwargs["offset"])
+        captured_cursors.append(kwargs["after_cursor"])
         captured_limits.append(kwargs["limit"])
-        return pages.pop(0) if pages else []
+        return pages.pop(0)
 
-    with patch(_REQUEST_MARKETS_PAGE, new=AsyncMock(side_effect=fake_page)) as mock_page:
+    with patch(_REQUEST_MARKETS_KEYSET_PAGE, new=AsyncMock(side_effect=fake_page)) as mock_page:
         # Act
-        yielded = [m async for m in iter_markets(mock_client)]
+        yielded = [
+            m
+            async for m in iter_markets(
+                mock_client,
+                filters={"limit": 500, "offset": 150},
+            )
+        ]
 
     # Assert
-    assert len(yielded) == 237
+    assert len(yielded) == 87
     assert mock_page.await_count == 3
     assert captured_limits == [100, 100, 100]
-    assert captured_offsets == [0, 100, 200]
+    assert captured_cursors == [None, "cursor-1", "cursor-2"]
+
+
+@pytest.mark.asyncio
+async def test_request_markets_keyset_page_uses_cursor_and_wrapper() -> None:
+    # Arrange
+    mock_client = AsyncMock()
+    response = AsyncMock()
+    response.status = 200
+    response.body = json.dumps(
+        {
+            "markets": [{"conditionId": "0xabc"}],
+            "next_cursor": "cursor-2",
+        },
+    ).encode()
+    mock_client.get.return_value = response
+
+    # Act
+    markets, next_cursor = await _request_markets_keyset_page(
+        http_client=mock_client,
+        base_url="https://gamma.test",
+        params={"active": "true"},
+        after_cursor="cursor-1",
+        limit=100,
+        timeout=10.0,
+    )
+
+    # Assert
+    mock_client.get.assert_awaited_once_with(
+        "https://gamma.test/markets/keyset",
+        params={"active": "true", "limit": 100, "after_cursor": "cursor-1"},
+        timeout_secs=10,
+    )
+    assert markets == [{"conditionId": "0xabc"}]
+    assert next_cursor == "cursor-2"
+
+
+@pytest.mark.asyncio
+async def test_iter_markets_applies_offset_locally() -> None:
+    # Arrange
+    mock_client = AsyncMock()
+    page = [
+        {"conditionId": "0x1"},
+        {"conditionId": "0x2"},
+        {"conditionId": "0x3"},
+    ]
+    mock_page = AsyncMock(return_value=(page, None))
+
+    with patch(_REQUEST_MARKETS_KEYSET_PAGE, new=mock_page):
+        # Act
+        yielded = [m async for m in iter_markets(mock_client, filters={"offset": 2})]
+
+    # Assert
+    assert yielded == [{"conditionId": "0x3"}]
+    assert mock_page.await_args is not None
+    assert "offset" not in mock_page.await_args.kwargs["params"]

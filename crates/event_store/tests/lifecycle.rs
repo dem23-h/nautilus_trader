@@ -68,7 +68,7 @@ use nautilus_model::{
     orders::{Order, OrderAny, builder::OrderTestBuilder, stubs::TestOrderEventStubs},
     position::Position,
     stubs::TestDefault,
-    types::{Currency, Quantity},
+    types::{Currency, Money, Quantity},
 };
 use nautilus_system::{KernelEventStore, NautilusKernelBuilder};
 use rstest::rstest;
@@ -460,7 +460,7 @@ fn kernel_start_restores_parent_cache_snapshot_and_replays_tail() {
     let position = Position::new(&instrument_any, fill.into());
     let mut snapshot_cache = Cache::default();
     let snapshot_ref = snapshot_cache
-        .snapshot_position(&position)
+        .snapshot_position_encoded(&position)
         .expect("snapshot position");
     let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
     let replayed_state = cash_account_state_million_usd("200 USD", "0 USD", "200 USD");
@@ -549,7 +549,7 @@ fn kernel_start_replays_configured_run_without_recovered_parent() {
     let position = Position::new(&instrument_any, fill.into());
     let mut snapshot_cache = Cache::default();
     let snapshot_ref = snapshot_cache
-        .snapshot_position(&position)
+        .snapshot_position_encoded(&position)
         .expect("snapshot position");
     let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
     let replayed_state = cash_account_state_million_usd("200 USD", "0 USD", "200 USD");
@@ -957,7 +957,7 @@ fn kernel_start_restore_failure_does_not_open_new_run(
     let position = Position::new(&instrument_any, fill.into());
     let mut snapshot_cache = Cache::default();
     let snapshot_ref = snapshot_cache
-        .snapshot_position(&position)
+        .snapshot_position_encoded(&position)
         .expect("snapshot position");
     let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
     let content_hash = if bad_hash {
@@ -1052,7 +1052,7 @@ fn kernel_start_restores_parent_cache_from_injected_database() {
     let position = Position::new(&instrument_any, fill.into());
     let mut snapshot_cache = Cache::default();
     let snapshot_ref = snapshot_cache
-        .snapshot_position(&position)
+        .snapshot_position_encoded(&position)
         .expect("snapshot position");
     let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
     let replayed_state = cash_account_state_million_usd("200 USD", "0 USD", "200 USD");
@@ -1157,7 +1157,7 @@ fn kernel_start_db_load_error_leaves_run_unopened() {
     let position = Position::new(&instrument_any, fill.into());
     let mut snapshot_cache = Cache::default();
     let snapshot_ref = snapshot_cache
-        .snapshot_position(&position)
+        .snapshot_position_encoded(&position)
         .expect("snapshot position");
     let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
 
@@ -1273,7 +1273,7 @@ impl CacheDatabaseAdapter for StubCacheDatabase {
         Ok(AHashMap::new())
     }
 
-    fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, Position>> {
+    fn load_index_order_position(&self) -> anyhow::Result<AHashMap<ClientOrderId, PositionId>> {
         Ok(AHashMap::new())
     }
 
@@ -1471,11 +1471,19 @@ impl CacheDatabaseAdapter for StubCacheDatabase {
         Ok(())
     }
 
-    fn update_actor(&self) -> anyhow::Result<()> {
+    fn update_actor(
+        &self,
+        _component_id: &ComponentId,
+        _state: &AHashMap<String, Bytes>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
-    fn update_strategy(&self) -> anyhow::Result<()> {
+    fn update_strategy(
+        &self,
+        _strategy_id: &StrategyId,
+        _state: &AHashMap<String, Bytes>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 
@@ -1495,7 +1503,12 @@ impl CacheDatabaseAdapter for StubCacheDatabase {
         Ok(())
     }
 
-    fn snapshot_position_state(&self, _position: &Position) -> anyhow::Result<()> {
+    fn snapshot_position_state(
+        &self,
+        _position: &Position,
+        _ts_snapshot: UnixNanos,
+        _unrealized_pnl: Option<Money>,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
 

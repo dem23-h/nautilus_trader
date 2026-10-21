@@ -27,8 +27,11 @@ use nautilus_model::{
 use rust_decimal::Decimal;
 
 use crate::{
-    common::enums::{
-        BinanceOrderStatus, BinanceSelfTradePreventionMode, BinanceSide, BinanceTimeInForce,
+    common::{
+        enums::{
+            BinanceOrderStatus, BinanceSelfTradePreventionMode, BinanceSide, BinanceTimeInForce,
+        },
+        parse::parse_micros_or_init,
     },
     spot::sbe::spot::{
         order_side::OrderSide, order_status::OrderStatus, order_type::OrderType,
@@ -88,6 +91,38 @@ pub struct BinanceTrades {
     pub qty_exponent: i8,
     /// List of trades.
     pub trades: Vec<BinanceTrade>,
+}
+
+/// A single aggregate trade from Binance Spot.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinanceAggTrade {
+    /// Aggregate trade ID.
+    pub id: i64,
+    /// Price mantissa.
+    pub price_mantissa: i64,
+    /// Quantity mantissa.
+    pub qty_mantissa: i64,
+    /// First raw trade ID represented by this aggregate.
+    pub first_trade_id: i64,
+    /// Last raw trade ID represented by this aggregate.
+    pub last_trade_id: i64,
+    /// Trade timestamp in microseconds.
+    pub time: i64,
+    /// Whether the buyer is the maker.
+    pub is_buyer_maker: bool,
+    /// Whether this trade was the best price match.
+    pub is_best_match: bool,
+}
+
+/// Binance Spot aggregate trades response.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinanceAggTrades {
+    /// Price exponent for all trades.
+    pub price_exponent: i8,
+    /// Quantity exponent for all trades.
+    pub qty_exponent: i8,
+    /// Aggregate trades in chronological order.
+    pub trades: Vec<BinanceAggTrade>,
 }
 
 /// A fill from an order execution.
@@ -312,12 +347,13 @@ impl BinanceAccountInfo {
         // Ensure at least one balance exists
         if balances.is_empty() {
             let zero_currency = Currency::USDT();
-            let zero_money = Money::new(0.0, zero_currency);
+            let zero_money = Money::zero(zero_currency);
             let zero_balance = AccountBalance::new(zero_money, zero_money, zero_money);
             balances.push(zero_balance);
         }
 
-        let ts_event = UnixNanos::from_micros(self.update_time as u64);
+        let ts_event =
+            parse_micros_or_init(self.update_time, "Spot SBE account update time", ts_init);
 
         AccountState::new(
             account_id,
@@ -414,6 +450,80 @@ pub struct BinanceSymbolSbe {
 pub struct BinanceExchangeInfoSbe {
     /// List of symbols.
     pub symbols: Vec<BinanceSymbolSbe>,
+}
+
+/// Exchange information returned as JSON by Binance US.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct BinanceExchangeInfoJson {
+    /// Symbol definitions.
+    pub symbols: Vec<BinanceSymbolJson>,
+}
+
+/// Spot symbol definition returned by JSON exchange info.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceSymbolJson {
+    /// Raw venue symbol.
+    pub symbol: String,
+    /// Venue trading status.
+    pub status: String,
+    /// Base asset code.
+    pub base_asset: String,
+    /// Quote asset code.
+    pub quote_asset: String,
+    /// Base asset precision.
+    pub base_asset_precision: u8,
+    /// Quote asset precision.
+    pub quote_asset_precision: u8,
+    /// Symbol filters.
+    pub filters: Vec<BinanceSymbolFilterJson>,
+}
+
+/// Spot JSON symbol filter fields used for instrument construction.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceSymbolFilterJson {
+    /// Venue filter type.
+    pub filter_type: String,
+    /// Minimum price.
+    pub min_price: Option<String>,
+    /// Maximum price.
+    pub max_price: Option<String>,
+    /// Tick size.
+    pub tick_size: Option<String>,
+    /// Minimum quantity.
+    pub min_qty: Option<String>,
+    /// Maximum quantity.
+    pub max_qty: Option<String>,
+    /// Quantity step size.
+    pub step_size: Option<String>,
+}
+
+/// Account-specific Spot commission response.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceAccountCommission {
+    /// Venue symbol.
+    pub symbol: String,
+    /// Standard commission rates representable on a Nautilus instrument.
+    pub standard_commission: BinanceCommissionRates,
+}
+
+/// Maker and taker commission rates.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct BinanceCommissionRates {
+    /// Maker rate.
+    pub maker: String,
+    /// Taker rate.
+    pub taker: String,
+}
+
+/// Minimal JSON account response used for Binance US commission fallback.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceAccountRatesJson {
+    /// Account-wide commission rates.
+    pub commission_rates: BinanceCommissionRates,
 }
 
 /// Account trade history entry.
@@ -567,6 +677,40 @@ pub struct TradeFee {
     pub maker_commission: String,
     /// Taker commission rate.
     pub taker_commission: String,
+}
+
+/// Response from a new OCO order-list request.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewOcoOrderListResponse {
+    /// Exchange order list ID.
+    pub order_list_id: i64,
+    /// Contingency type.
+    pub contingency_type: String,
+    /// List status type.
+    pub list_status_type: String,
+    /// List order status.
+    pub list_order_status: String,
+    /// Client order ID for the order list.
+    pub list_client_order_id: String,
+    /// Transaction time in milliseconds.
+    pub transaction_time: i64,
+    /// Trading pair symbol.
+    pub symbol: String,
+    /// Orders in the list.
+    pub orders: Vec<OrderListOrder>,
+}
+
+/// Order summary inside an order-list response.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrderListOrder {
+    /// Trading pair symbol.
+    pub symbol: String,
+    /// Exchange order ID.
+    pub order_id: i64,
+    /// Client order ID.
+    pub client_order_id: String,
 }
 
 /// Result of a single order in a batch operation.

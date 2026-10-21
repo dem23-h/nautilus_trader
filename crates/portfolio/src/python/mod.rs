@@ -18,9 +18,12 @@
 use std::{cell::RefCell, rc::Rc};
 
 use indexmap::{IndexMap, IndexSet};
+use nautilus_analysis::snapshot::PortfolioStatistics;
+use nautilus_common::python::config_error_to_pyvalue_err;
 use nautilus_core::python::{to_pynotimplemented_err, to_pyvalue_err};
 use nautilus_model::{
     accounts::AccountAny,
+    events::PortfolioSnapshot,
     identifiers::{AccountId, InstrumentId, Venue},
     python::account::account_any_to_pyobject,
     types::{Currency, Money, Price},
@@ -35,27 +38,32 @@ use crate::{config::PortfolioConfig, portfolio::Portfolio};
 impl PortfolioConfig {
     /// Configuration for `Portfolio` instances.
     #[new]
-    #[pyo3(signature = (use_mark_prices=None, use_mark_xrates=None, bar_updates=None, convert_to_account_base_currency=None, min_account_state_logging_interval_ms=None, debug=None, snapshot_interval_ms=None))]
+    #[pyo3(signature = (use_mark_prices=None, use_mark_xrates=None, bar_updates=None, convert_to_account_base_currency=None, equity_curve=None, min_account_state_logging_interval_ms=None, debug=None, snapshot_interval_ms=None))]
+    #[expect(clippy::too_many_arguments)]
     fn py_new(
         use_mark_prices: Option<bool>,
         use_mark_xrates: Option<bool>,
         bar_updates: Option<bool>,
         convert_to_account_base_currency: Option<bool>,
+        equity_curve: Option<bool>,
         min_account_state_logging_interval_ms: Option<u64>,
         debug: Option<bool>,
         snapshot_interval_ms: Option<u64>,
-    ) -> Self {
+    ) -> PyResult<Self> {
         let default = Self::default();
-        Self {
+        let config = Self {
             use_mark_prices: use_mark_prices.unwrap_or(default.use_mark_prices),
             use_mark_xrates: use_mark_xrates.unwrap_or(default.use_mark_xrates),
             bar_updates: bar_updates.unwrap_or(default.bar_updates),
             convert_to_account_base_currency: convert_to_account_base_currency
                 .unwrap_or(default.convert_to_account_base_currency),
+            equity_curve: equity_curve.unwrap_or(default.equity_curve),
             min_account_state_logging_interval_ms,
             snapshot_interval_ms,
             debug: debug.unwrap_or(default.debug),
-        }
+        };
+        config.validate().map_err(config_error_to_pyvalue_err)?;
+        Ok(config)
     }
 
     fn __repr__(&self) -> String {
@@ -84,6 +92,11 @@ impl PortfolioConfig {
     #[getter]
     fn convert_to_account_base_currency(&self) -> bool {
         self.convert_to_account_base_currency
+    }
+
+    #[getter]
+    fn equity_curve(&self) -> bool {
+        self.equity_curve
     }
 
     #[getter]
@@ -324,6 +337,16 @@ impl PyPortfolio {
         self.0.borrow().missing_price_instruments(&venue)
     }
 
+    #[pyo3(name = "build_snapshot")]
+    fn py_build_snapshot(&self, account_id: AccountId) -> Option<PortfolioSnapshot> {
+        self.0.borrow_mut().build_snapshot(&account_id)
+    }
+
+    #[pyo3(name = "snapshots")]
+    fn py_snapshots(&self, account_id: AccountId) -> Vec<PortfolioSnapshot> {
+        self.0.borrow().snapshots(&account_id)
+    }
+
     #[pyo3(name = "realized_pnl", signature = (instrument_id, account_id=None, target_currency=None))]
     fn py_realized_pnl(
         &self,
@@ -422,6 +445,11 @@ impl PyPortfolio {
     #[pyo3(name = "is_completely_flat", signature = (account_id=None))]
     fn py_is_completely_flat(&self, account_id: Option<AccountId>) -> bool {
         self.is_completely_flat_for_account(account_id.as_ref())
+    }
+
+    #[pyo3(name = "statistics")]
+    fn py_statistics(&self) -> PortfolioStatistics {
+        self.0.borrow().statistics()
     }
 }
 

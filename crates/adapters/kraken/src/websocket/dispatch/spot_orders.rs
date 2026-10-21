@@ -460,7 +460,7 @@ impl OrderRequestState {
                  relying on reconciliation to recover any orphan order",
             );
         } else {
-            log::info!(
+            log::debug!(
                 "Submit timeout: compensating cancel sent req_id={req_id} cl_ord_ids={cl_ord_ids:?}",
             );
         }
@@ -809,6 +809,7 @@ mod tests {
         types::{Price, Quantity},
     };
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
     use crate::{
@@ -921,10 +922,10 @@ mod tests {
         let params = KrakenWsAddOrderParams {
             order_type: KrakenOrderType::Limit,
             side: KrakenOrderSide::Buy,
-            order_qty: 0.001,
+            order_qty: dec!(0.001),
             symbol: "BTC/USD".to_string(),
             token: "test-token".to_string(),
-            limit_price: Some(50_000.0),
+            limit_price: Some(dec!(50000)),
             time_in_force: None,
             expire_time: None,
             cl_ord_id: Some("O-1".to_string()),
@@ -965,10 +966,10 @@ mod tests {
         let params = KrakenWsAddOrderParams {
             order_type: KrakenOrderType::Limit,
             side: KrakenOrderSide::Buy,
-            order_qty: 0.001,
+            order_qty: dec!(0.001),
             symbol: "BTC/USD".to_string(),
             token: "TKN".to_string(),
-            limit_price: Some(50_000.0),
+            limit_price: Some(dec!(50000)),
             time_in_force: None,
             expire_time: None,
             cl_ord_id: Some(CLIENT_ORDER_ID.to_string()),
@@ -1003,7 +1004,7 @@ mod tests {
         let params = KrakenWsAmendOrderParams {
             order_id: Some("O-VENUE".to_string()),
             cl_ord_id: None,
-            order_qty: Some(0.005),
+            order_qty: Some(dec!(0.005)),
             limit_price: None,
             trigger_price: None,
             token: "TKN".to_string(),
@@ -1699,6 +1700,32 @@ mod tests {
         out
     }
 
+    // The compensating cancel is the last command the timeout task emits, so
+    // awaiting it means the original request and the rejection event are
+    // already enqueued; avoids racing a fixed sleep against the global runtime.
+    async fn recv_send_payloads_until_cancel(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<SpotHandlerCommand>,
+    ) -> Vec<String> {
+        let mut out = Vec::new();
+
+        loop {
+            let cmd = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("timed out awaiting compensating cancel")
+                .expect("command channel closed");
+
+            let SpotHandlerCommand::SendOrderRequest { payload, .. } = cmd else {
+                continue;
+            };
+            let is_cancel = payload.contains("\"cancel_order\"");
+            out.push(payload);
+
+            if is_cancel {
+                return out;
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_submit_timeout_sends_compensating_cancel() {
         let mut harness = make_harness(50);
@@ -1709,10 +1736,10 @@ mod tests {
         let params = KrakenWsAddOrderParams {
             order_type: KrakenOrderType::Limit,
             side: KrakenOrderSide::Buy,
-            order_qty: 0.001,
+            order_qty: dec!(0.001),
             symbol: "BTC/USD".to_string(),
             token: "TEST-TOKEN".to_string(),
-            limit_price: Some(50_000.0),
+            limit_price: Some(dec!(50000)),
             time_in_force: None,
             expire_time: None,
             cl_ord_id: Some(CLIENT_ORDER_ID.to_string()),
@@ -1728,9 +1755,7 @@ mod tests {
             .submit(params, identity, 1)
             .expect("submit ok");
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let payloads = drain_send_payloads(&mut harness.cmd_rx);
+        let payloads = recv_send_payloads_until_cancel(&mut harness.cmd_rx).await;
         assert!(
             payloads.iter().any(|p| p.contains("\"add_order\"")),
             "original add_order missing: {payloads:?}",
@@ -1764,10 +1789,10 @@ mod tests {
         let params = KrakenWsAddOrderParams {
             order_type: KrakenOrderType::Limit,
             side: KrakenOrderSide::Buy,
-            order_qty: 0.001,
+            order_qty: dec!(0.001),
             symbol: "BTC/USD".to_string(),
             token: "TEST-TOKEN".to_string(),
-            limit_price: Some(50_000.0),
+            limit_price: Some(dec!(50000)),
             time_in_force: None,
             expire_time: None,
             cl_ord_id: Some(CLIENT_ORDER_ID.to_string()),
@@ -1783,11 +1808,10 @@ mod tests {
             .submit(params, identity, 1)
             .expect("submit ok");
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let payloads = recv_send_payloads_until_cancel(&mut harness.cmd_rx).await;
 
         let _ = harness.event_rx.try_recv().expect("rejection event");
 
-        let payloads = drain_send_payloads(&mut harness.cmd_rx);
         let cancel = payloads
             .iter()
             .find(|p| p.contains("\"cancel_order\""))
@@ -1823,10 +1847,10 @@ mod tests {
         let params = KrakenWsAddOrderParams {
             order_type: KrakenOrderType::Limit,
             side: KrakenOrderSide::Buy,
-            order_qty: 0.001,
+            order_qty: dec!(0.001),
             symbol: "BTC/USD".to_string(),
             token: String::new(),
-            limit_price: Some(50_000.0),
+            limit_price: Some(dec!(50000)),
             time_in_force: None,
             expire_time: None,
             cl_ord_id: Some(CLIENT_ORDER_ID.to_string()),
@@ -1853,9 +1877,10 @@ mod tests {
             .submit(params, identity, 1)
             .expect("submit ok");
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let event = harness.event_rx.try_recv().expect("rejection event");
+        let event = tokio::time::timeout(Duration::from_secs(5), harness.event_rx.recv())
+            .await
+            .expect("timed out awaiting rejection event")
+            .expect("event channel closed");
         match event {
             OrderEventAny::Rejected(e) => {
                 let ts_event_ns = e.ts_event.as_u64();
@@ -1878,10 +1903,10 @@ mod tests {
         let params = KrakenWsAddOrderParams {
             order_type: KrakenOrderType::Limit,
             side: KrakenOrderSide::Buy,
-            order_qty: 0.001,
+            order_qty: dec!(0.001),
             symbol: "BTC/USD".to_string(),
             token: String::new(),
-            limit_price: Some(50_000.0),
+            limit_price: Some(dec!(50000)),
             time_in_force: None,
             expire_time: None,
             cl_ord_id: Some(CLIENT_ORDER_ID.to_string()),
@@ -1897,16 +1922,17 @@ mod tests {
             .submit(params, identity, 1)
             .expect("submit ok");
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        let event = tokio::time::timeout(Duration::from_secs(5), harness.event_rx.recv())
+            .await
+            .expect("timed out awaiting rejection event")
+            .expect("event channel closed");
+        assert!(matches!(event, OrderEventAny::Rejected(_)));
 
         let payloads = drain_send_payloads(&mut harness.cmd_rx);
         assert!(
             payloads.iter().all(|p| !p.contains("\"cancel_order\"")),
             "no compensating cancel expected without token, was {payloads:?}",
         );
-
-        let event = harness.event_rx.try_recv().expect("rejection event");
-        assert!(matches!(event, OrderEventAny::Rejected(_)));
     }
 
     #[tokio::test]
@@ -1937,9 +1963,7 @@ mod tests {
             .batch_add(params, identity, 1)
             .expect("batch ok");
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
-
-        let payloads = drain_send_payloads(&mut harness.cmd_rx);
+        let payloads = recv_send_payloads_until_cancel(&mut harness.cmd_rx).await;
         let cancel = payloads
             .iter()
             .find(|p| p.contains("\"cancel_order\""))
@@ -1956,10 +1980,10 @@ mod tests {
         let params = KrakenWsAddOrderParams {
             order_type: KrakenOrderType::Limit,
             side: KrakenOrderSide::Buy,
-            order_qty: 0.001,
+            order_qty: dec!(0.001),
             symbol: "BTC/USD".to_string(),
             token: String::new(),
-            limit_price: Some(50_000.0),
+            limit_price: Some(dec!(50000)),
             time_in_force: None,
             expire_time: None,
             cl_ord_id: Some(CLIENT_ORDER_ID.to_string()),
@@ -1977,7 +2001,17 @@ mod tests {
         assert_eq!(harness.state.pending_len(), 1);
 
         harness.cancellation_token.cancel();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Cancellation clears the pending entry from a task on the global runtime,
+        // so poll the condition rather than racing a fixed sleep.
+        nautilus_common::testing::wait_until_async(
+            || {
+                let state = Arc::clone(&harness.state);
+                async move { state.pending_len() == 0 }
+            },
+            Duration::from_secs(5),
+        )
+        .await;
 
         assert_eq!(
             harness.state.pending_len(),

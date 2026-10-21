@@ -18,7 +18,7 @@
 use std::{
     future::Future,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -31,7 +31,7 @@ use futures_util::{StreamExt, pin_mut};
 use nautilus_common::{
     clients::ExecutionClient,
     enums::LogLevel,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::{get_runtime, runner::get_exec_event_sender, task::TaskHandles},
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -89,7 +89,7 @@ pub struct BitmexExecutionClient {
     _submitter: SubmitBroadcaster,
     _canceller: CancelBroadcaster,
     ws_stream_handle: Option<JoinHandle<()>>,
-    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
+    pending_tasks: TaskHandles,
     dms_task_handle: Option<JoinHandle<()>>,
     dms_running: Arc<AtomicBool>,
 }
@@ -152,6 +152,7 @@ impl BitmexExecutionClient {
             config.api_secret.clone(),
             Some(account_id),
             config.heartbeat_interval_secs,
+            config.auth_timeout_secs,
             config.environment,
             config.transport_backend,
             config.proxy_url.clone(),
@@ -221,7 +222,7 @@ impl BitmexExecutionClient {
             _submitter,
             _canceller,
             ws_stream_handle: None,
-            pending_tasks: Mutex::new(Vec::new()),
+            pending_tasks: TaskHandles::default(),
             dms_task_handle: None,
             dms_running: Arc::new(AtomicBool::new(false)),
         })
@@ -237,25 +238,11 @@ impl BitmexExecutionClient {
             }
         });
 
-        let mut guard = self
-            .pending_tasks
-            .lock()
-            .expect("pending task lock poisoned");
-
-        // Remove completed tasks to prevent unbounded growth
-        guard.retain(|h| !h.is_finished());
-        guard.push(handle);
+        self.pending_tasks.push(handle);
     }
 
     fn abort_pending_tasks(&self) {
-        let mut guard = self
-            .pending_tasks
-            .lock()
-            .expect("pending task lock poisoned");
-
-        for handle in guard.drain(..) {
-            handle.abort();
-        }
+        self.pending_tasks.abort_all();
     }
 
     /// Populates `order_identities` for an order if not already present.
@@ -398,7 +385,7 @@ impl BitmexExecutionClient {
 
     fn apply_account_id(&mut self, account_id: AccountId) {
         if self.core.account_id != account_id {
-            log::info!(
+            log::debug!(
                 "Discovered BitMEX account ID: account_id={} (was {})",
                 account_id,
                 self.core.account_id
@@ -446,6 +433,7 @@ impl BitmexExecutionClient {
         let stream = self.ws_client.stream();
         let emitter = self.emitter.clone();
         let state = Arc::clone(&self.ws_dispatch_state);
+        state.order_rows_clear();
         let account_id = self.core.account_id;
         let clock = self.clock;
 
@@ -953,14 +941,7 @@ impl ExecutionClient for BitmexExecutionClient {
             .and_then(|p| p.get_usize("submit_tries"))
             .filter(|&n| n > 0);
 
-        let order = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .map(|o| o.clone())
-            .ok_or_else(|| {
-                anyhow::anyhow!("Order not found in cache for {}", cmd.client_order_id)
-            })?;
+        let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
 
         let peg_price_type = match parse_peg_price_type(cmd.params.as_ref()) {
             Ok(value) => value,
@@ -1020,7 +1001,7 @@ impl ExecutionClient for BitmexExecutionClient {
             }
         };
 
-        log::info!(
+        log::debug!(
             "Submitting BitMEX order list: order_list_id={}, count={}",
             cmd.order_list.id,
             orders.len(),
@@ -1065,7 +1046,11 @@ impl ExecutionClient for BitmexExecutionClient {
                 )
                 .await
             {
-                Ok(report) => emitter.send_order_status_report(report),
+                Ok(_) => {
+                    log::debug!(
+                        "BitMEX modify accepted by REST, awaiting websocket confirmation: client_order_id={client_order_id}"
+                    );
+                }
                 Err(e) => handle_modify_failure(&ModifyFailure {
                     err: &e,
                     emitter: &emitter,
@@ -1250,7 +1235,7 @@ fn handle_submit_failure(failure: &SubmitFailure<'_>) {
             failure.post_only,
         );
     } else {
-        log::error!(
+        log::warn!(
             "Ambiguous BitMEX submit failure for {}, awaiting reconciliation: {:?}",
             failure.client_order_id,
             failure.err,
@@ -1280,7 +1265,7 @@ fn handle_modify_failure(failure: &ModifyFailure<'_>) {
             ts_event,
         );
     } else {
-        log::error!(
+        log::warn!(
             "Ambiguous BitMEX modify failure for {}, awaiting reconciliation: {:?}",
             failure.client_order_id,
             failure.err,
@@ -1400,7 +1385,10 @@ mod tests {
         },
         websocket::{
             enums::BitmexAction,
-            messages::{BitmexExecutionMsg, BitmexTableMessage, BitmexWalletMsg, BitmexWsMessage},
+            messages::{
+                BitmexExecutionMsg, BitmexOrderMsg, BitmexTableMessage, BitmexWalletMsg,
+                BitmexWsMessage, OrderData,
+            },
         },
     };
 
@@ -1477,6 +1465,7 @@ mod tests {
             0,
             Price::new(0.5, 1),
             Quantity::new(1.0, 0),
+            None,
             None,
             None,
             None,
@@ -1661,6 +1650,121 @@ mod tests {
             }
             event => panic!("expected fill report, was {event:?}"),
         }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[rstest]
+    #[case::continuous(false)]
+    #[case::reconnected(true)]
+    fn test_dispatch_sparse_terminal_update_respects_cache_lifecycle(#[case] reconnect: bool) {
+        let (emitter, mut rx) = make_emitter();
+        let state = WsDispatchState::default();
+        let account_id = AccountId::from("BITMEX-1234567");
+        let client_order_id = ClientOrderId::from("mm_bitmex_1a/oemUeQ4CAJZgP3fjHsA");
+        let order: BitmexOrderMsg = serde_json::from_str(&load_test_json("ws_order.json")).unwrap();
+        let update: BitmexTableMessage =
+            serde_json::from_str(&load_test_json("ws_order_update_canceled.json")).unwrap();
+        let mut instruments_by_symbol = AHashMap::new();
+        instruments_by_symbol.insert(Ustr::from("XBTUSD"), test_perpetual_instrument());
+        let mut order_type_cache = AHashMap::new();
+        let mut order_symbol_cache = AHashMap::new();
+        state.order_identities.insert(
+            client_order_id,
+            OrderIdentity {
+                instrument_id: InstrumentId::from("XBTUSD.BITMEX"),
+                strategy_id: StrategyId::from("S-001"),
+                order_side: OrderSide::Buy,
+                order_type: OrderType::Limit,
+            },
+        );
+
+        dispatch::dispatch_ws_message(
+            UnixNanos::default(),
+            BitmexWsMessage::Table(BitmexTableMessage::Order {
+                action: BitmexAction::Partial,
+                data: vec![OrderData::Full(order)],
+            }),
+            &emitter,
+            &state,
+            &mut instruments_by_symbol,
+            &mut order_type_cache,
+            &mut order_symbol_cache,
+            account_id,
+        );
+
+        if reconnect {
+            dispatch::dispatch_ws_message(
+                UnixNanos::default(),
+                BitmexWsMessage::Reconnected,
+                &emitter,
+                &state,
+                &mut instruments_by_symbol,
+                &mut order_type_cache,
+                &mut order_symbol_cache,
+                account_id,
+            );
+        }
+        dispatch::dispatch_ws_message(
+            UnixNanos::default(),
+            BitmexWsMessage::Table(update),
+            &emitter,
+            &state,
+            &mut instruments_by_symbol,
+            &mut order_type_cache,
+            &mut order_symbol_cache,
+            account_id,
+        );
+
+        let events = drain_order_events(&mut rx);
+        match (reconnect, &events[..]) {
+            (false, [OrderEventAny::Accepted(_), OrderEventAny::Canceled(_)])
+            | (true, [OrderEventAny::Accepted(_)]) => {}
+            (_, events) => panic!("unexpected order lifecycle events: {events:?}"),
+        }
+    }
+
+    #[rstest]
+    fn test_dispatch_untracked_sparse_terminal_update_does_not_emit_report() {
+        let (emitter, mut rx) = make_emitter();
+        let state = WsDispatchState::default();
+        let account_id = AccountId::from("BITMEX-1234567");
+        let order: BitmexOrderMsg = serde_json::from_str(&load_test_json("ws_order.json")).unwrap();
+        let update: BitmexTableMessage =
+            serde_json::from_str(&load_test_json("ws_order_update_canceled.json")).unwrap();
+        let mut instruments_by_symbol = AHashMap::new();
+        instruments_by_symbol.insert(Ustr::from("XBTUSD"), test_perpetual_instrument());
+        let mut order_type_cache = AHashMap::new();
+        let mut order_symbol_cache = AHashMap::new();
+
+        dispatch::dispatch_ws_message(
+            UnixNanos::default(),
+            BitmexWsMessage::Table(BitmexTableMessage::Order {
+                action: BitmexAction::Partial,
+                data: vec![OrderData::Full(order)],
+            }),
+            &emitter,
+            &state,
+            &mut instruments_by_symbol,
+            &mut order_type_cache,
+            &mut order_symbol_cache,
+            account_id,
+        );
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ExecutionEvent::Report(ExecutionReport::Order(_)))
+        ));
+
+        dispatch::dispatch_ws_message(
+            UnixNanos::default(),
+            BitmexWsMessage::Table(update),
+            &emitter,
+            &state,
+            &mut instruments_by_symbol,
+            &mut order_type_cache,
+            &mut order_symbol_cache,
+            account_id,
+        );
+
         assert!(rx.try_recv().is_err());
     }
 

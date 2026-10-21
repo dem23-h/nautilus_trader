@@ -9,23 +9,14 @@ from nautilus_trader import model
 __all__ = [
     "ReplayNormalizedRequestOptions",
     "StreamNormalizedRequestOptions",
-    "TardisBatchedDeltasStreamIterator",
     "TardisDataClientConfig",
     "TardisDataClientFactory",
-    "TardisDeltaStreamIterator",
-    "TardisDepth10StreamIterator",
-    "TardisFundingRateStreamIterator",
-    "TardisHttpClient",
-    "TardisInstrumentKey",
-    "TardisInstrumentMiniInfo",
-    "TardisMachineClient",
-    "TardisQuoteStreamIterator",
-    "TardisTradeStreamIterator",
-    "bar_spec_to_tardis_trade_bar_string",
+    "convert_tardis_options_chain_csv",
     "load_tardis_deltas",
     "load_tardis_depth10_from_snapshot5",
     "load_tardis_depth10_from_snapshot25",
     "load_tardis_funding_rates",
+    "load_tardis_options_chain",
     "load_tardis_quotes",
     "load_tardis_trades",
     "run_tardis_machine_replay",
@@ -34,13 +25,9 @@ __all__ = [
     "stream_tardis_depth10_from_snapshot5",
     "stream_tardis_depth10_from_snapshot25",
     "stream_tardis_funding_rates",
+    "stream_tardis_options_chain",
     "stream_tardis_quotes",
     "stream_tardis_trades",
-    "tardis_exchange_from_venue_str",
-    "tardis_exchange_is_option_exchange",
-    "tardis_exchange_to_venue_str",
-    "tardis_exchanges",
-    "tardis_normalize_symbol_str",
 ]
 
 @typing.final
@@ -64,6 +51,16 @@ class TardisBatchedDeltasStreamIterator:
 
 @typing.final
 class TardisDataClientConfig:
+    @property
+    def tardis_ws_url(self) -> str | None: ...
+    @property
+    def normalize_symbols(self) -> bool: ...
+    @property
+    def extract_bbo_as_quotes(self) -> bool: ...
+    @property
+    def options(self) -> list[ReplayNormalizedRequestOptions]: ...
+    @property
+    def stream_options(self) -> list[StreamNormalizedRequestOptions]: ...
     def __init__(
         self,
         api_key: str | None = None,
@@ -74,6 +71,8 @@ class TardisDataClientConfig:
         stream_options: typing.Sequence[StreamNormalizedRequestOptions] | None = None,
         extract_bbo_as_quotes: bool | None = None,
     ) -> None: ...
+    @property
+    def has_proxy_url(self) -> bool: ...
 
 @typing.final
 class TardisDataClientFactory:
@@ -126,9 +125,6 @@ class TardisHttpClient:
     ) -> typing.Any: ...
 
 @typing.final
-class TardisInstrumentKey: ...
-
-@typing.final
 class TardisInstrumentMiniInfo:
     def __init__(
         self,
@@ -179,6 +175,11 @@ class TardisMachineClient:
     ) -> typing.Any: ...
 
 @typing.final
+class TardisOptionsChainStreamIterator:
+    def __iter__(self) -> TardisOptionsChainStreamIterator: ...
+    def __next__(self) -> list[typing.Any] | None: ...
+
+@typing.final
 class TardisQuoteStreamIterator:
     def __iter__(self) -> TardisQuoteStreamIterator: ...
     def __next__(self) -> list[model.QuoteTick] | None: ...
@@ -189,6 +190,16 @@ class TardisTradeStreamIterator:
     def __next__(self) -> list[model.TradeTick] | None: ...
 
 def bar_spec_to_tardis_trade_bar_string(bar_spec: model.BarSpecification) -> str: ...
+def convert_tardis_options_chain_csv(
+    filepaths: typing.Sequence[str | os.PathLike | pathlib.Path],
+    catalog_path: str | os.PathLike | pathlib.Path,
+    underlyings: typing.Sequence[str] | None = None,
+    snapshot_interval_ms: int | None = None,
+    extract_bbo_as_quotes: bool = True,
+    write_instruments: bool = True,
+    price_precision: int | None = None,
+    size_precision: int | None = None,
+) -> None: ...
 def load_tardis_deltas(
     filepath: str | os.PathLike | pathlib.Path,
     price_precision: int | None = None,
@@ -215,6 +226,13 @@ def load_tardis_funding_rates(
     instrument_id: model.InstrumentId | None = None,
     limit: int | None = None,
 ) -> list[model.FundingRateUpdate]: ...
+def load_tardis_options_chain(
+    filepath: str | os.PathLike | pathlib.Path,
+    underlyings: typing.Sequence[str] | None = None,
+    price_precision: int | None = None,
+    size_precision: int | None = None,
+    limit: int | None = None,
+) -> list[typing.Any]: ...
 def load_tardis_quotes(
     filepath: str | os.PathLike | pathlib.Path,
     price_precision: int | None = None,
@@ -268,6 +286,14 @@ def stream_tardis_funding_rates(
     instrument_id: model.InstrumentId | None = None,
     limit: int | None = None,
 ) -> TardisFundingRateStreamIterator: ...
+def stream_tardis_options_chain(
+    filepath: str | os.PathLike | pathlib.Path,
+    chunk_size: int = 100000,
+    underlyings: typing.Sequence[str] | None = None,
+    price_precision: int | None = None,
+    size_precision: int | None = None,
+    limit: int | None = None,
+) -> TardisOptionsChainStreamIterator: ...
 def stream_tardis_quotes(
     filepath: str | os.PathLike | pathlib.Path,
     chunk_size: int = 100000,

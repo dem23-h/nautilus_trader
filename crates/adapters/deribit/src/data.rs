@@ -27,7 +27,7 @@ use futures_util::StreamExt;
 use nautilus_common::{
     clients::DataClient,
     live::{runner::get_data_event_sender, runtime::get_runtime},
-    log_info,
+    log_debug, log_info,
     messages::{
         DataEvent, DataResponse,
         data::{
@@ -137,6 +137,7 @@ impl DeribitDataClient {
             config.api_key.clone(),
             config.api_secret.clone(),
             config.heartbeat_interval_secs,
+            config.auth_timeout_secs,
             config.environment,
             config.transport_backend,
             config.proxy_url.clone(),
@@ -252,7 +253,7 @@ impl DeribitDataClient {
                 }
             }
             NautilusWsMessage::Error(e) => {
-                log::error!("WebSocket error: {e:?}");
+                log::warn!("WebSocket error: {e:?}");
             }
             NautilusWsMessage::Raw(value) => {
                 log::debug!("Unhandled raw message: {value}");
@@ -285,6 +286,11 @@ impl DeribitDataClient {
                 log::warn!(
                     "Data client received FillReports message (should be handled by execution client): {} reports",
                     reports.len()
+                );
+            }
+            NautilusWsMessage::OrderFilled(order) => {
+                log::warn!(
+                    "Data client received OrderFilled message (should be handled by execution client): {order:?}"
                 );
             }
             NautilusWsMessage::OrderRejected(order) => {
@@ -526,7 +532,7 @@ impl DataClient for DeribitDataClient {
     }
 
     fn dispose(&mut self) -> anyhow::Result<()> {
-        log::info!("Disposing data client: {}", self.client_id);
+        log::debug!("Disposing data client: {}", self.client_id);
         self.stop()
     }
 
@@ -574,7 +580,7 @@ impl DataClient for DeribitDataClient {
             all_instruments.extend(fetched);
         }
 
-        log::info!(
+        log::debug!(
             "Cached instruments: client_id={}, total={}",
             self.client_id,
             all_instruments.len()
@@ -610,7 +616,7 @@ impl DataClient for DeribitDataClient {
             ws.authenticate_session(DERIBIT_DATA_SESSION_NAME)
                 .await
                 .context("failed to authenticate WebSocket")?;
-            log_info!("WebSocket authenticated");
+            log_debug!("WebSocket authenticated");
         }
 
         // Get the stream and spawn processing task
@@ -851,8 +857,6 @@ impl DataClient for DeribitDataClient {
             .clone();
         let http_client = self.http_client.clone();
         let instruments = Arc::clone(&self.instruments);
-
-        log::debug!("Subscribing to quotes for {instrument_id}");
 
         get_runtime().spawn(async move {
             if needs_load
@@ -1098,6 +1102,7 @@ impl DataClient for DeribitDataClient {
                 .load()
                 .get(&instrument_id)
                 .is_some_and(|inst| matches!(inst, InstrumentAny::CryptoPerpetual(_)));
+
             if !is_perpetual {
                 log::warn!(
                     "Funding rates subscription rejected for {instrument_id}: only available for perpetual instruments"
@@ -1129,7 +1134,7 @@ impl DataClient for DeribitDataClient {
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
 
-        log::info!("Subscribing to instrument status for {instrument_id} ({kind}.{currency})");
+        log::debug!("Subscribing to instrument status for {instrument_id} ({kind}.{currency})");
 
         get_runtime().spawn(async move {
             if let Err(e) = ws.subscribe_instrument_status(&kind, &currency).await {
@@ -1202,7 +1207,7 @@ impl DataClient for DeribitDataClient {
             return Ok(());
         };
 
-        log::info!("Subscribing to Deribit volatility index: {index_name}");
+        log::debug!("Subscribing to Deribit volatility index: {index_name}");
 
         let ws = self
             .ws_client
@@ -1232,7 +1237,7 @@ impl DataClient for DeribitDataClient {
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
 
-        log::info!("Unsubscribing from instrument status for {instrument_id} ({kind}.{currency})");
+        log::debug!("Unsubscribing from instrument status for {instrument_id} ({kind}.{currency})");
 
         get_runtime().spawn(async move {
             if let Err(e) = ws.unsubscribe_instrument_status(&kind, &currency).await {
@@ -1396,8 +1401,6 @@ impl DataClient for DeribitDataClient {
             .ok_or_else(|| anyhow::anyhow!("WebSocket client not initialized"))?
             .clone();
         let instrument_id = cmd.instrument_id;
-
-        log::debug!("Unsubscribing from quotes for {instrument_id}");
 
         get_runtime().spawn(async move {
             if let Err(e) = ws.unsubscribe_quotes(instrument_id).await {
@@ -1604,7 +1607,7 @@ impl DataClient for DeribitDataClient {
             return Ok(());
         };
 
-        log::info!("Unsubscribing from Deribit volatility index: {index_name}");
+        log::debug!("Unsubscribing from Deribit volatility index: {index_name}");
 
         let ws = self
             .ws_client
@@ -1668,7 +1671,7 @@ impl DataClient for DeribitDataClient {
                     .await
                 {
                     Ok(instruments) => {
-                        log::info!(
+                        log::debug!(
                             "Fetched {} instruments for ANY/{:?}",
                             instruments.len(),
                             product_type
@@ -1732,29 +1735,7 @@ impl DataClient for DeribitDataClient {
             );
         }
 
-        // First, check if instrument exists in cache
-        if let Some(instrument) = self.instruments.get_cloned(&request.instrument_id) {
-            let response = DataResponse::Instrument(Box::new(InstrumentResponse::new(
-                request.request_id,
-                request.client_id.unwrap_or(self.client_id),
-                instrument.id(),
-                instrument,
-                datetime_to_unix_nanos(request.start),
-                datetime_to_unix_nanos(request.end),
-                self.clock.get_time_ns(),
-                request.params,
-            )));
-
-            if let Err(e) = self.data_sender.send(DataEvent::Response(response)) {
-                log::error!("Failed to send instrument response: {e}");
-            }
-            return Ok(());
-        }
-
-        log::debug!(
-            "Instrument {} not in cache, fetching from API",
-            request.instrument_id
-        );
+        log::debug!("Fetching instrument {} from API", request.instrument_id);
 
         let http_client = self.http_client.clone();
         let ws_client = self.ws_client.clone();
@@ -1775,7 +1756,7 @@ impl DataClient for DeribitDataClient {
                 .context("failed to request instrument from Deribit")
             {
                 Ok(instrument) => {
-                    log::info!("Successfully fetched instrument: {instrument_id}");
+                    log::debug!("Successfully fetched instrument: {instrument_id}");
 
                     instruments_cache.insert(instrument.id(), instrument.clone());
                     http_client.cache_instruments(std::slice::from_ref(&instrument));
@@ -1951,7 +1932,7 @@ impl DataClient for DeribitDataClient {
             let result = if let Some(inst_id) = instrument_id {
                 // Single-instrument path: 1 HTTP call to public/ticker
                 let instrument_name = inst_id.symbol.to_string();
-                log::info!(
+                log::debug!(
                     "Requesting forward price for {currency} (single instrument: {instrument_name})"
                 );
 
@@ -1971,7 +1952,7 @@ impl DataClient for DeribitDataClient {
                             })
                             .unwrap_or_default();
 
-                        log::info!(
+                        log::debug!(
                             "Fetched {} forward price for {currency} (single instrument: {instrument_name})",
                             forward_prices.len(),
                         );
@@ -1981,7 +1962,7 @@ impl DataClient for DeribitDataClient {
                 }
             } else {
                 // Bulk path: fetch all book summaries
-                log::info!("Requesting option forward prices for currency={currency} (bulk)");
+                log::debug!("Requesting option forward prices for currency={currency} (bulk)");
 
                 match http_client.request_book_summaries(&currency).await {
                     Ok(summaries) => {
@@ -2011,7 +1992,7 @@ impl DataClient for DeribitDataClient {
                             })
                             .collect();
 
-                        log::info!(
+                        log::debug!(
                             "Fetched {} forward prices (per-expiry) for {currency}",
                             forward_prices.len(),
                         );

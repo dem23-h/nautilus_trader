@@ -55,12 +55,14 @@ use nautilus_lighter::{
     },
 };
 use nautilus_model::{
+    data::OrderBookDepth10,
     enums::{BookAction, RecordFlag},
     identifiers::{InstrumentId, Symbol},
     instruments::{CryptoPerpetual, CurrencyPair, InstrumentAny},
     types::{Currency, Price, Quantity},
 };
 use nautilus_network::websocket::TransportBackend;
+use rust_decimal::Decimal;
 use serde_json::{Value, json};
 
 const PERP_MARKET_INDEX: i16 = 0;
@@ -110,6 +112,7 @@ fn perp_instrument(
         None,
         None,
         None,
+        None,
         UnixNanos::default(),
         UnixNanos::default(),
     ))
@@ -130,6 +133,7 @@ fn spot_instrument(
         4,
         Price::from("0.01"),
         Quantity::from("0.0001"),
+        None,
         None,
         None,
         None,
@@ -303,7 +307,11 @@ async fn start_ws_server(state: Arc<TestServerState>) -> SocketAddr {
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("ws server");
     });
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_until_async(
+        || async { tokio::net::TcpStream::connect(addr).await.is_ok() },
+        Duration::from_secs(2),
+    )
+    .await;
     addr
 }
 
@@ -324,6 +332,7 @@ impl ClientHarness {
             LighterEnvironment::Testnet,
             Arc::clone(&registry),
             TransportBackend::default(),
+            5,
             None,
         );
         client.cache_instruments(vec![
@@ -410,16 +419,8 @@ fn book_snapshot_frame_for_market(market_index: i16) -> Value {
     frame
 }
 
-/// Returns a clone of the incremental order_book fixture rewritten to target
-/// a specific `market_index`.
 fn book_update_frame_for_market(market_index: i16) -> Value {
-    let mut frame = load_json("ws_order_book_update.json");
-    frame["channel"] = json!(format!("order_book:{market_index}"));
-    frame
-}
-
-fn book_update_frame_with_cached_changes() -> Value {
-    json!({
+    let mut frame = json!({
         "channel": "order_book:0",
         "last_updated_at": 1778138389656150_u64,
         "offset": 2165,
@@ -427,7 +428,6 @@ fn book_update_frame_with_cached_changes() -> Value {
             "code": 0,
             "asks": [
                 {"price": "2325.00", "size": "0.0000"},
-                {"price": "2341.25", "size": "1.0000"},
                 {"price": "2330.00", "size": "0.1200"}
             ],
             "bids": [
@@ -441,7 +441,25 @@ fn book_update_frame_with_cached_changes() -> Value {
         },
         "timestamp": 1778138583602_u64,
         "type": "update/order_book"
-    })
+    });
+    frame["channel"] = json!(format!("order_book:{market_index}"));
+    frame
+}
+
+fn book_update_frame_with_cached_changes() -> Value {
+    book_update_frame_for_market(PERP_MARKET_INDEX)
+}
+
+fn assert_depth10_matches_cached_changes(depth: &OrderBookDepth10) {
+    assert_eq!(depth.sequence, 904846);
+    assert_eq!(depth.bids[0].price, Price::from("2000.00"));
+    assert_eq!(depth.bids[0].size, Quantity::from("0.0500"));
+    assert_eq!(depth.bids[1].price, Price::from("1999.00"));
+    assert_eq!(depth.bids[1].size, Quantity::from("0.0100"));
+    assert_eq!(depth.asks[0].price, Price::from("2330.00"));
+    assert_eq!(depth.asks[0].size, Quantity::from("0.1200"));
+    assert_eq!(depth.asks[1].price, Price::from("2341.25"));
+    assert_eq!(depth.asks[1].size, Quantity::from("340.1028"));
 }
 
 #[tokio::test]
@@ -634,6 +652,7 @@ async fn test_send_tx_errors_when_handler_unavailable() {
         LighterEnvironment::Testnet,
         registry,
         TransportBackend::default(),
+        5,
         None,
     );
 
@@ -695,6 +714,160 @@ async fn test_order_book_update_before_snapshot_is_dropped() {
 }
 
 #[tokio::test]
+async fn test_order_book_nonce_gap_drops_update_and_resubscribes() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let mut harness = ClientHarness::build(addr).await;
+
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+
+    let id = harness.instrument(PERP_MARKET_INDEX);
+    harness.client.subscribe_book(id).await.expect("subscribe");
+
+    let snapshot_event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("snapshot deltas");
+    let NautilusWsMessage::Deltas(deltas) = snapshot_event else {
+        panic!("expected snapshot Deltas, was {snapshot_event:?}");
+    };
+    assert!(
+        deltas
+            .deltas
+            .iter()
+            .any(|d| d.flags & RecordFlag::F_SNAPSHOT as u8 != 0),
+        "initial snapshot must seed the cached book",
+    );
+
+    state
+        .enqueue_push(load_json("ws_order_book_update.json"))
+        .await;
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+    harness
+        .client
+        .subscribe_quotes(id)
+        .await
+        .expect("trigger nonce-gap update");
+
+    await_unsubscribe_count(&state, 1).await;
+    await_subscribe_count(&state, 3).await;
+
+    let event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("resync snapshot");
+    let NautilusWsMessage::Deltas(deltas) = event else {
+        panic!("expected resync snapshot Deltas, was {event:?}");
+    };
+    let first = deltas.deltas.first().expect("at least one delta");
+
+    assert_eq!(first.action, BookAction::Clear);
+    assert!(
+        deltas
+            .deltas
+            .iter()
+            .any(|d| d.flags & RecordFlag::F_SNAPSHOT as u8 != 0),
+        "nonce-gap update must be dropped until a fresh snapshot arrives",
+    );
+
+    let order_book_subs = state
+        .subscribes()
+        .await
+        .into_iter()
+        .filter(|sub| sub["channel"] == "order_book/0")
+        .count();
+    let order_book_unsubs = state
+        .unsubscribes()
+        .await
+        .into_iter()
+        .filter(|unsub| unsub["channel"] == "order_book/0")
+        .count();
+
+    assert_eq!(order_book_subs, 2, "gap must force one book resubscribe");
+    assert_eq!(
+        order_book_unsubs, 1,
+        "gap must force one venue book unsubscribe",
+    );
+
+    harness.client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn test_order_book_depth10_nonce_gap_drops_update_and_resubscribes() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let mut harness = ClientHarness::build(addr).await;
+
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+
+    let id = harness.instrument(PERP_MARKET_INDEX);
+    harness
+        .client
+        .subscribe_book_depth10(id)
+        .await
+        .expect("subscribe_book_depth10");
+
+    let snapshot_event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("snapshot depth10");
+    let NautilusWsMessage::Depth10(depth) = snapshot_event else {
+        panic!("expected snapshot Depth10, was {snapshot_event:?}");
+    };
+    assert_eq!(depth.instrument_id, id);
+    assert_eq!(depth.sequence, 904845);
+
+    state
+        .enqueue_push(load_json("ws_order_book_update.json"))
+        .await;
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+    harness
+        .client
+        .subscribe_quotes(id)
+        .await
+        .expect("trigger nonce-gap update");
+
+    await_unsubscribe_count(&state, 1).await;
+    await_subscribe_count(&state, 3).await;
+
+    let event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("resync depth10");
+    let NautilusWsMessage::Depth10(depth) = event else {
+        panic!("expected resync Depth10, was {event:?}");
+    };
+
+    assert_eq!(depth.instrument_id, id);
+    assert_eq!(depth.sequence, 904845);
+
+    let order_book_subs = state
+        .subscribes()
+        .await
+        .into_iter()
+        .filter(|sub| sub["channel"] == "order_book/0")
+        .count();
+    let order_book_unsubs = state
+        .unsubscribes()
+        .await
+        .into_iter()
+        .filter(|unsub| unsub["channel"] == "order_book/0")
+        .count();
+
+    assert_eq!(order_book_subs, 2, "gap must force one book resubscribe");
+    assert_eq!(
+        order_book_unsubs, 1,
+        "gap must force one venue book unsubscribe",
+    );
+
+    harness.client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
 async fn test_order_book_second_frame_is_incremental_no_depth10() {
     let state = Arc::new(TestServerState::default());
     let addr = start_ws_server(state.clone()).await;
@@ -726,7 +899,7 @@ async fn test_order_book_second_frame_is_incremental_no_depth10() {
     // so the second frame parses as incremental even when delivered through
     // a fresh push.
     state
-        .enqueue_push(load_json("ws_order_book_update.json"))
+        .enqueue_push(book_update_frame_with_cached_changes())
         .await;
     harness
         .client
@@ -794,6 +967,116 @@ async fn test_order_book_depth10_emits_on_snapshot() {
 }
 
 #[tokio::test]
+async fn test_order_book_depth10_emits_on_incremental_update() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let mut harness = ClientHarness::build(addr).await;
+
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+
+    let id = harness.instrument(PERP_MARKET_INDEX);
+    harness
+        .client
+        .subscribe_book_depth10(id)
+        .await
+        .expect("subscribe_book_depth10");
+
+    let event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("initial depth10");
+    assert!(matches!(event, NautilusWsMessage::Depth10(_)));
+
+    state
+        .enqueue_push(book_update_frame_with_cached_changes())
+        .await;
+    harness
+        .client
+        .subscribe_quotes(id)
+        .await
+        .expect("trigger incremental push");
+
+    let event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("updated depth10");
+    let NautilusWsMessage::Depth10(depth) = event else {
+        panic!("expected updated Depth10, was {event:?}");
+    };
+
+    assert_depth10_matches_cached_changes(&depth);
+
+    harness.client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
+async fn test_order_book_incremental_emits_deltas_and_depth10_when_both_subscribed() {
+    let state = Arc::new(TestServerState::default());
+    let addr = start_ws_server(state.clone()).await;
+    let mut harness = ClientHarness::build(addr).await;
+
+    state
+        .enqueue_push(load_json("ws_order_book_subscribed.json"))
+        .await;
+
+    let id = harness.instrument(PERP_MARKET_INDEX);
+    harness
+        .client
+        .subscribe_book_depth10(id)
+        .await
+        .expect("subscribe_book_depth10");
+
+    let event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("initial depth10");
+    assert!(matches!(event, NautilusWsMessage::Depth10(_)));
+
+    harness
+        .client
+        .subscribe_book(id)
+        .await
+        .expect("subscribe_book");
+    let event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("cached deltas");
+    assert!(matches!(event, NautilusWsMessage::Deltas(_)));
+
+    state
+        .enqueue_push(book_update_frame_with_cached_changes())
+        .await;
+    harness
+        .client
+        .subscribe_quotes(id)
+        .await
+        .expect("trigger incremental push");
+
+    let event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("incremental deltas");
+    let NautilusWsMessage::Deltas(deltas) = event else {
+        panic!("expected Deltas, was {event:?}");
+    };
+    assert!(
+        !deltas
+            .deltas
+            .iter()
+            .any(|d| d.flags & RecordFlag::F_SNAPSHOT as u8 != 0),
+        "incremental frame must not carry F_SNAPSHOT",
+    );
+
+    let event = next_event_within(&mut harness.client, Duration::from_secs(2))
+        .await
+        .expect("updated depth10");
+    let NautilusWsMessage::Depth10(depth) = event else {
+        panic!("expected updated Depth10, was {event:?}");
+    };
+
+    assert_depth10_matches_cached_changes(&depth);
+
+    harness.client.disconnect().await.expect("disconnect");
+}
+
+#[tokio::test]
 async fn test_late_depth10_uses_cached_book_after_incremental_updates() {
     let state = Arc::new(TestServerState::default());
     let addr = start_ws_server(state.clone()).await;
@@ -854,15 +1137,7 @@ async fn test_late_depth10_uses_cached_book_after_incremental_updates() {
         panic!("expected cached Depth10, was {event:?}");
     };
 
-    assert_eq!(depth.sequence, 904846);
-    assert_eq!(depth.bids[0].price, Price::from("2000.00"));
-    assert_eq!(depth.bids[0].size, Quantity::from("0.0500"));
-    assert_eq!(depth.bids[1].price, Price::from("1999.00"));
-    assert_eq!(depth.bids[1].size, Quantity::from("0.0100"));
-    assert_eq!(depth.asks[0].price, Price::from("2330.00"));
-    assert_eq!(depth.asks[0].size, Quantity::from("0.1200"));
-    assert_eq!(depth.asks[1].price, Price::from("2341.25"));
-    assert_eq!(depth.asks[1].size, Quantity::from("1.0000"));
+    assert_depth10_matches_cached_changes(&depth);
 
     harness.client.disconnect().await.expect("disconnect");
 }
@@ -904,7 +1179,7 @@ async fn test_ticker_frame_resolves_via_channel_index() {
     let mut harness = ClientHarness::build(addr).await;
 
     // Use the existing fixture but rewrite `s` to a symbol that does NOT
-    // match any cached raw_symbol — verifies the handler resolves from the
+    // match any cached raw_symbol - verifies the handler resolves from the
     // channel field, not the payload symbol field.
     let mut frame = load_json("ws_ticker_update.json");
     frame["ticker"]["s"] = json!("UNRELATED");
@@ -971,11 +1246,8 @@ async fn test_market_stats_frame_emits_mark_index_and_funding_updates() {
             NautilusWsMessage::FundingRate(update) => {
                 saw_funding = true;
                 assert_eq!(update.instrument_id, harness.instrument(PERP_MARKET_INDEX));
-                assert_eq!(update.rate.to_string(), "0.000001");
-                assert_eq!(
-                    update.next_funding_ns,
-                    Some(UnixNanos::from(1_774_886_400_000_000_000))
-                );
+                assert_eq!(update.rate, Decimal::new(1, 6));
+                assert_eq!(update.next_funding_ns, None);
             }
             _ => {}
         }
@@ -1095,7 +1367,7 @@ async fn test_typed_snapshot_then_update_marks_only_first_with_f_snapshot() {
     // tracks `book_snapshots_seen` per market_index, so the second frame
     // must parse as incremental.
     state
-        .enqueue_push(load_json("ws_order_book_update.json"))
+        .enqueue_push(book_update_frame_with_cached_changes())
         .await;
     harness
         .client
@@ -1156,7 +1428,7 @@ async fn test_unsubscribe_trade_does_not_clear_book_snapshot_state() {
 
     // Push a second order_book frame.
     state
-        .enqueue_push(load_json("ws_order_book_update.json"))
+        .enqueue_push(book_update_frame_with_cached_changes())
         .await;
     harness
         .client
@@ -1217,7 +1489,7 @@ async fn test_unsubscribe_book_ack_resets_snapshot_state() {
     // Resubscribe; an update arriving before the next subscription snapshot
     // must be dropped because the unsubscribe ack cleared book_snapshots_seen.
     state
-        .enqueue_push(load_json("ws_order_book_update.json"))
+        .enqueue_push(book_update_frame_with_cached_changes())
         .await;
     harness
         .client
@@ -1499,7 +1771,7 @@ async fn test_reconnect_replays_authenticated_and_public_subscriptions() {
     // Drain events until Reconnected lands. The network layer reconnects
     // after `RECONNECT_BASE_BACKOFF` (250 ms) plus jitter, so a few seconds
     // is plenty of headroom.
-    let mut saw_reconnected = false;
+    let mut reconnect_epoch = None;
 
     for _ in 0..20 {
         let Some(event) = next_event_within(&mut harness.client, Duration::from_secs(3)).await
@@ -1507,14 +1779,15 @@ async fn test_reconnect_replays_authenticated_and_public_subscriptions() {
             break;
         };
 
-        if matches!(event, NautilusWsMessage::Reconnected) {
-            saw_reconnected = true;
+        if let NautilusWsMessage::Reconnected { connection_epoch } = event {
+            reconnect_epoch = Some(connection_epoch);
             break;
         }
     }
-    assert!(
-        saw_reconnected,
-        "expected Reconnected after server-driven close"
+    assert_eq!(
+        reconnect_epoch,
+        Some(1),
+        "first replacement connection must own epoch 1",
     );
 
     // The spawn loop replays both topics from `subscription_args`. Order is

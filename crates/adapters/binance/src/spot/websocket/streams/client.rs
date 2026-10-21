@@ -83,11 +83,13 @@ pub struct BinanceSpotWebSocketClient {
     heartbeat: Option<u64>,
     signal: Arc<AtomicBool>,
     slots: Arc<Mutex<Vec<ConnectionSlot>>>,
+    connect_lock: Arc<tokio::sync::Mutex<()>>,
     out_tx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedSender<BinanceSpotWsMessage>>>>,
     out_rx: Arc<Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<BinanceSpotWsMessage>>>>,
     request_id_counter: Arc<AtomicU64>,
     instruments_cache: Arc<AtomicMap<Ustr, InstrumentAny>>,
     transport_backend: TransportBackend,
+    proxy_url: Option<String>,
 }
 
 impl Debug for BinanceSpotWebSocketClient {
@@ -140,12 +142,21 @@ impl BinanceSpotWebSocketClient {
             heartbeat,
             signal: Arc::new(AtomicBool::new(false)),
             slots: Arc::new(Mutex::new(Vec::new())),
+            connect_lock: Arc::new(tokio::sync::Mutex::new(())),
             out_tx: Arc::new(Mutex::new(None)),
             out_rx: Arc::new(Mutex::new(None)),
             request_id_counter: Arc::new(AtomicU64::new(1)),
             instruments_cache: Arc::new(AtomicMap::new()),
             transport_backend,
+            proxy_url: None,
         })
+    }
+
+    /// Configures the proxy used by every connection in the stream pool.
+    #[must_use]
+    pub fn with_proxy(mut self, proxy_url: Option<String>) -> Self {
+        self.proxy_url = proxy_url;
+        self
     }
 
     /// Returns whether API credentials are configured.
@@ -199,7 +210,7 @@ impl BinanceSpotWebSocketClient {
         let slot = self.create_connection().await?;
         self.slots.lock().expect("slots lock poisoned").push(slot);
 
-        log::info!(
+        log::debug!(
             "Connected to Binance Spot SBE stream pool: url={}",
             self.url
         );
@@ -229,7 +240,7 @@ impl BinanceSpotWebSocketClient {
         *self.out_tx.lock().expect("out_tx lock poisoned") = None;
         *self.out_rx.lock().expect("out_rx lock poisoned") = None;
 
-        log::info!("Disconnected from Binance Spot SBE stream pool");
+        log::debug!("Disconnected from Binance Spot SBE stream pool");
         Ok(())
     }
 
@@ -244,7 +255,11 @@ impl BinanceSpotWebSocketClient {
     /// Returns an error if the pool is exhausted or command delivery fails.
     #[expect(clippy::missing_panics_doc, reason = "mutex poisoning is not expected")]
     pub async fn subscribe(&self, streams: Vec<String>) -> BinanceWsResult<()> {
-        // Phase 1: filter already-subscribed streams (brief lock)
+        // Serialize all phases so concurrent subscribers see a consistent
+        // pool state and can't trigger spurious `Pool exhausted`.
+        let _connect_guard = self.connect_lock.lock().await;
+
+        // Phase 1: filter already-subscribed streams (brief lock).
         let new_streams: Vec<String> = {
             let slots = self.slots.lock().expect("slots lock poisoned");
             streams
@@ -257,7 +272,7 @@ impl BinanceSpotWebSocketClient {
             return Ok(());
         }
 
-        // Phase 2: create connections if needed (no lock held during async connect)
+        // Phase 2: create connections if needed.
         loop {
             let (remaining_capacity, slot_count) = {
                 let slots = self.slots.lock().expect("slots lock poisoned");
@@ -278,7 +293,7 @@ impl BinanceSpotWebSocketClient {
                 slots.push(new_slot);
                 slots.len()
             };
-            log::info!("Pool slot {} connected: url={}", slot_count - 1, self.url);
+            log::debug!("Pool slot {} connected: url={}", slot_count - 1, self.url);
         }
 
         // Phase 3: assign streams to slots and send commands (brief lock).
@@ -395,6 +410,15 @@ impl BinanceSpotWebSocketClient {
         });
     }
 
+    /// Replaces the complete instrument cache.
+    pub fn replace_instruments(&self, instruments: &[InstrumentAny]) {
+        let cache = instruments
+            .iter()
+            .map(|instrument| (instrument.symbol().inner(), instrument.clone()))
+            .collect();
+        self.instruments_cache.store(cache);
+    }
+
     /// Update a single instrument in the cache.
     pub fn cache_instrument(&self, instrument: InstrumentAny) {
         self.instruments_cache
@@ -448,7 +472,7 @@ impl BinanceSpotWebSocketClient {
             reconnect_max_attempts: None,
             idle_timeout_ms: None,
             backend: self.transport_backend,
-            proxy_url: None,
+            proxy_url: self.proxy_url.clone(),
         };
 
         let keyed_quotas = vec![(
@@ -583,6 +607,19 @@ mod tests {
         assert!(
             msg.contains("HMAC"),
             "error should mention HMAC, was: {msg}"
+        );
+    }
+
+    #[rstest]
+    fn test_with_proxy_preserves_proxy_url() {
+        let client =
+            BinanceSpotWebSocketClient::new(None, None, None, None, TransportBackend::default())
+                .unwrap()
+                .with_proxy(Some("socks5://proxy.example:1080".to_string()));
+
+        assert_eq!(
+            client.proxy_url.as_deref(),
+            Some("socks5://proxy.example:1080")
         );
     }
 }

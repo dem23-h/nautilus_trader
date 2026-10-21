@@ -25,7 +25,6 @@ use nautilus_core::{
     correctness::{FAILED, check_equal},
     datetime::secs_to_nanos_unchecked,
 };
-use rust_decimal::prelude::ToPrimitive;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -171,17 +170,37 @@ impl BaseAccount {
         }
     }
 
+    /// Updates the account commissions with the provided amount.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the accumulated commission exceeds [`Money`] bounds. Operational callers should
+    /// use [`Self::try_update_commissions`] when the input is not already known to fit.
     pub fn update_commissions(&mut self, commission: Money) {
+        self.try_update_commissions(commission)
+            .expect("commission total exceeded Money bounds");
+    }
+
+    /// Updates the account commissions with the provided amount.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the accumulated commission exceeds [`Money`] bounds.
+    pub fn try_update_commissions(&mut self, commission: Money) -> anyhow::Result<()> {
         // TODO: Remove once from_raw enforces canonical precision alignment (v2)
         let commission = commission.normalized();
         if commission.is_zero() {
-            return;
+            return Ok(());
         }
         let currency = commission.currency;
-        self.commissions
-            .entry(currency)
-            .and_modify(|total| *total = *total + commission)
-            .or_insert(commission);
+        let total = self
+            .commissions
+            .get(&currency)
+            .copied()
+            .map_or(Some(commission), |total| total.checked_add(commission))
+            .ok_or_else(|| anyhow::anyhow!("{currency} commission total exceeds Money bounds"))?;
+        self.commissions.insert(currency, total);
+        Ok(())
     }
 
     /// Returns the total commission for the specified currency.
@@ -237,7 +256,7 @@ impl BaseAccount {
     ///
     /// # Errors
     ///
-    /// This function never returns an error (TBD).
+    /// Returns an error if the locked amount cannot be represented in the target currency.
     ///
     pub fn base_calculate_balance_locked(
         &mut self,
@@ -251,23 +270,22 @@ impl BaseAccount {
             .base_currency()
             .unwrap_or(instrument.quote_currency());
         let quote_currency = instrument.quote_currency();
-        let notional: f64 = match side {
+        let amount = match side {
             OrderSide::Buy => instrument
-                .calculate_notional_value(quantity, price, use_quote_for_inverse)
-                .as_f64(),
-            OrderSide::Sell => quantity.as_f64(),
+                .try_calculate_notional_value(quantity, price, use_quote_for_inverse)?
+                .as_decimal(),
+            OrderSide::Sell => quantity.as_decimal(),
             OrderSide::NoOrderSide => {
                 anyhow::bail!("Invalid `OrderSide` in `base_calculate_balance_locked`: {side}")
             }
         };
 
-        // Handle inverse
         if instrument.is_inverse() && !use_quote_for_inverse.unwrap_or(false) {
-            Ok(Money::new(notional, base_currency))
+            Ok(Money::from_decimal(amount, base_currency)?)
         } else if side == OrderSide::Buy {
-            Ok(Money::new(notional, quote_currency))
+            Ok(Money::from_decimal(amount, quote_currency)?)
         } else if side == OrderSide::Sell {
-            Ok(Money::new(notional, base_currency))
+            Ok(Money::from_decimal(amount, base_currency)?)
         } else {
             anyhow::bail!("Invalid `OrderSide` in `base_calculate_balance_locked`: {side}")
         }
@@ -284,7 +302,7 @@ impl BaseAccount {
     ///
     /// # Errors
     ///
-    /// This function never returns an error (TBD).
+    /// Returns an error if a PnL amount cannot be represented in the target currency.
     ///
     pub fn base_calculate_pnls(
         &self,
@@ -297,32 +315,24 @@ impl BaseAccount {
 
         // No quantity capping (betting accounts cap to position qty, cash accounts don't)
         let fill_qty = fill.last_qty;
-        let fill_qty_value = fill_qty.as_f64();
-
-        let notional = instrument.calculate_notional_value(fill_qty, fill.last_px, None);
+        let notional = instrument.try_calculate_notional_value(fill_qty, fill.last_px, None)?;
 
         if fill.order_side == OrderSide::Buy {
             if let (Some(base_currency_value), None) = (base_currency, self.base_currency) {
                 pnls.insert(
                     base_currency_value,
-                    Money::new(fill_qty_value, base_currency_value),
+                    Money::from_decimal(fill_qty.as_decimal(), base_currency_value)?,
                 );
             }
-            pnls.insert(
-                notional.currency,
-                Money::new(-notional.as_f64(), notional.currency),
-            );
+            pnls.insert(notional.currency, -notional);
         } else if fill.order_side == OrderSide::Sell {
             if let (Some(base_currency_value), None) = (base_currency, self.base_currency) {
                 pnls.insert(
                     base_currency_value,
-                    Money::new(-fill_qty_value, base_currency_value),
+                    -Money::from_decimal(fill_qty.as_decimal(), base_currency_value)?,
                 );
             }
-            pnls.insert(
-                notional.currency,
-                Money::new(notional.as_f64(), notional.currency),
-            );
+            pnls.insert(notional.currency, notional);
         } else {
             anyhow::bail!(
                 "Invalid `OrderSide` in base_calculate_pnls: {}",
@@ -334,13 +344,10 @@ impl BaseAccount {
 
     /// Calculates commission fees for a filled order.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Panics if instrument fees cannot be converted to f64, or if base currency is unavailable for inverse instruments.
-    #[expect(
-        clippy::missing_errors_doc,
-        reason = "Error conditions documented inline"
-    )]
+    /// Returns an error if `liquidity_side` is invalid, the notional value cannot be calculated,
+    /// or the commission cannot be represented in the target currency.
     pub fn base_calculate_commission(
         &self,
         instrument: &InstrumentAny,
@@ -353,22 +360,21 @@ impl BaseAccount {
             liquidity_side != LiquiditySide::NoLiquiditySide,
             "Invalid `LiquiditySide`: {liquidity_side}"
         );
-        let notional = instrument
-            .calculate_notional_value(last_qty, last_px, use_quote_for_inverse)
-            .as_f64();
-        let commission = if liquidity_side == LiquiditySide::Maker {
-            notional * instrument.maker_fee().to_f64().unwrap()
-        } else if liquidity_side == LiquiditySide::Taker {
-            notional * instrument.taker_fee().to_f64().unwrap()
-        } else {
-            anyhow::bail!("Invalid `LiquiditySide`: {liquidity_side}");
+        let notional =
+            instrument.try_calculate_notional_value(last_qty, last_px, use_quote_for_inverse)?;
+        let rate = match liquidity_side {
+            LiquiditySide::Maker => instrument.maker_fee(),
+            LiquiditySide::Taker => instrument.taker_fee(),
+            LiquiditySide::NoLiquiditySide => {
+                anyhow::bail!("Invalid `LiquiditySide`: {liquidity_side}")
+            }
         };
+        let commission = notional
+            .as_decimal()
+            .checked_mul(rate)
+            .ok_or_else(|| anyhow::anyhow!("commission calculation overflow"))?;
 
-        if instrument.is_inverse() && !use_quote_for_inverse.unwrap_or(false) {
-            Ok(Money::new(commission, instrument.base_currency().unwrap()))
-        } else {
-            Ok(Money::new(commission, instrument.quote_currency()))
-        }
+        Ok(Money::from_decimal(commission, notional.currency)?)
     }
 }
 
@@ -377,6 +383,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::{events::account::stubs::cash_account_state, types::money::MONEY_RAW_MAX};
 
     #[rstest]
     fn test_base_purge_account_events_retains_latest_when_all_purged() {
@@ -451,5 +458,18 @@ mod tests {
         account.update_commissions(Money::from_raw(1, usd));
 
         assert!(account.commission(&usd).is_none());
+    }
+
+    #[rstest]
+    fn test_try_update_commissions_overflow_preserves_total() {
+        let mut account = BaseAccount::new(cash_account_state(), true);
+        let usd = Currency::USD();
+        let maximum = Money::from_raw(MONEY_RAW_MAX, usd);
+
+        account.try_update_commissions(maximum).unwrap();
+        let result = account.try_update_commissions(Money::from("0.01 USD"));
+
+        assert!(result.is_err());
+        assert_eq!(account.commission(&usd), Some(maximum));
     }
 }

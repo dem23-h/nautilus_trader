@@ -19,7 +19,7 @@
 //! `Inverse` product types. Spot and HIP-4 outcome orders/positions are
 //! intentionally out of scope: spot holdings are token balances rather than
 //! derivative positions, and "flattening" them would mean dumping into a
-//! different quote asset — a real trade decision rather than cleanup. Working
+//! different quote asset - a real trade decision rather than cleanup. Working
 //! orders on those product types are left untouched and will continue to be
 //! eligible to fill after this binary exits.
 //!
@@ -110,8 +110,7 @@ async fn main() -> anyhow::Result<()> {
         .iter()
         .filter(|inst| {
             HyperliquidProductType::from_symbol(inst.id().symbol.as_str())
-                .ok()
-                .is_some_and(|pt| pt == HyperliquidProductType::Perp)
+                .is_ok_and(|pt| pt == HyperliquidProductType::Perp)
         })
         .map(|inst| (inst.raw_symbol().inner(), inst))
         .collect();
@@ -146,7 +145,12 @@ async fn cancel_open_orders(
     }
 
     log::info!("Cancelling {} open perp order(s)", cancels.len());
-    let action = HyperliquidExecAction::Cancel { cancels };
+    // Flatten cancels a mixed bag of order types (trigger orders can't be fast-cancelled)
+    // and the frontend open-orders parse does not track type, so omit the fast flag here.
+    let action = HyperliquidExecAction::Cancel {
+        cancels,
+        fast: None,
+    };
     let response = client
         .post_action_exec(&action)
         .await
@@ -346,7 +350,7 @@ fn top_of_book_reference(book: &HyperliquidL2Book, is_buy: bool) -> Option<Decim
     // levels[0] = bids, levels[1] = asks; close-BUY (cover short) targets asks
     let side = usize::from(is_buy);
     let level = book.levels.get(side).and_then(|v| v.first())?;
-    Decimal::from_str(&level.px).ok()
+    Some(level.px)
 }
 
 fn check_response(context: &str, response: &HyperliquidExchangeResponse) -> anyhow::Result<()> {
@@ -422,6 +426,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::default(),
             UnixNanos::default(),
         ))
@@ -432,8 +437,8 @@ mod tests {
             entries
                 .iter()
                 .map(|(px, sz)| HyperliquidLevel {
-                    px: (*px).to_string(),
-                    sz: (*sz).to_string(),
+                    px: Decimal::from_str(px).unwrap(),
+                    sz: Decimal::from_str(sz).unwrap(),
                 })
                 .collect()
         };

@@ -20,11 +20,13 @@ use std::{
     str::FromStr,
 };
 
-use nautilus_core::python::{get_pytype_name, to_pytype_err, to_pyvalue_err};
+use nautilus_core::python::{
+    correctness_error_to_pyvalue_err, get_pytype_name, to_pytype_err, to_pyvalue_err,
+};
 use pyo3::{basic::CompareOp, conversion::IntoPyObjectExt, prelude::*, types::PyFloat};
 use rust_decimal::{Decimal, RoundingStrategy};
 
-use crate::types::{Quantity, quantity::QuantityRaw};
+use crate::types::{Quantity, fixed::raw_scale, quantity::QuantityRaw};
 
 #[pymethods]
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
@@ -305,8 +307,10 @@ impl Quantity {
         *self
     }
 
-    fn __int__(&self) -> u64 {
-        self.as_f64() as u64
+    fn __int__(&self) -> QuantityRaw {
+        let scale = QuantityRaw::try_from(raw_scale(self.precision))
+            .expect("effective raw scale should fit in QuantityRaw");
+        self.raw / scale
     }
 
     fn __float__(&self) -> f64 {
@@ -340,8 +344,8 @@ impl Quantity {
     /// Creates a new `Quantity` instance from the given `raw` fixed-point value and `precision`.
     #[staticmethod]
     #[pyo3(name = "from_raw")]
-    fn py_from_raw(raw: QuantityRaw, precision: u8) -> Self {
-        Self::from_raw(raw, precision)
+    fn py_from_raw(raw: QuantityRaw, precision: u8) -> PyResult<Self> {
+        Self::from_raw_checked(raw, precision).map_err(correctness_error_to_pyvalue_err)
     }
 
     /// Creates a new `Quantity` instance with a value of zero with the given `precision`.
@@ -465,5 +469,62 @@ impl Quantity {
     #[pyo3(name = "checked_sub")]
     fn py_checked_sub(&self, other: Self) -> Option<Self> {
         self.checked_sub(other)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pyo3::Python;
+    use rstest::rstest;
+
+    use super::*;
+    use crate::types::{fixed::FIXED_PRECISION, quantity::QUANTITY_RAW_MAX};
+
+    #[rstest]
+    #[case("0", 0)]
+    #[case("0.000000001", 0)]
+    #[case("1.999999999", 1)]
+    #[case("50.25", 50)]
+    #[case("9007199253.999999999", 9_007_199_253)]
+    fn test_int_uses_exact_raw_value(#[case] value: &str, #[case] expected: u64) {
+        let quantity = Quantity::from_str(value).unwrap();
+
+        assert_eq!(quantity.__int__(), QuantityRaw::from(expected));
+    }
+
+    #[rstest]
+    fn test_int_preserves_domain_maximum() {
+        let expected: QuantityRaw = if cfg!(feature = "high-precision") {
+            34_028_236_692_093
+        } else {
+            18_446_744_073
+        };
+
+        assert_eq!(
+            Quantity::from_raw(QUANTITY_RAW_MAX, FIXED_PRECISION).__int__(),
+            expected
+        );
+    }
+
+    #[rstest]
+    #[cfg(feature = "defi")]
+    fn test_int_uses_defi_raw_scale() {
+        let quantity = Quantity::from_raw(1_999_999_999_999_999_999, crate::defi::WEI_PRECISION);
+
+        assert_eq!(quantity.__int__(), 1);
+    }
+
+    #[rstest]
+    fn test_py_from_raw_rejects_out_of_range_raw_value() {
+        Python::initialize();
+        Python::attach(|_| {
+            let raw = QUANTITY_RAW_MAX.saturating_add(1);
+            let error = Quantity::py_from_raw(raw, 0).unwrap_err();
+
+            assert_eq!(
+                error.to_string(),
+                format!("ValueError: raw value {raw} exceeds QUANTITY_RAW_MAX={QUANTITY_RAW_MAX}")
+            );
+        });
     }
 }

@@ -24,13 +24,16 @@ use std::{
         Arc,
         atomic::{AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
     Router,
     body::Body,
-    extract::{Query, State},
+    extract::{
+        Query, State,
+        ws::{Message, WebSocket, WebSocketUpgrade},
+    },
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -53,8 +56,8 @@ use nautilus_common::{
     messages::{
         ExecutionEvent, ExecutionReport,
         execution::{
-            BatchCancelOrders, CancelAllOrders, CancelOrder, ModifyOrder, QueryAccount, QueryOrder,
-            SubmitOrder,
+            BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports, ModifyOrder,
+            QueryAccount, QueryOrder, SubmitOrder, SubmitOrderList,
         },
     },
     testing::wait_until_async,
@@ -63,10 +66,17 @@ use nautilus_core::UnixNanos;
 use nautilus_live::ExecutionClientCore;
 use nautilus_model::{
     accounts::{AccountAny, CashAccount},
-    enums::{AccountType, OmsType, OrderSide, TimeInForce},
-    events::{AccountState, OrderEventAny},
-    identifiers::{AccountId, ClientOrderId, InstrumentId, StrategyId, TraderId, VenueOrderId},
-    orders::{LimitOrder, Order, OrderAny},
+    enums::{AccountType, ContingencyType, OmsType, OrderSide, TimeInForce, TriggerType},
+    events::{AccountState, OrderAccepted, OrderEventAny},
+    identifiers::{
+        AccountId, ClientOrderId, InstrumentId, OrderListId, StrategyId, TradeId, TraderId,
+        VenueOrderId,
+    },
+    instruments::{
+        any::InstrumentAny,
+        stubs::{crypto_perpetual_ethusdt, currency_pair_btcusdt},
+    },
+    orders::{LimitOrder, Order, OrderAny, OrderList, StopLimitOrder},
     types::{AccountBalance, Money, Price, Quantity},
 };
 use nautilus_network::http::HttpClient;
@@ -80,15 +90,24 @@ const NEW_ORDER_FULL_TEMPLATE_ID: u16 = 302;
 const CANCEL_ORDER_TEMPLATE_ID: u16 = 305;
 const CANCEL_OPEN_ORDERS_TEMPLATE_ID: u16 = 306;
 const ACCOUNT_TEMPLATE_ID: u16 = 400;
+const ACCOUNT_TRADES_TEMPLATE_ID: u16 = 401;
 const ORDERS_TEMPLATE_ID: u16 = 308;
 const SYMBOL_BLOCK_LENGTH: u16 = 19;
 const ACCOUNT_BLOCK_LENGTH: u16 = 64;
 const BALANCE_BLOCK_LENGTH: u16 = 17;
+const ACCOUNT_TRADE_BLOCK_LENGTH: u16 = 70;
 const NEW_ORDER_FULL_BLOCK_LENGTH: u16 = 153;
 const CANCEL_ORDER_BLOCK_LENGTH: u16 = 137;
 const ORDERS_GROUP_BLOCK_LENGTH: u16 = 162;
 const PRICE_FILTER_TEMPLATE_ID: u16 = 1;
 const LOT_SIZE_FILTER_TEMPLATE_ID: u16 = 4;
+
+/// WS trading setup timeout for the tests that exercise setup expiry.
+///
+/// Sized to expire quickly while leaving room for the request to reach the
+/// loopback server and be recorded: the timer starts when the command is
+/// queued on the handler channel, not when the frame hits the socket.
+const TEST_WS_SETUP_TIMEOUT_MS: u64 = 250;
 
 fn create_sbe_header(block_length: u16, template_id: u16) -> [u8; 8] {
     let mut header = [0u8; 8];
@@ -499,8 +518,74 @@ struct CommandResponseState {
     request_count: Arc<AtomicUsize>,
 }
 
-fn create_exec_test_router(order_query_count: Option<Arc<AtomicUsize>>) -> Router {
-    let order_query_count_for_order_route = order_query_count;
+#[derive(Clone, Copy, Debug)]
+enum FillFixtureMode {
+    Empty,
+    Invalid,
+    Paginated,
+    PaginatedWithWindowSpill,
+    Stable,
+    StableWithOpenOrder,
+}
+
+#[derive(Clone)]
+struct FillFixtureState {
+    mode: FillFixtureMode,
+    captured_queries: Option<CapturedQueries>,
+}
+
+#[derive(Clone)]
+struct CapturedQuery {
+    query: HashMap<String, String>,
+}
+
+type CapturedQueries = Arc<std::sync::Mutex<Vec<CapturedQuery>>>;
+
+#[derive(Clone, Copy)]
+enum WsSetupBehavior {
+    CompleteSetup,
+    RejectFirstSessionLogon,
+    RejectSessionLogon,
+    IgnoreSessionLogon,
+    RejectUserDataSubscribe,
+    IgnoreUserDataSubscribe,
+}
+
+#[derive(Clone)]
+struct WsSetupState {
+    behavior: WsSetupBehavior,
+    received_methods: Arc<tokio::sync::Mutex<Vec<String>>>,
+    session_logon_rejections: Arc<AtomicUsize>,
+}
+
+impl WsSetupState {
+    fn new(behavior: WsSetupBehavior) -> Self {
+        Self {
+            behavior,
+            received_methods: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            session_logon_rejections: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    async fn received_methods(&self) -> Vec<String> {
+        self.received_methods.lock().await.clone()
+    }
+}
+
+fn create_exec_test_router(order_query_received: Option<Arc<tokio::sync::Notify>>) -> Router {
+    create_exec_test_router_with_fill_fixture(order_query_received, FillFixtureMode::Stable, None)
+}
+
+fn create_exec_test_router_with_fill_fixture(
+    order_query_received: Option<Arc<tokio::sync::Notify>>,
+    mode: FillFixtureMode,
+    captured_queries: Option<CapturedQueries>,
+) -> Router {
+    let order_query_received_for_order_route = order_query_received;
+    let state = FillFixtureState {
+        mode,
+        captured_queries,
+    };
 
     Router::new()
         .route(
@@ -514,6 +599,7 @@ fn create_exec_test_router(order_query_count: Option<Arc<AtomicUsize>>) -> Route
                     if !has_auth_headers(&headers) {
                         return unauthorized_response().into_response();
                     }
+
                     let symbol = params
                         .get("symbol")
                         .cloned()
@@ -557,18 +643,12 @@ fn create_exec_test_router(order_query_count: Option<Arc<AtomicUsize>>) -> Route
         )
         .route(
             "/api/v3/openOrders",
-            get(|headers: HeaderMap| async move {
-                if !has_auth_headers(&headers) {
-                    return unauthorized_response().into_response();
-                }
-                let orders: Vec<(i64, &str, &str, i64, i64)> = vec![];
-                sbe_response(build_orders_response(&orders)).into_response()
-            })
-            .delete(
+            get(handle_open_orders).delete(
                 |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| async move {
                     if !has_auth_headers(&headers) {
                         return unauthorized_response().into_response();
                     }
+
                     let symbol = params
                         .get("symbol")
                         .cloned()
@@ -585,13 +665,23 @@ fn create_exec_test_router(order_query_count: Option<Arc<AtomicUsize>>) -> Route
                 },
             ),
         )
+        .route("/api/v3/myTrades", get(handle_account_trades))
         .route(
             "/api/v3/order",
             post(
-                |headers: HeaderMap, Query(params): Query<HashMap<String, String>>| async move {
+                |State(state): State<FillFixtureState>,
+                 headers: HeaderMap,
+                 Query(params): Query<HashMap<String, String>>| async move {
                     if !has_auth_headers(&headers) {
                         return unauthorized_response().into_response();
                     }
+
+                    if let Some(captured_queries) = &state.captured_queries {
+                        captured_queries.lock().unwrap().push(CapturedQuery {
+                            query: params.clone(),
+                        });
+                    }
+
                     let symbol = params
                         .get("symbol")
                         .cloned()
@@ -613,14 +703,14 @@ fn create_exec_test_router(order_query_count: Option<Arc<AtomicUsize>>) -> Route
                 },
             )
             .get(move |headers: HeaderMap| {
-                let order_query_count = order_query_count_for_order_route.clone();
+                let order_query_received = order_query_received_for_order_route.clone();
                 async move {
                     if !has_auth_headers(&headers) {
                         return unauthorized_response().into_response();
                     }
 
-                    if let Some(count) = order_query_count {
-                        count.fetch_add(1, Ordering::SeqCst);
+                    if let Some(received) = order_query_received {
+                        received.notify_one();
                     }
 
                     no_such_order_response().into_response()
@@ -631,6 +721,7 @@ fn create_exec_test_router(order_query_count: Option<Arc<AtomicUsize>>) -> Route
                     if !has_auth_headers(&headers) {
                         return unauthorized_response().into_response();
                     }
+
                     let symbol = params
                         .get("symbol")
                         .cloned()
@@ -656,6 +747,102 @@ fn create_exec_test_router(order_query_count: Option<Arc<AtomicUsize>>) -> Route
                 },
             ),
         )
+        .with_state(state)
+}
+
+async fn handle_open_orders(State(state): State<FillFixtureState>, headers: HeaderMap) -> Response {
+    if !has_auth_headers(&headers) {
+        return unauthorized_response().into_response();
+    }
+    let orders = if matches!(state.mode, FillFixtureMode::StableWithOpenOrder) {
+        vec![(
+            12345_i64,
+            "BTCUSDT",
+            "venue-open-order",
+            100_000_000_000_i64,
+            10_000_000_i64,
+        )]
+    } else {
+        Vec::new()
+    };
+    sbe_response(build_orders_response(&orders)).into_response()
+}
+
+async fn handle_account_trades(
+    State(state): State<FillFixtureState>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Response {
+    if !has_auth_headers(&headers) {
+        return unauthorized_response().into_response();
+    }
+    let from_id = query
+        .get("fromId")
+        .and_then(|value| value.parse::<i64>().ok());
+
+    if let Some(captured_queries) = &state.captured_queries {
+        captured_queries
+            .lock()
+            .unwrap()
+            .push(CapturedQuery { query });
+    }
+    let time_micros = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_micros() as i64
+        - 30_000_000;
+    let trades = match state.mode {
+        FillFixtureMode::Empty => Vec::new(),
+        FillFixtureMode::Invalid => {
+            return sbe_response(vec![0_u8; 4]).into_response();
+        }
+        FillFixtureMode::Paginated | FillFixtureMode::PaginatedWithWindowSpill
+            if from_id.is_none() || from_id == Some(0) =>
+        {
+            (1..=1_000).map(|id| (id, time_micros)).collect()
+        }
+        FillFixtureMode::Paginated if from_id == Some(1_001) => {
+            vec![(1_001, time_micros)]
+        }
+        FillFixtureMode::PaginatedWithWindowSpill if from_id == Some(1_001) => {
+            vec![(1_001, time_micros + 60_000_000)]
+        }
+        FillFixtureMode::Paginated => Vec::new(),
+        FillFixtureMode::PaginatedWithWindowSpill => Vec::new(),
+        FillFixtureMode::Stable | FillFixtureMode::StableWithOpenOrder => {
+            vec![(98_765_432, time_micros)]
+        }
+    };
+    sbe_response(build_account_trade_response(&trades)).into_response()
+}
+
+fn build_account_trade_response(trades: &[(i64, i64)]) -> Vec<u8> {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(&create_sbe_header(0, ACCOUNT_TRADES_TEMPLATE_ID));
+    buf.extend_from_slice(&create_group_header(
+        ACCOUNT_TRADE_BLOCK_LENGTH,
+        trades.len() as u32,
+    ));
+
+    for (id, time_micros) in trades {
+        buf.push((-8i8) as u8);
+        buf.push((-8i8) as u8);
+        buf.push((-8i8) as u8);
+        buf.extend_from_slice(&id.to_le_bytes());
+        buf.extend_from_slice(&12345_i64.to_le_bytes());
+        buf.extend_from_slice(&i64::MIN.to_le_bytes());
+        buf.extend_from_slice(&100_000_000_000_i64.to_le_bytes());
+        buf.extend_from_slice(&10_000_000_i64.to_le_bytes());
+        buf.extend_from_slice(&10_000_000_000_i64.to_le_bytes());
+        buf.extend_from_slice(&100_000_i64.to_le_bytes());
+        buf.extend_from_slice(&time_micros.to_le_bytes());
+        buf.push(1);
+        buf.push(0);
+        buf.push(1);
+        write_var_string(&mut buf, "BTCUSDT");
+        write_var_string(&mut buf, "BNB");
+    }
+    buf
 }
 
 fn create_exec_test_router_with_command_responses(state: CommandResponseState) -> Router {
@@ -706,6 +893,7 @@ fn create_exec_test_router_with_command_responses(state: CommandResponseState) -
                 })
                 .delete(handle_order_cancel),
         )
+        .route("/api/v3/orderList/oco", post(handle_oco_order_list_submit))
         .route("/api/v3/batchOrders", delete(handle_batch_cancel))
         .with_state(state)
 }
@@ -718,6 +906,7 @@ async fn handle_order_submit(
     if !has_auth_headers(&headers) {
         return unauthorized_response().into_response();
     }
+
     state.request_count.fetch_add(1, Ordering::Relaxed);
     let symbol = params
         .get("symbol")
@@ -749,6 +938,7 @@ async fn handle_order_cancel(
     if !has_auth_headers(&headers) {
         return unauthorized_response().into_response();
     }
+
     state.request_count.fetch_add(1, Ordering::Relaxed);
     let symbol = params
         .get("symbol")
@@ -784,6 +974,7 @@ async fn handle_order_modify(
     if !has_auth_headers(&headers) {
         return unauthorized_response().into_response();
     }
+
     state.request_count.fetch_add(1, Ordering::Relaxed);
     let symbol = params
         .get("symbol")
@@ -818,14 +1009,206 @@ async fn handle_batch_cancel(
     command_response(state.responses.batch_cancel, json_response(&json!([])))
 }
 
-async fn start_exec_test_server() -> SocketAddr {
-    start_exec_test_server_with_order_query_count(None).await
+async fn handle_oco_order_list_submit(
+    State(state): State<CommandResponseState>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if !has_auth_headers(&headers) {
+        return unauthorized_response().into_response();
+    }
+    state.request_count.fetch_add(1, Ordering::Relaxed);
+
+    let valid_oco = params.get("symbol").is_some_and(|value| value == "BTCUSDT")
+        && params.get("side").is_some_and(|value| value == "SELL")
+        && params.get("quantity").is_some_and(|value| value == "0.001")
+        && params
+            .get("aboveType")
+            .is_some_and(|value| value == "LIMIT_MAKER")
+        && params
+            .get("belowType")
+            .is_some_and(|value| value == "STOP_LOSS_LIMIT")
+        && params
+            .get("aboveClientOrderId")
+            .is_some_and(|value| value.contains("spot-oco-tp"))
+        && params
+            .get("belowClientOrderId")
+            .is_some_and(|value| value.contains("spot-oco-sl"));
+
+    if !valid_oco {
+        return venue_reject_response(-1102, "invalid OCO test request");
+    }
+
+    let above_client_order_id = params
+        .get("aboveClientOrderId")
+        .cloned()
+        .unwrap_or_else(|| "above".to_string());
+    let below_client_order_id = params
+        .get("belowClientOrderId")
+        .cloned()
+        .unwrap_or_else(|| "below".to_string());
+    let list_client_order_id = params
+        .get("listClientOrderId")
+        .cloned()
+        .unwrap_or_else(|| "list".to_string());
+
+    command_response(
+        state.responses.submit,
+        json_response(&json!({
+            "orderListId": 42,
+            "contingencyType": "OCO",
+            "listStatusType": "EXEC_STARTED",
+            "listOrderStatus": "EXECUTING",
+            "listClientOrderId": list_client_order_id,
+            "transactionTime": 1710485608839_i64,
+            "symbol": "BTCUSDT",
+            "orders": [
+                {
+                    "symbol": "BTCUSDT",
+                    "orderId": 1001,
+                    "clientOrderId": above_client_order_id
+                },
+                {
+                    "symbol": "BTCUSDT",
+                    "orderId": 1002,
+                    "clientOrderId": below_client_order_id
+                }
+            ]
+        })),
+    )
 }
 
-async fn start_exec_test_server_with_order_query_count(
-    order_query_count: Option<Arc<AtomicUsize>>,
+async fn handle_ws_setup(ws: WebSocketUpgrade, State(state): State<WsSetupState>) -> Response {
+    ws.on_upgrade(|socket| handle_ws_setup_socket(socket, state))
+}
+
+async fn handle_ws_setup_socket(mut socket: WebSocket, state: WsSetupState) {
+    while let Some(Ok(msg)) = socket.recv().await {
+        match msg {
+            Message::Text(text) => {
+                let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+                    continue;
+                };
+                let method = value
+                    .get("method")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+                let request_id = value
+                    .get("id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default();
+
+                state.received_methods.lock().await.push(method.to_string());
+
+                match (method, state.behavior) {
+                    ("session.logon", WsSetupBehavior::RejectFirstSessionLogon) => {
+                        if state
+                            .session_logon_rejections
+                            .fetch_add(1, Ordering::Relaxed)
+                            == 0
+                        {
+                            if send_ws_setup_error(&mut socket, request_id, -2015, "auth rejected")
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        } else if send_ws_setup_result(&mut socket, request_id, json!({}))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    ("session.logon", WsSetupBehavior::RejectSessionLogon) => {
+                        if send_ws_setup_error(&mut socket, request_id, -2015, "auth rejected")
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    ("session.logon", WsSetupBehavior::IgnoreSessionLogon) => {}
+                    ("session.logon", _) => {
+                        if send_ws_setup_result(&mut socket, request_id, json!({}))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    ("userDataStream.subscribe", WsSetupBehavior::RejectUserDataSubscribe) => {
+                        if send_ws_setup_error(&mut socket, request_id, -1000, "subscribe rejected")
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    ("userDataStream.subscribe", WsSetupBehavior::IgnoreUserDataSubscribe) => {}
+                    ("userDataStream.subscribe", _) => {
+                        match send_ws_setup_result(
+                            &mut socket,
+                            request_id,
+                            json!({"subscriptionId": 1}),
+                        )
+                        .await
+                        {
+                            Ok(()) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Message::Ping(payload) => {
+                if socket.send(Message::Pong(payload)).await.is_err() {
+                    break;
+                }
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+}
+
+async fn send_ws_setup_result(
+    socket: &mut WebSocket,
+    request_id: &str,
+    result: serde_json::Value,
+) -> Result<(), axum::Error> {
+    socket
+        .send(Message::Text(
+            json!({"id": request_id, "result": result})
+                .to_string()
+                .into(),
+        ))
+        .await
+}
+
+async fn send_ws_setup_error(
+    socket: &mut WebSocket,
+    request_id: &str,
+    code: i64,
+    msg: &str,
+) -> Result<(), axum::Error> {
+    socket
+        .send(Message::Text(
+            json!({"id": request_id, "error": {"code": code, "msg": msg}})
+                .to_string()
+                .into(),
+        ))
+        .await
+}
+
+async fn start_exec_test_server() -> SocketAddr {
+    start_exec_test_server_with_order_query_signal(None).await
+}
+
+async fn start_exec_test_server_with_order_query_signal(
+    order_query_received: Option<Arc<tokio::sync::Notify>>,
 ) -> SocketAddr {
-    let router = create_exec_test_router(order_query_count);
+    let router = create_exec_test_router(order_query_received);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
@@ -850,6 +1233,24 @@ async fn start_exec_test_server_with_order_query_count(
     .await;
 
     addr
+}
+
+async fn start_exec_test_server_with_fill_fixture(
+    mode: FillFixtureMode,
+) -> (SocketAddr, CapturedQueries) {
+    let captured_queries = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let router =
+        create_exec_test_router_with_fill_fixture(None, mode, Some(captured_queries.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    (addr, captured_queries)
 }
 
 async fn start_exec_test_server_with_command_responses(
@@ -885,8 +1286,104 @@ async fn start_exec_test_server_with_command_responses(
     (addr, request_count)
 }
 
+async fn start_ws_setup_test_server(behavior: WsSetupBehavior) -> (SocketAddr, WsSetupState) {
+    let state = WsSetupState::new(behavior);
+    let router = Router::new()
+        .route("/ws-api/v3", get(handle_ws_setup))
+        .with_state(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    tokio::spawn(async move {
+        axum::serve(listener, router.into_make_service())
+            .await
+            .unwrap();
+    });
+
+    (addr, state)
+}
+
 fn create_test_execution_client(
     base_url: String,
+) -> (
+    BinanceSpotExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    create_test_execution_client_with_transport(base_url, false, None)
+}
+
+fn create_test_execution_client_with_ws_trading(
+    base_url_http: String,
+    base_url_ws_trading: String,
+) -> (
+    BinanceSpotExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    create_test_execution_client_with_transport(base_url_http, true, Some(base_url_ws_trading))
+}
+
+fn create_test_execution_client_with_ws_trading_timeout(
+    base_url_http: String,
+    base_url_ws_trading: String,
+    ws_trading_setup_timeout_ms: u64,
+) -> (
+    BinanceSpotExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    create_test_execution_client_with_transport_and_gtd_and_ws_setup_timeout(
+        base_url_http,
+        true,
+        Some(base_url_ws_trading),
+        true,
+        ws_trading_setup_timeout_ms,
+    )
+}
+
+fn create_test_execution_client_with_transport(
+    base_url_http: String,
+    use_ws_trading: bool,
+    base_url_ws_trading: Option<String>,
+) -> (
+    BinanceSpotExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    create_test_execution_client_with_transport_and_gtd(
+        base_url_http,
+        use_ws_trading,
+        base_url_ws_trading,
+        true,
+    )
+}
+
+fn create_test_execution_client_with_transport_and_gtd(
+    base_url_http: String,
+    use_ws_trading: bool,
+    base_url_ws_trading: Option<String>,
+    use_gtd: bool,
+) -> (
+    BinanceSpotExecutionClient,
+    tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    Rc<RefCell<Cache>>,
+) {
+    create_test_execution_client_with_transport_and_gtd_and_ws_setup_timeout(
+        base_url_http,
+        use_ws_trading,
+        base_url_ws_trading,
+        use_gtd,
+        BinanceExecClientConfig::default().ws_trading_setup_timeout_ms,
+    )
+}
+
+fn create_test_execution_client_with_transport_and_gtd_and_ws_setup_timeout(
+    base_url_http: String,
+    use_ws_trading: bool,
+    base_url_ws_trading: Option<String>,
+    use_gtd: bool,
+    ws_trading_setup_timeout_ms: u64,
 ) -> (
     BinanceSpotExecutionClient,
     tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
@@ -912,8 +1409,11 @@ fn create_test_execution_client(
     let config = BinanceExecClientConfig {
         trader_id,
         account_id,
-        base_url_http: Some(base_url),
-        use_ws_trading: false,
+        base_url_http: Some(base_url_http),
+        base_url_ws_trading,
+        use_ws_trading,
+        ws_trading_setup_timeout_ms,
+        use_gtd,
         api_key: Some("test_api_key".to_string()),
         api_secret: Some("test_api_secret".to_string()),
         ..Default::default()
@@ -977,6 +1477,473 @@ async fn test_connect_loads_instruments_and_account() {
     client.connect().await.unwrap();
 
     assert!(client.is_connected());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_includes_stable_fill_identity() {
+    let (addr, captured_queries) =
+        start_exec_test_server_with_fill_fixture(FillFixtureMode::Stable).await;
+    let base_url = format!("http://{addr}");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url);
+    let account_id = AccountId::from("BINANCE-001");
+    add_test_account_to_cache(&cache, account_id);
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(currency_pair_btcusdt()))
+        .unwrap();
+    add_open_order_to_cache(
+        &cache,
+        test_instrument_id(),
+        ClientOrderId::new("retained-spot-order"),
+        account_id,
+        VenueOrderId::from("12345"),
+    );
+
+    let futures_instrument = crypto_perpetual_ethusdt();
+    let futures_instrument_id = futures_instrument.id;
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CryptoPerpetual(futures_instrument))
+        .unwrap();
+    add_open_order_to_cache(
+        &cache,
+        futures_instrument_id,
+        ClientOrderId::new("retained-futures-order"),
+        account_id,
+        VenueOrderId::from("12346"),
+    );
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .unwrap()
+        .unwrap();
+    let fill_reports: Vec<_> = mass_status.fill_reports().into_values().flatten().collect();
+
+    assert_eq!(fill_reports.len(), 1);
+    assert_eq!(fill_reports[0].instrument_id, test_instrument_id());
+    assert_eq!(fill_reports[0].trade_id, TradeId::new("98765432"));
+    let queries = captured_queries.lock().unwrap();
+    assert_eq!(queries.len(), 1);
+    assert_eq!(
+        queries[0].query.get("symbol").map(String::as_str),
+        Some("BTCUSDT")
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_discovers_fill_instrument_from_venue_order() {
+    let (addr, captured_queries) =
+        start_exec_test_server_with_fill_fixture(FillFixtureMode::StableWithOpenOrder).await;
+    let base_url = format!("http://{addr}");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let mass_status = client
+        .generate_mass_status(Some(60))
+        .await
+        .unwrap()
+        .unwrap();
+    let fill_reports: Vec<_> = mass_status.fill_reports().into_values().flatten().collect();
+
+    assert_eq!(fill_reports.len(), 1);
+    assert_eq!(fill_reports[0].trade_id, TradeId::new("98765432"));
+    assert_eq!(captured_queries.lock().unwrap().len(), 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_propagates_invalid_fill_response() {
+    let (addr, _captured_queries) =
+        start_exec_test_server_with_fill_fixture(FillFixtureMode::Invalid).await;
+    let base_url = format!("http://{addr}");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url);
+    let account_id = AccountId::from("BINANCE-001");
+    add_test_account_to_cache(&cache, account_id);
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(currency_pair_btcusdt()))
+        .unwrap();
+    add_open_order_to_cache(
+        &cache,
+        test_instrument_id(),
+        ClientOrderId::new("invalid-fill-order"),
+        account_id,
+        VenueOrderId::from("12345"),
+    );
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let error = client.generate_mass_status(Some(60)).await.unwrap_err();
+
+    assert!(error.to_string().contains("SBE decode error"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_rejects_overflowing_lookback() {
+    let addr = start_exec_test_server().await;
+    let base_url = format!("http://{addr}");
+    let (client, _rx, _cache) = create_test_execution_client(base_url);
+
+    let error = client
+        .generate_mass_status(Some(307_445_735))
+        .await
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "lookback minutes exceed the nanosecond range"
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_uses_supported_order_cursor_query() {
+    let (addr, captured_queries) =
+        start_exec_test_server_with_fill_fixture(FillFixtureMode::Paginated).await;
+    let base_url = format!("http://{addr}");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let command = GenerateFillReports::new(
+        nautilus_core::UUID4::new(),
+        UnixNanos::from(now_ns),
+        Some(test_instrument_id()),
+        Some(VenueOrderId::from("12345")),
+        Some(UnixNanos::from(now_ns - 60_000_000_000)),
+        Some(UnixNanos::from(now_ns)),
+        None,
+        None,
+    );
+
+    let reports = client.generate_fill_reports(command).await.unwrap();
+    let queries = captured_queries.lock().unwrap();
+
+    assert_eq!(reports.len(), 1_001);
+    assert_eq!(reports[997].trade_id, TradeId::new("998"));
+    assert_eq!(reports[998].trade_id, TradeId::new("999"));
+    assert_eq!(reports[999].trade_id, TradeId::new("1000"));
+    assert_eq!(reports[1_000].trade_id, TradeId::new("1001"));
+    assert_eq!(queries.len(), 2);
+    assert_eq!(
+        queries[0].query.get("orderId").map(String::as_str),
+        Some("12345")
+    );
+    assert_eq!(
+        queries[0].query.get("fromId").map(String::as_str),
+        Some("0")
+    );
+    assert!(!queries[0].query.contains_key("startTime"));
+    assert!(!queries[0].query.contains_key("endTime"));
+    assert_eq!(
+        queries[1].query.get("fromId").map(String::as_str),
+        Some("1001")
+    );
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_fill_reports_rejects_reversed_time_range() {
+    let (addr, captured_queries) =
+        start_exec_test_server_with_fill_fixture(FillFixtureMode::Stable).await;
+    let base_url = format!("http://{addr}");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let now_ns = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let command = GenerateFillReports::new(
+        nautilus_core::UUID4::new(),
+        UnixNanos::from(now_ns),
+        Some(test_instrument_id()),
+        None,
+        Some(UnixNanos::from(now_ns)),
+        Some(UnixNanos::from(now_ns - 1_000_000)),
+        None,
+        None,
+    );
+
+    let error = client.generate_fill_reports(command).await.unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "fill report start time must not exceed end time"
+    );
+    assert!(captured_queries.lock().unwrap().is_empty());
+}
+
+#[rstest]
+#[case(Some(60), false, FillFixtureMode::Paginated, 1_001)]
+#[case(None, true, FillFixtureMode::Paginated, 1_001)]
+#[case(Some(60), false, FillFixtureMode::PaginatedWithWindowSpill, 1_000)]
+#[tokio::test]
+async fn test_generate_mass_status_paginates_fill_reports(
+    #[case] lookback_mins: Option<u64>,
+    #[case] maximum_history: bool,
+    #[case] fixture_mode: FillFixtureMode,
+    #[case] expected_reports: usize,
+) {
+    let (addr, captured_queries) = start_exec_test_server_with_fill_fixture(fixture_mode).await;
+    let base_url = format!("http://{addr}");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url);
+    let account_id = AccountId::from("BINANCE-001");
+    add_test_account_to_cache(&cache, account_id);
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(currency_pair_btcusdt()))
+        .unwrap();
+    add_open_order_to_cache(
+        &cache,
+        test_instrument_id(),
+        ClientOrderId::new("paginated-fill-order"),
+        account_id,
+        VenueOrderId::from("12345"),
+    );
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let mass_status = client
+        .generate_mass_status(lookback_mins)
+        .await
+        .unwrap()
+        .unwrap();
+    let fill_reports: Vec<_> = mass_status.fill_reports().into_values().flatten().collect();
+    let queries = captured_queries.lock().unwrap();
+
+    assert_eq!(fill_reports.len(), expected_reports);
+    assert_eq!(fill_reports.first().unwrap().trade_id, TradeId::new("1"));
+    assert_eq!(
+        fill_reports.last().unwrap().trade_id,
+        TradeId::new(expected_reports.to_string())
+    );
+    assert_eq!(queries.len(), 2);
+    assert_eq!(
+        queries[0].query.get("limit").map(String::as_str),
+        Some("1000")
+    );
+
+    if maximum_history {
+        assert_eq!(
+            queries[0].query.get("fromId").map(String::as_str),
+            Some("0")
+        );
+        assert!(!queries[0].query.contains_key("startTime"));
+        assert!(!queries[0].query.contains_key("endTime"));
+    } else {
+        assert!(queries[0].query.contains_key("startTime"));
+        assert!(queries[0].query.contains_key("endTime"));
+    }
+    assert_eq!(
+        queries[1].query.get("fromId").map(String::as_str),
+        Some("1001")
+    );
+    assert!(!queries[1].query.contains_key("startTime"));
+    assert!(!queries[1].query.contains_key("endTime"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_generate_mass_status_splits_fill_lookback_into_supported_windows() {
+    let (addr, captured_queries) =
+        start_exec_test_server_with_fill_fixture(FillFixtureMode::Empty).await;
+    let base_url = format!("http://{addr}");
+
+    let (mut client, _rx, cache) = create_test_execution_client(base_url);
+    let account_id = AccountId::from("BINANCE-001");
+    add_test_account_to_cache(&cache, account_id);
+    cache
+        .borrow_mut()
+        .add_instrument(InstrumentAny::CurrencyPair(currency_pair_btcusdt()))
+        .unwrap();
+    add_open_order_to_cache(
+        &cache,
+        test_instrument_id(),
+        ClientOrderId::new("windowed-fill-order"),
+        account_id,
+        VenueOrderId::from("12345"),
+    );
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let mass_status = client
+        .generate_mass_status(Some(25 * 60))
+        .await
+        .unwrap()
+        .unwrap();
+    let queries = captured_queries.lock().unwrap();
+    let first_start = queries[0].query["startTime"].parse::<i64>().unwrap();
+    let first_end = queries[0].query["endTime"].parse::<i64>().unwrap();
+    let second_start = queries[1].query["startTime"].parse::<i64>().unwrap();
+
+    assert_eq!(
+        mass_status.fill_reports().into_values().flatten().count(),
+        0
+    );
+    assert_eq!(queries.len(), 2);
+    assert_eq!(first_end - first_start, 24 * 60 * 60 * 1_000);
+    assert_eq!(second_start, first_end + 1);
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_ws_trading_success_routes_orders_over_ws() {
+    let (http_addr, request_count) =
+        start_exec_test_server_with_command_responses(CommandResponses::default()).await;
+    let (ws_addr, ws_state) = start_ws_setup_test_server(WsSetupBehavior::CompleteSetup).await;
+    let base_url_http = format!("http://{http_addr}");
+    let base_url_ws_trading = format!("ws://{ws_addr}/ws-api/v3");
+
+    let (mut client, _rx, cache) =
+        create_test_execution_client_with_ws_trading(base_url_http, base_url_ws_trading);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    assert!(client.is_connected());
+
+    let client_order_id = ClientOrderId::new("ws-setup-success-test-001");
+    let order_any = add_limit_order_to_cache(&cache, client_order_id);
+
+    client
+        .submit_order(submit_order_command(&order_any))
+        .unwrap();
+
+    wait_for_ws_method(&ws_state, "order.place").await;
+
+    assert_eq!(request_count.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        ws_state.received_methods().await,
+        ["session.logon", "userDataStream.subscribe", "order.place"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_ws_trading_reconnect_retries_ws_after_setup_failure() {
+    let (http_addr, request_count) =
+        start_exec_test_server_with_command_responses(CommandResponses::default()).await;
+    let (ws_addr, ws_state) =
+        start_ws_setup_test_server(WsSetupBehavior::RejectFirstSessionLogon).await;
+    let base_url_http = format!("http://{http_addr}");
+    let base_url_ws_trading = format!("ws://{ws_addr}/ws-api/v3");
+
+    let (mut client, _rx, cache) =
+        create_test_execution_client_with_ws_trading(base_url_http, base_url_ws_trading);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    client.connect().await.unwrap();
+    assert!(client.is_connected());
+
+    let fallback_order_id = ClientOrderId::new("ws-setup-retry-fallback-001");
+    let fallback_order = add_limit_order_to_cache(&cache, fallback_order_id);
+
+    client
+        .submit_order(submit_order_command(&fallback_order))
+        .unwrap();
+
+    wait_for_command_requests(&request_count, 1).await;
+
+    client.disconnect().await.unwrap();
+    client.connect().await.unwrap();
+
+    let retry_order_id = ClientOrderId::new("ws-setup-retry-success-001");
+    let retry_order = add_limit_order_to_cache(&cache, retry_order_id);
+
+    client
+        .submit_order(submit_order_command(&retry_order))
+        .unwrap();
+
+    wait_for_ws_method(&ws_state, "order.place").await;
+
+    assert_eq!(request_count.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        ws_state.received_methods().await,
+        [
+            "session.logon",
+            "session.logon",
+            "userDataStream.subscribe",
+            "order.place",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>()
+    );
+
+    client.disconnect().await.unwrap();
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_ws_trading_session_logon_rejection_uses_http_only_mode() {
+    assert_ws_setup_failure_uses_http(
+        WsSetupBehavior::RejectSessionLogon,
+        &["session.logon"],
+        None,
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_ws_trading_auth_timeout_uses_http_only_mode() {
+    assert_ws_setup_failure_uses_http(
+        WsSetupBehavior::IgnoreSessionLogon,
+        &["session.logon"],
+        Some(TEST_WS_SETUP_TIMEOUT_MS),
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_ws_trading_user_data_subscribe_rejection_uses_http_only_mode() {
+    assert_ws_setup_failure_uses_http(
+        WsSetupBehavior::RejectUserDataSubscribe,
+        &["session.logon", "userDataStream.subscribe"],
+        None,
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_ws_trading_user_data_subscribe_timeout_uses_http_only_mode() {
+    assert_ws_setup_failure_uses_http(
+        WsSetupBehavior::IgnoreUserDataSubscribe,
+        &["session.logon", "userDataStream.subscribe"],
+        Some(TEST_WS_SETUP_TIMEOUT_MS),
+    )
+    .await;
 }
 
 #[rstest]
@@ -1075,6 +2042,152 @@ async fn test_submit_order_generates_submitted_and_accepted_events() {
         Duration::from_secs(5),
     )
     .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_spot_locally_managed_gtd_encodes_gtc() {
+    let (addr, captured_queries) =
+        start_exec_test_server_with_fill_fixture(FillFixtureMode::Empty).await;
+    let base_url = format!("http://{addr}");
+    let (mut client, _rx, cache) =
+        create_test_execution_client_with_transport_and_gtd(base_url, false, None, false);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    let order = add_gtd_limit_order_to_cache(&cache, ClientOrderId::new("spot-local-gtd-test-001"));
+    client.submit_order(submit_order_command(&order)).unwrap();
+
+    wait_until_async(
+        || {
+            let captured_queries = captured_queries.clone();
+            async move { !captured_queries.lock().unwrap().is_empty() }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let queries = captured_queries.lock().unwrap();
+    assert_eq!(
+        queries[0].query.get("timeInForce").map(String::as_str),
+        Some("GTC"),
+    );
+    assert!(!queries[0].query.contains_key("goodTillDate"));
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_spot_native_gtd_rejects_before_submission() {
+    let (addr, captured_queries) =
+        start_exec_test_server_with_fill_fixture(FillFixtureMode::Empty).await;
+    let base_url = format!("http://{addr}");
+    let (mut client, mut rx, cache) = create_test_execution_client(base_url);
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+    client.start().unwrap();
+    client.connect().await.unwrap();
+
+    while rx.try_recv().is_ok() {}
+
+    let order = add_gtd_limit_order_to_cache(&cache, ClientOrderId::new("spot-gtd-test-001"));
+    let error = client
+        .submit_order(submit_order_command(&order))
+        .unwrap_err();
+
+    assert!(error.to_string().contains("does not support native GTD"));
+    assert!(captured_queries.lock().unwrap().is_empty());
+    assert!(rx.try_recv().is_err());
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_oco_order_list_routes_to_order_list_oco_endpoint() {
+    let (client, mut rx, cache, request_count) =
+        connected_client_with_command_responses(CommandResponses::default()).await;
+
+    let orders = add_spot_oco_orders_to_cache(&cache);
+    let submit_cmd = submit_order_list_command(&orders);
+
+    client.submit_order_list(submit_cmd).unwrap();
+
+    wait_for_command_requests(&request_count, 1).await;
+
+    let mut accepted_count = 0;
+    wait_until_async(
+        || {
+            while let Ok(event) = rx.try_recv() {
+                if matches!(event, ExecutionEvent::Order(OrderEventAny::Accepted(_))) {
+                    accepted_count += 1;
+                }
+            }
+            let done = accepted_count == 2;
+            async move { done }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_oco_order_list_response_parse_failure_does_not_emit_order_rejected() {
+    let (client, mut rx, cache, request_count) =
+        connected_client_with_command_responses(CommandResponses {
+            submit: CommandResponse::MalformedSuccess,
+            ..Default::default()
+        })
+        .await;
+
+    let orders = add_spot_oco_orders_to_cache(&cache);
+    let submit_cmd = submit_order_list_command(&orders);
+    let client_order_ids = orders
+        .iter()
+        .map(|order| order.client_order_id())
+        .collect::<Vec<_>>();
+
+    client.submit_order_list(submit_cmd).unwrap();
+
+    wait_for_command_requests(&request_count, 1).await;
+
+    assert_no_order_event_matching(&mut rx, |event| {
+        matches!(
+            event,
+            OrderEventAny::Rejected(event) if client_order_ids.contains(&event.client_order_id)
+        )
+    })
+    .await;
+}
+
+#[rstest]
+#[tokio::test]
+async fn test_submit_independent_order_list_is_denied_without_http_request() {
+    let (client, mut rx, cache, request_count) =
+        connected_client_with_command_responses(CommandResponses::default()).await;
+
+    let orders = [
+        add_limit_order_to_cache(&cache, ClientOrderId::new("spot-batch-001")),
+        add_limit_order_to_cache(&cache, ClientOrderId::new("spot-batch-002")),
+    ];
+    let submit_cmd = submit_order_list_command(&orders);
+
+    client.submit_order_list(submit_cmd).unwrap();
+
+    let mut denied_count = 0;
+    wait_until_async(
+        || {
+            while let Ok(event) = rx.try_recv() {
+                if matches!(event, ExecutionEvent::Order(OrderEventAny::Denied(_))) {
+                    denied_count += 1;
+                }
+            }
+            let done = denied_count == 2;
+            async move { done }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert_eq!(request_count.load(Ordering::Relaxed), 0);
 }
 
 #[rstest]
@@ -1815,8 +2928,9 @@ async fn test_query_account_does_not_block_within_runtime() {
 #[rstest]
 #[tokio::test]
 async fn test_query_order_missing_order_emits_no_order_report() {
-    let order_query_count = Arc::new(AtomicUsize::new(0));
-    let addr = start_exec_test_server_with_order_query_count(Some(order_query_count.clone())).await;
+    let order_query_received = Arc::new(tokio::sync::Notify::new());
+    let addr =
+        start_exec_test_server_with_order_query_signal(Some(order_query_received.clone())).await;
     let base_url = format!("http://{addr}");
 
     let (mut client, mut rx, cache) = create_test_execution_client(base_url);
@@ -1842,26 +2956,14 @@ async fn test_query_order_missing_order_emits_no_order_report() {
 
     client.query_order(query_cmd).unwrap();
 
-    wait_until_async(
-        || {
-            let order_query_count = order_query_count.clone();
-            async move { order_query_count.load(Ordering::SeqCst) > 0 }
-        },
-        Duration::from_secs(5),
-    )
+    tokio::time::timeout(Duration::from_secs(10), order_query_received.notified())
+        .await
+        .expect("Timed out waiting for authenticated order query");
+
+    assert_no_event_matching(&mut rx, |event| {
+        matches!(event, ExecutionEvent::Report(ExecutionReport::Order(_)))
+    })
     .await;
-
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    let mut emitted_order_report = false;
-
-    while let Ok(event) = rx.try_recv() {
-        if matches!(event, ExecutionEvent::Report(ExecutionReport::Order(_))) {
-            emitted_order_report = true;
-        }
-    }
-
-    assert!(!emitted_order_report);
 }
 
 async fn connected_client_with_command_responses(
@@ -1888,10 +2990,18 @@ fn add_limit_order_to_cache(
     cache: &Rc<RefCell<Cache>>,
     client_order_id: ClientOrderId,
 ) -> OrderAny {
+    add_limit_order_for_instrument_to_cache(cache, test_instrument_id(), client_order_id)
+}
+
+fn add_limit_order_for_instrument_to_cache(
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+) -> OrderAny {
     let order = LimitOrder::new(
         test_trader_id(),
         test_strategy_id(),
-        test_instrument_id(),
+        instrument_id,
         client_order_id,
         OrderSide::Buy,
         Quantity::from("0.001"),
@@ -1924,6 +3034,146 @@ fn add_limit_order_to_cache(
     order_any
 }
 
+fn add_gtd_limit_order_to_cache(
+    cache: &Rc<RefCell<Cache>>,
+    client_order_id: ClientOrderId,
+) -> OrderAny {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let order = LimitOrder::new(
+        test_trader_id(),
+        test_strategy_id(),
+        test_instrument_id(),
+        client_order_id,
+        OrderSide::Buy,
+        Quantity::from("0.001"),
+        Price::from("50000.00"),
+        TimeInForce::Gtd,
+        Some(UnixNanos::from_seconds(now.as_secs() + 1_200)),
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    );
+    let order = OrderAny::Limit(order);
+    cache
+        .borrow_mut()
+        .add_order(order.clone(), None, None, false)
+        .unwrap();
+    order
+}
+
+fn add_open_order_to_cache(
+    cache: &Rc<RefCell<Cache>>,
+    instrument_id: InstrumentId,
+    client_order_id: ClientOrderId,
+    account_id: AccountId,
+    venue_order_id: VenueOrderId,
+) {
+    add_limit_order_for_instrument_to_cache(cache, instrument_id, client_order_id);
+    let accepted = OrderAccepted::new(
+        test_trader_id(),
+        test_strategy_id(),
+        instrument_id,
+        client_order_id,
+        venue_order_id,
+        account_id,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+        UnixNanos::default(),
+        false,
+    );
+    cache
+        .borrow_mut()
+        .update_order(&OrderEventAny::Accepted(accepted))
+        .unwrap();
+}
+
+fn add_spot_oco_orders_to_cache(cache: &Rc<RefCell<Cache>>) -> Vec<OrderAny> {
+    let order_list_id = OrderListId::from("OL-SPOT-OCO");
+    let take_profit_id = ClientOrderId::new("spot-oco-tp");
+    let stop_loss_id = ClientOrderId::new("spot-oco-sl");
+
+    let take_profit = OrderAny::Limit(LimitOrder::new(
+        test_trader_id(),
+        test_strategy_id(),
+        test_instrument_id(),
+        take_profit_id,
+        OrderSide::Sell,
+        Quantity::from("0.001"),
+        Price::from("60000.00"),
+        TimeInForce::Gtc,
+        None,
+        true,
+        false,
+        false,
+        None,
+        None,
+        None,
+        Some(ContingencyType::Oco),
+        Some(order_list_id),
+        Some(vec![stop_loss_id]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    ));
+
+    let stop_loss = OrderAny::StopLimit(StopLimitOrder::new(
+        test_trader_id(),
+        test_strategy_id(),
+        test_instrument_id(),
+        stop_loss_id,
+        OrderSide::Sell,
+        Quantity::from("0.001"),
+        Price::from("49000.00"),
+        Price::from("50000.00"),
+        TriggerType::Default,
+        TimeInForce::Gtc,
+        None,
+        false,
+        false,
+        false,
+        None,
+        None,
+        None,
+        Some(ContingencyType::Oco),
+        Some(order_list_id),
+        Some(vec![take_profit_id]),
+        None,
+        None,
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+    ));
+
+    let orders = vec![take_profit, stop_loss];
+    for order in &orders {
+        cache
+            .borrow_mut()
+            .add_order(order.clone(), None, None, false)
+            .unwrap();
+    }
+
+    orders
+}
+
 fn submit_order_command(order: &OrderAny) -> SubmitOrder {
     SubmitOrder::new(
         test_trader_id(),
@@ -1932,6 +3182,34 @@ fn submit_order_command(order: &OrderAny) -> SubmitOrder {
         test_instrument_id(),
         order.client_order_id(),
         order.init_event().clone(),
+        None,
+        None,
+        None,
+        nautilus_core::UUID4::new(),
+        UnixNanos::default(),
+        None,
+    )
+}
+
+fn submit_order_list_command(orders: &[OrderAny]) -> SubmitOrderList {
+    let order_list = OrderList::new(
+        OrderListId::from("OL-SPOT-TEST"),
+        test_instrument_id(),
+        test_strategy_id(),
+        orders.iter().map(|order| order.client_order_id()).collect(),
+        UnixNanos::default(),
+    );
+    let order_inits = orders
+        .iter()
+        .map(|order| order.init_event().clone())
+        .collect();
+
+    SubmitOrderList::new(
+        test_trader_id(),
+        Some(*BINANCE_CLIENT_ID),
+        test_strategy_id(),
+        order_list,
+        order_inits,
         None,
         None,
         None,
@@ -2001,18 +3279,121 @@ async fn wait_for_command_requests(request_count: &AtomicUsize, expected: usize)
     .await;
 }
 
+async fn wait_for_ws_method(state: &WsSetupState, expected_method: &str) {
+    wait_until_async(
+        || {
+            let state = state.clone();
+            async move {
+                state
+                    .received_methods()
+                    .await
+                    .iter()
+                    .any(|method| method == expected_method)
+            }
+        },
+        Duration::from_secs(5),
+    )
+    .await;
+}
+
+async fn assert_ws_setup_failure_uses_http(
+    behavior: WsSetupBehavior,
+    expected_methods: &[&str],
+    ws_trading_setup_timeout_ms: Option<u64>,
+) {
+    let (http_addr, request_count) =
+        start_exec_test_server_with_command_responses(CommandResponses::default()).await;
+    let (ws_addr, ws_state) = start_ws_setup_test_server(behavior).await;
+    let base_url_http = format!("http://{http_addr}");
+    let base_url_ws_trading = format!("ws://{ws_addr}/ws-api/v3");
+
+    let (mut client, mut rx, cache) = match ws_trading_setup_timeout_ms {
+        Some(timeout_ms) => create_test_execution_client_with_ws_trading_timeout(
+            base_url_http,
+            base_url_ws_trading,
+            timeout_ms,
+        ),
+        None => create_test_execution_client_with_ws_trading(base_url_http, base_url_ws_trading),
+    };
+    add_test_account_to_cache(&cache, AccountId::from("BINANCE-001"));
+
+    client.start().unwrap();
+    let connect_timeout = match behavior {
+        WsSetupBehavior::CompleteSetup | WsSetupBehavior::RejectFirstSessionLogon => {
+            unreachable!("complete setup is not a setup failure")
+        }
+        WsSetupBehavior::IgnoreSessionLogon | WsSetupBehavior::IgnoreUserDataSubscribe => {
+            Duration::from_secs(2)
+        }
+        WsSetupBehavior::RejectSessionLogon | WsSetupBehavior::RejectUserDataSubscribe => {
+            Duration::from_secs(5)
+        }
+    };
+    tokio::time::timeout(connect_timeout, client.connect())
+        .await
+        .expect("Connect should finish before setup timeout")
+        .unwrap();
+    assert!(client.is_connected());
+
+    let client_order_id = ClientOrderId::new("ws-setup-fallback-test-001");
+    let order_any = add_limit_order_to_cache(&cache, client_order_id);
+
+    client
+        .submit_order(submit_order_command(&order_any))
+        .unwrap();
+
+    wait_for_command_requests(&request_count, 1).await;
+
+    match recv_until(&mut rx, |event| {
+        matches!(
+            event,
+            ExecutionEvent::Order(OrderEventAny::Accepted(event))
+                if event.client_order_id == client_order_id
+        )
+    })
+    .await
+    {
+        ExecutionEvent::Order(OrderEventAny::Accepted(event)) => {
+            assert_eq!(event.client_order_id, client_order_id);
+        }
+        other => panic!("Expected Accepted event, was {other:?}"),
+    }
+
+    let expected_methods = expected_methods
+        .iter()
+        .map(|method| (*method).to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(ws_state.received_methods().await, expected_methods);
+
+    client.disconnect().await.unwrap();
+}
+
 async fn assert_no_order_event_matching<F>(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
     predicate: F,
 ) where
     F: Fn(&OrderEventAny) -> bool,
 {
+    assert_no_event_matching(rx, |event| {
+        if let ExecutionEvent::Order(order_event) = event {
+            predicate(order_event)
+        } else {
+            false
+        }
+    })
+    .await;
+}
+
+async fn assert_no_event_matching<F>(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<ExecutionEvent>,
+    predicate: F,
+) where
+    F: Fn(&ExecutionEvent) -> bool,
+{
     let unexpected = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
             let event = rx.recv().await.expect("Execution event channel closed");
-            if let ExecutionEvent::Order(order_event) = &event
-                && predicate(order_event)
-            {
+            if predicate(&event) {
                 return event;
             }
         }
@@ -2020,7 +3401,7 @@ async fn assert_no_order_event_matching<F>(
     .await;
 
     if let Ok(event) = unexpected {
-        panic!("Unexpected order event: {event:?}");
+        panic!("Unexpected execution event: {event:?}");
     }
 }
 

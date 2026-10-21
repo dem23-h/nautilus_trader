@@ -61,6 +61,23 @@ fn plan_retention_sorts_runs_before_selecting_candidates() {
 }
 
 #[rstest]
+fn plan_retention_breaks_start_time_ties_by_run_id() {
+    // Equal start timestamps are routine in Rust backtests (static clock); the
+    // keep window and restore point must still resolve deterministically.
+    let plan = plan_retention(
+        vec![
+            planning_run("run-c", RunStatus::Ended, 1, valid_anchor(1)),
+            planning_run("run-a", RunStatus::Ended, 1, valid_anchor(1)),
+            planning_run("run-b", RunStatus::Ended, 1, valid_anchor(1)),
+        ],
+        RetentionMode::Bounded { keep_last: 1 },
+    );
+
+    assert_eq!(run_ids(&plan.sealed_runs), vec!["run-a", "run-b", "run-c"]);
+    assert_eq!(run_ids(&plan.reclaim_candidates), vec!["run-a", "run-b"]);
+}
+
+#[rstest]
 fn redb_planner_lists_sealed_runs_and_never_selects_running_runs() {
     let tmp = TempDir::new().expect("tempdir");
     write_redb_run(tmp.path(), "run-1", 1, RunStatus::Ended, true);
@@ -173,7 +190,7 @@ fn snapshot_anchored_mode_reclaims_only_before_latest_valid_restore_point() {
 #[rstest]
 #[case::missing(SnapshotAnchorStatus::Missing)]
 #[case::invalid(SnapshotAnchorStatus::Invalid(
-    "snapshot anchor high_watermark 2 exceeds manifest high_watermark 1".to_string(),
+    "snapshot anchor high_watermark 2 exceeds durable high_watermark 1".to_string(),
 ))]
 fn snapshot_anchored_mode_handles_unusable_snapshot_anchors_conservatively(
     #[case] snapshot_anchor: SnapshotAnchorStatus,

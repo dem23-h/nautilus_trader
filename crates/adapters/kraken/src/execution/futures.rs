@@ -25,6 +25,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use nautilus_common::{
+    cache::InstrumentLookupError,
     clients::ExecutionClient,
     live::{get_runtime, runner::get_exec_event_sender},
     messages::execution::{
@@ -135,6 +136,7 @@ impl KrakenFuturesExecutionClient {
             config.ws_url(),
             config.heartbeat_interval_secs,
             Some(credential),
+            config.auth_timeout_secs,
             config.transport_backend,
             config.proxy_url.clone(),
         );
@@ -286,7 +288,7 @@ impl KrakenFuturesExecutionClient {
         let strategy_id = cmd.strategy_id;
         let instrument_id = cmd.instrument_id;
 
-        log::info!(
+        log::debug!(
             "Canceling order: venue_order_id={venue_order_id:?}, client_order_id={client_order_id}"
         );
 
@@ -475,7 +477,7 @@ impl KrakenFuturesExecutionClient {
         let quantity = cmd.quantity;
         let price = cmd.price;
 
-        log::info!(
+        log::debug!(
             "Modifying order: venue_order_id={venue_order_id:?}, client_order_id={client_order_id}"
         );
 
@@ -589,7 +591,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
                 .request_instruments()
                 .await
                 .context("Failed to load Kraken futures instruments")?;
-            log::info!("Loaded {} Futures instruments", instruments.len());
+            log::debug!("Loaded {} Futures instruments", instruments.len());
             self.http.cache_instruments(&instruments);
             self.core.set_instruments_initialized();
         }
@@ -622,7 +624,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
             .context("Failed to request Kraken futures account state")?;
 
         if !account_state.balances.is_empty() {
-            log::info!(
+            log::debug!(
                 "Received account state with {} balance(s)",
                 account_state.balances.len()
             );
@@ -637,7 +639,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
             .await
             .context("Failed to subscribe to executions")?;
 
-        log::info!("Futures WebSocket authenticated and subscribed to executions");
+        log::debug!("Futures WebSocket authenticated and subscribed to executions");
 
         self.core.set_connected();
         log::info!("Connected: client_id={}", self.core.client_id);
@@ -857,12 +859,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        let order = self
-            .core
-            .cache()
-            .order(&cmd.client_order_id)
-            .map(|o| o.clone())
-            .ok_or_else(|| anyhow::anyhow!("Order not found in cache: {}", cmd.client_order_id))?;
+        let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
         self.submit_single_order(&order, "submit_order");
         Ok(())
     }
@@ -870,7 +867,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
     fn submit_order_list(&self, cmd: SubmitOrderList) -> anyhow::Result<()> {
         let orders = self.core.get_orders_for_list(&cmd.order_list)?;
 
-        log::info!(
+        log::debug!(
             "Submitting order list: order_list_id={}, count={}",
             cmd.order_list.id,
             orders.len()
@@ -996,7 +993,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
         let instrument_id = cmd.instrument_id;
 
         if cmd.order_side == OrderSide::NoOrderSide {
-            log::info!("Canceling all orders: instrument_id={instrument_id} (bulk)");
+            log::debug!("Canceling all orders: instrument_id={instrument_id} (bulk)");
 
             let http = self.http.clone();
             let symbol = instrument_id.symbol.to_string();
@@ -1031,7 +1028,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
             return Ok(());
         }
 
-        log::info!(
+        log::debug!(
             "Canceling all orders: instrument_id={instrument_id}, side={:?}",
             cmd.order_side
         );
@@ -1090,7 +1087,7 @@ impl ExecutionClient for KrakenFuturesExecutionClient {
     }
 
     fn batch_cancel_orders(&self, cmd: BatchCancelOrders) -> anyhow::Result<()> {
-        log::info!(
+        log::debug!(
             "Batch canceling orders: instrument_id={}, count={}",
             cmd.instrument_id,
             cmd.cancels.len()
@@ -1128,7 +1125,7 @@ async fn cancel_order_for_futures(
 ) -> Result<(), CancelCommandFailure> {
     http.get_cached_instrument(&instrument_id.symbol.inner())
         .ok_or_else(|| {
-            CancelCommandFailure::local(format!("Instrument not found in cache: {instrument_id}"))
+            CancelCommandFailure::local(InstrumentLookupError::not_found(instrument_id).to_string())
         })?;
 
     let order_id = venue_order_id.as_ref().map(ToString::to_string);
@@ -1269,10 +1266,9 @@ fn batch_cancel_item_for_futures(
 ) -> Result<(CancelRequestContext, KrakenFuturesBatchCancelItem), CancelCommandFailure> {
     http.get_cached_instrument(&cancel.instrument_id.symbol.inner())
         .ok_or_else(|| {
-            CancelCommandFailure::local(format!(
-                "Instrument not found in cache: {}",
-                cancel.instrument_id
-            ))
+            CancelCommandFailure::local(
+                InstrumentLookupError::not_found(cancel.instrument_id).to_string(),
+            )
         })?;
 
     let truncated_client_order_id = truncate_cl_ord_id(&cancel.client_order_id);
@@ -1475,7 +1471,9 @@ mod tests {
     use nautilus_core::{UUID4, UnixNanos};
     use nautilus_model::{
         enums::{LiquiditySide, OrderSide, OrderType, TimeInForce},
-        identifiers::{AccountId, ClientOrderId, InstrumentId, TradeId, VenueOrderId},
+        identifiers::{
+            AccountId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, VenueOrderId,
+        },
         orders::OrderTestBuilder,
         reports::FillReport,
         types::{Currency, Money, Price, Quantity},
@@ -1485,6 +1483,63 @@ mod tests {
     use super::*;
 
     const TEST_INSTRUMENT_ID: &str = "PF_XBTUSD.KRAKEN";
+
+    #[tokio::test]
+    async fn test_cancel_order_for_futures_missing_cached_instrument_returns_canonical_error() {
+        let http = KrakenFuturesHttpClient::default();
+        let instrument_id = InstrumentId::from(TEST_INSTRUMENT_ID);
+        let client_order_id = ClientOrderId::from("C-001");
+        let venue_order_id = VenueOrderId::from("V-001");
+
+        let result = cancel_order_for_futures(
+            &http,
+            AccountId::from("KRAKEN-001"),
+            instrument_id,
+            Some(client_order_id),
+            Some(venue_order_id),
+        )
+        .await;
+
+        match result {
+            Err(CancelCommandFailure::LocalValidation(reason)) => {
+                assert_eq!(
+                    reason,
+                    InstrumentLookupError::not_found(instrument_id).to_string()
+                );
+            }
+            _ => panic!("Expected local validation failure"),
+        }
+    }
+
+    #[rstest]
+    fn test_batch_cancel_item_for_futures_missing_cached_instrument_returns_canonical_error() {
+        let http = KrakenFuturesHttpClient::default();
+        let instrument_id = InstrumentId::from(TEST_INSTRUMENT_ID);
+        let cancel = CancelOrder::new(
+            TraderId::from("TESTER-001"),
+            None,
+            StrategyId::from("S-001"),
+            instrument_id,
+            ClientOrderId::from("C-001"),
+            Some(VenueOrderId::from("V-001")),
+            UUID4::new(),
+            UnixNanos::default(),
+            None,
+            None,
+        );
+
+        let result = batch_cancel_item_for_futures(&http, &cancel);
+
+        match result {
+            Err(CancelCommandFailure::LocalValidation(reason)) => {
+                assert_eq!(
+                    reason,
+                    InstrumentLookupError::not_found(instrument_id).to_string()
+                );
+            }
+            _ => panic!("Expected local validation failure"),
+        }
+    }
 
     fn make_fill(
         venue_order_id: &str,
@@ -1501,7 +1556,7 @@ mod tests {
             OrderSide::Buy,
             Quantity::from(quantity),
             Price::from(price),
-            Money::new(0.0, Currency::USD()),
+            Money::from_decimal(Decimal::ZERO, Currency::USD()).unwrap(),
             LiquiditySide::Taker,
             client_order_id.map(ClientOrderId::from),
             None,

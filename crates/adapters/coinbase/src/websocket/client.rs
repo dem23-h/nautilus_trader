@@ -87,10 +87,6 @@ pub static COINBASE_WS_SUBSCRIPTION_KEYS: LazyLock<[Ustr; 1]> =
     feature = "python",
     pyo3::pyclass(module = "nautilus_trader.core.nautilus_pyo3.coinbase", from_py_object)
 )]
-#[cfg_attr(
-    feature = "python",
-    pyo3_stub_gen::derive::gen_stub_pyclass(module = "nautilus_trader.adapters.coinbase")
-)]
 pub struct CoinbaseWebSocketClient {
     url: String,
     connection_mode: Arc<ArcSwap<AtomicU8>>,
@@ -258,7 +254,7 @@ impl CoinbaseWebSocketClient {
         *self.cmd_tx.write().await = cmd_tx.clone();
         self.out_rx = Some(out_rx);
         self.connection_mode.store(client.connection_mode_atomic());
-        log::info!("Coinbase WebSocket connected: {}", self.url);
+        log::debug!("Coinbase WebSocket connected: {}", self.url);
 
         if let Err(e) = cmd_tx.send(HandlerCommand::SetClient(client)) {
             anyhow::bail!("Failed to send SetClient command: {e}");
@@ -330,7 +326,7 @@ impl CoinbaseWebSocketClient {
                         }
                     }
                     None => {
-                        log::info!("Feed handler stopped");
+                        log::debug!("Feed handler stopped");
                         break;
                     }
                 }

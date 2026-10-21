@@ -17,11 +17,18 @@
 
 use std::{collections::HashMap, str::FromStr, sync::LazyLock};
 
-use ibapi::contracts::{Contract, Currency, Exchange, SecurityType, Symbol};
+use ibapi::contracts::{Contract, Currency, Exchange, OptionRight, SecurityType, Symbol};
 use nautilus_core::UnixNanos;
 use nautilus_model::identifiers::{InstrumentId, Symbol as NautilusSymbol, TradeId, Venue};
 
 use crate::common::enums::{IbOptionRight, IbSecurityType};
+
+fn ib_option_right_to_option_right(right: IbOptionRight) -> OptionRight {
+    match right {
+        IbOptionRight::Call => OptionRight::Call,
+        IbOptionRight::Put => OptionRight::Put,
+    }
+}
 
 /// Generate a unique trade ID for Interactive Brokers trades.
 ///
@@ -66,7 +73,7 @@ pub fn ib_contract_to_instrument_id_simplified(
                 }
             }
             SecurityType::ForexPair => Venue::from("IDEALPRO"),
-            SecurityType::Crypto => Venue::from("PAXOS"),
+            SecurityType::Crypto => derive_crypto_venue(contract),
             SecurityType::Stock => Venue::from("SMART"),
             SecurityType::Option | SecurityType::FuturesOption => {
                 if !contract.exchange.as_str().is_empty() && contract.exchange.as_str() != "SMART" {
@@ -106,7 +113,7 @@ pub fn ib_contract_to_instrument_id_simplified(
             let symbol_str = if contract.local_symbol.is_empty() {
                 format!(
                     "{} {} {} {}",
-                    contract.right.as_str(),
+                    contract.right.map_or("", |right| right.as_str()),
                     contract.trading_class.as_str(),
                     contract.last_trade_date_or_contract_month.as_str(),
                     format_option_strike(contract.strike),
@@ -158,7 +165,7 @@ pub fn ib_contract_to_instrument_id_simplified(
             if contract.local_symbol.is_empty() {
                 // Fallback construction
                 let expiry = contract.last_trade_date_or_contract_month.as_str();
-                let right = if contract.right == "C" { "C" } else { "P" };
+                let right = contract.right.map_or("P", |right| right.as_str());
                 let strike_str = format!("{}", contract.strike as i64);
                 let symbol_str = format!(
                     "{}{} {}{}",
@@ -227,7 +234,7 @@ pub fn ib_contract_to_instrument_id_raw(
 ) -> anyhow::Result<InstrumentId> {
     let venue = venue.unwrap_or_else(|| match contract.security_type {
         SecurityType::ForexPair => Venue::from("IDEALPRO"),
-        SecurityType::Crypto => Venue::from("PAXOS"),
+        SecurityType::Crypto => derive_crypto_venue(contract),
         SecurityType::Stock => Venue::from("SMART"),
         SecurityType::Option => Venue::from("SMART"),
         SecurityType::FuturesOption => Venue::from("SMART"),
@@ -350,6 +357,30 @@ pub static VENUE_MEMBERS: LazyLock<HashMap<&'static str, Vec<&'static str>>> =
         map
     });
 
+/// Returns `true` if the contract is a cryptocurrency contract.
+///
+/// Centralizes the crypto check used to gate crypto-specific request handling
+/// (e.g. the `AGGTRADES` `whatToShow` rule - see
+/// [`crate::data::convert::price_type_to_ib_what_to_show_for_security`]).
+#[must_use]
+pub fn is_crypto_contract(contract: &Contract) -> bool {
+    matches!(contract.security_type, SecurityType::Crypto)
+}
+
+/// Derives the venue for a crypto contract.
+///
+/// IB routes crypto to multiple venues; both PAXOS and ZEROHASH are live (which one
+/// applies depends on the account/region). Uses the contract's actual exchange when
+/// set (e.g. ZEROHASH or PAXOS), falling back to PAXOS when it is unspecified.
+#[must_use]
+pub fn derive_crypto_venue(contract: &Contract) -> Venue {
+    if !contract.exchange.as_str().is_empty() && contract.exchange.as_str() != "SMART" {
+        Venue::from(contract.exchange.as_str())
+    } else {
+        Venue::from("PAXOS")
+    }
+}
+
 #[must_use]
 pub fn possible_exchanges_for_venue(venue: &str) -> Vec<String> {
     if let Some(exchanges) = VENUE_MEMBERS.get(venue) {
@@ -364,7 +395,9 @@ pub fn possible_exchanges_for_venue(venue: &str) -> Vec<String> {
 
 /// Venue lists for different asset classes
 const VENUES_CASH: &[&str] = &["IDEALPRO"];
-const VENUES_CRYPTO: &[&str] = &["PAXOS"];
+// IB routes crypto to both PAXOS and ZEROHASH (which one applies depends on the
+// account/region); accept both.
+const VENUES_CRYPTO: &[&str] = &["PAXOS", "ZEROHASH"];
 const VENUES_OPT: &[&str] = &["SMART", "EUREX"];
 const VENUES_FUT: &[&str] = &[
     "BELFOX",
@@ -605,7 +638,7 @@ pub fn instrument_id_to_ib_contract(
                 local_symbol: opt.local_symbol,
                 last_trade_date_or_contract_month: opt.expiry,
                 strike: opt.strike_value,
-                right: opt.right,
+                right: Some(opt.right),
                 ..Default::default()
             });
         }
@@ -620,7 +653,7 @@ pub fn instrument_id_to_ib_contract(
                 trading_class: opt.trading_class,
                 last_trade_date_or_contract_month: opt.expiry,
                 strike: opt.strike_value,
-                right: opt.right,
+                right: Some(opt.right),
                 ..Default::default()
             });
         }
@@ -740,9 +773,8 @@ pub fn instrument_id_to_ib_contract(
         symbol: Symbol::from(&symbol_clean),
         security_type: SecurityType::Stock,
         exchange: Exchange::from("SMART"),
-        currency: Currency::from("USD"), // Will be resolved from contract details
+        currency: Currency::from(""), // Will be resolved from contract details
         primary_exchange: Exchange::from(exchange_str),
-        local_symbol: symbol_clean,
         ..Default::default()
     })
 }
@@ -848,7 +880,7 @@ fn parse_cfd_cash_symbol(symbol: &str) -> Option<CurrencyPair> {
 struct OptionSymbol {
     symbol: String,
     expiry: String,
-    right: String,
+    right: OptionRight,
     local_symbol: String,
     strike_value: f64,
 }
@@ -890,7 +922,7 @@ fn parse_option_symbol(symbol: &str) -> Option<OptionSymbol> {
     Some(OptionSymbol {
         symbol: symbol_part.to_string(),
         expiry: expiry.to_string(),
-        right: right.to_string(),
+        right: ib_option_right_to_option_right(right),
         local_symbol: symbol.to_string(),
         strike_value,
     })
@@ -900,7 +932,7 @@ fn parse_option_symbol(symbol: &str) -> Option<OptionSymbol> {
 struct NamedOptionSymbol {
     trading_class: String,
     expiry: String,
-    right: String,
+    right: OptionRight,
     strike_value: f64,
 }
 
@@ -945,7 +977,7 @@ fn parse_named_option_symbol(symbol: &str) -> Option<NamedOptionSymbol> {
     Some(NamedOptionSymbol {
         trading_class: parts[1].to_string(),
         expiry: expiry.to_string(),
-        right: right.to_string(),
+        right: ib_option_right_to_option_right(right),
         strike_value: parts[3].parse::<f64>().ok()?,
     })
 }
@@ -1179,7 +1211,7 @@ pub fn parse_spread_instrument_id_to_legs(
 
 #[cfg(test)]
 mod tests {
-    use ibapi::contracts::{Contract, Currency, Exchange, SecurityType, Symbol};
+    use ibapi::contracts::{Contract, Currency, Exchange, OptionRight, SecurityType, Symbol};
     use nautilus_model::identifiers::InstrumentId;
     use rstest::rstest;
 
@@ -1194,7 +1226,7 @@ mod tests {
             currency: Currency::from("USD"),
             local_symbol: "SPXW260313P06630000".to_string(),
             last_trade_date_or_contract_month: "260313".to_string(),
-            right: "P".to_string(),
+            right: Some(OptionRight::Put),
             strike: 6630.0,
             ..Default::default()
         };
@@ -1217,7 +1249,7 @@ mod tests {
             trading_class: "OESX".to_string(),
             local_symbol: String::new(),
             last_trade_date_or_contract_month: "20260213".to_string(),
-            right: "C".to_string(),
+            right: Some(OptionRight::Call),
             strike: 4775.0,
             ..Default::default()
         };
@@ -1260,7 +1292,7 @@ mod tests {
             contract.last_trade_date_or_contract_month.as_str(),
             "20260213"
         );
-        assert_eq!(contract.right.as_str(), "C");
+        assert_eq!(contract.right.map(|right| right.as_str()), Some("C"));
         assert_eq!(contract.strike, 4775.0);
     }
 
@@ -1278,7 +1310,7 @@ mod tests {
             contract.last_trade_date_or_contract_month.as_str(),
             "230217"
         );
-        assert_eq!(contract.right.as_str(), "P");
+        assert_eq!(contract.right.map(|right| right.as_str()), Some("P"));
         assert_eq!(contract.strike, 155.0);
     }
 
@@ -1360,6 +1392,86 @@ mod tests {
     }
 
     #[rstest]
+    fn test_instrument_id_to_ib_contract_parses_zerohash_crypto_symbol() {
+        // ZEROHASH is one of IB's crypto venues (alongside PAXOS).
+        let instrument_id = InstrumentId::from("BTC/USD.ZEROHASH");
+
+        let contract = instrument_id_to_ib_contract(instrument_id, None).unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Crypto);
+        assert_eq!(contract.exchange.as_str(), "ZEROHASH");
+        assert_eq!(contract.symbol.as_str(), "BTC");
+        assert_eq!(contract.currency.as_str(), "USD");
+        assert_eq!(contract.local_symbol.as_str(), "BTC.USD");
+    }
+
+    #[rstest]
+    fn test_ib_contract_to_instrument_id_simplified_derives_zerohash_crypto_venue() {
+        // Contract -> InstrumentId derives the venue from the ZEROHASH exchange.
+        let contract = Contract {
+            symbol: Symbol::from("BTC"),
+            security_type: SecurityType::Crypto,
+            exchange: Exchange::from("ZEROHASH"),
+            currency: Currency::from("USD"),
+            local_symbol: "BTC.USD".to_string(),
+            ..Default::default()
+        };
+
+        let instrument_id = ib_contract_to_instrument_id_simplified(&contract, None).unwrap();
+
+        assert_eq!(instrument_id, InstrumentId::from("BTC/USD.ZEROHASH"));
+    }
+
+    #[rstest]
+    fn test_ib_contract_to_instrument_id_simplified_falls_back_to_paxos_crypto_venue() {
+        // Contract -> InstrumentId falls back to PAXOS when no exchange is set,
+        // preserving backwards compatibility.
+        let contract = Contract {
+            symbol: Symbol::from("DOGE"),
+            security_type: SecurityType::Crypto,
+            currency: Currency::from("USD"),
+            local_symbol: "DOGE.USD".to_string(),
+            ..Default::default()
+        };
+
+        let instrument_id = ib_contract_to_instrument_id_simplified(&contract, None).unwrap();
+
+        assert_eq!(instrument_id, InstrumentId::from("DOGE/USD.PAXOS"));
+    }
+
+    #[rstest]
+    fn test_instrument_id_to_ib_contract_parses_paxos_crypto_symbol() {
+        // PAXOS remains a live IB crypto venue alongside ZEROHASH.
+        let instrument_id = InstrumentId::from("BTC/USD.PAXOS");
+
+        let contract = instrument_id_to_ib_contract(instrument_id, None).unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Crypto);
+        assert_eq!(contract.exchange.as_str(), "PAXOS");
+        assert_eq!(contract.symbol.as_str(), "BTC");
+        assert_eq!(contract.currency.as_str(), "USD");
+        assert_eq!(contract.local_symbol.as_str(), "BTC.USD");
+    }
+
+    #[rstest]
+    fn test_ib_contract_to_instrument_id_simplified_derives_paxos_crypto_venue() {
+        // A PAXOS contract derives the PAXOS venue from its exchange (not via the
+        // fallback), proving both venues are honored when explicitly set.
+        let contract = Contract {
+            symbol: Symbol::from("BTC"),
+            security_type: SecurityType::Crypto,
+            exchange: Exchange::from("PAXOS"),
+            currency: Currency::from("USD"),
+            local_symbol: "BTC.USD".to_string(),
+            ..Default::default()
+        };
+
+        let instrument_id = ib_contract_to_instrument_id_simplified(&contract, None).unwrap();
+
+        assert_eq!(instrument_id, InstrumentId::from("BTC/USD.PAXOS"));
+    }
+
+    #[rstest]
     fn test_instrument_id_to_ib_contract_uses_contfut_for_underlying() {
         let instrument_id = InstrumentId::from("ES.XCME");
 
@@ -1404,5 +1516,19 @@ mod tests {
         assert_eq!(contract.security_type, SecurityType::Future);
         assert_eq!(contract.exchange.as_str(), "CBOT");
         assert_eq!(contract.local_symbol.as_str(), "YMM6");
+    }
+
+    #[rstest]
+    fn test_instrument_id_to_ib_contract_default_stock_omits_local_symbol_and_currency() {
+        let instrument_id = InstrumentId::from("IUSA.IBIS");
+
+        let contract = instrument_id_to_ib_contract(instrument_id, Some("IBIS")).unwrap();
+
+        assert_eq!(contract.security_type, SecurityType::Stock);
+        assert_eq!(contract.symbol.as_str(), "IUSA");
+        assert_eq!(contract.exchange.as_str(), "SMART");
+        assert_eq!(contract.primary_exchange.as_str(), "IBIS");
+        assert!(contract.currency.as_str().is_empty());
+        assert!(contract.local_symbol.is_empty());
     }
 }

@@ -17,9 +17,10 @@
 //!
 //! The governor does not support different quota for different key. It is an open [issue](https://github.com/antifuchs/governor/issues/193).
 pub mod clock;
+pub mod quota;
+
 mod gcra;
 mod nanos;
-pub mod quota;
 
 use std::{
     fmt::Debug,
@@ -321,6 +322,22 @@ mod tests {
     }
 
     #[rstest]
+    fn test_enormous_quota_denies_after_burst() {
+        // Regression: a period beyond ~584 years panicked in Gcra::new; with
+        // clamping it must admit the burst and then deny, not admit everything
+        let quota = Quota::with_period(Duration::MAX)
+            .unwrap()
+            .allow_burst(NonZeroU32::new(u32::MAX).unwrap());
+        let clock = FakeRelativeClock::default();
+        let limiter: RateLimiter<String, FakeRelativeClock> =
+            RateLimiter::new_with_clock(Some(quota), vec![], clock);
+
+        let key = "key".to_string();
+        assert!(limiter.check_key(&key).is_ok());
+        assert!(limiter.check_key(&key).is_err());
+    }
+
+    #[rstest]
     fn test_default_quota() {
         let mock_limiter = initialize_mock_rate_limiter();
 
@@ -480,9 +497,6 @@ mod tests {
 
         use crate::ratelimiter::{gcra::StateSnapshot, nanos::Nanos};
 
-        // Upper bound: ~1 hour in nanoseconds (realistic GCRA range)
-        const MAX_NANOS: u64 = 3_600_000_000_000;
-
         proptest! {
             #![proptest_config(ProptestConfig {
                 failure_persistence: Some(Box::new(
@@ -491,12 +505,13 @@ mod tests {
                 ..ProptestConfig::default()
             })]
 
+            // Full u64 domain: the historical overflow lived above the narrowed one-hour range
             #[rstest]
             fn remaining_burst_capacity_never_panics(
-                t in 0u64..=MAX_NANOS,
-                tau in 0u64..=MAX_NANOS,
-                time_of_measurement in 0u64..=MAX_NANOS,
-                tat in 0u64..=MAX_NANOS,
+                t in proptest::num::u64::ANY,
+                tau in proptest::num::u64::ANY,
+                time_of_measurement in proptest::num::u64::ANY,
+                tat in proptest::num::u64::ANY,
             ) {
                 let snapshot = StateSnapshot::new(
                     Nanos::from(t),
@@ -506,6 +521,17 @@ mod tests {
                 );
 
                 let _ = snapshot.remaining_burst_capacity();
+            }
+
+            // Operators must saturate across the full u64 domain (a wrapped TAT admits everything)
+            #[rstest]
+            fn nanos_operators_never_panic(a in proptest::num::u64::ANY, b in proptest::num::u64::ANY) {
+                let na = Nanos::from(a);
+                let nb = Nanos::from(b);
+
+                prop_assert_eq!((na + nb).as_u64(), a.saturating_add(b));
+                prop_assert_eq!((na * b).as_u64(), a.saturating_mul(b));
+                prop_assert_eq!(na.saturating_sub(nb).as_u64(), a.saturating_sub(b));
             }
         }
     }
@@ -550,22 +576,18 @@ mod tests {
     }
 
     #[rstest]
-    fn test_burst_size_replenished_in_truncation() {
-        // 100_000_000_000ns * u32::MAX overflows u64, `as u64` silently truncates
-        let quota = Quota::with_period(Duration::from_secs(100))
+    #[case::large(Duration::from_secs(100), u32::MAX, Duration::from_mins(7_158_278_825))]
+    #[case::saturated(Duration::MAX, 2, Duration::MAX)]
+    fn test_burst_size_replenished_in(
+        #[case] replenish_interval: Duration,
+        #[case] burst_size: u32,
+        #[case] expected: Duration,
+    ) {
+        let quota = Quota::with_period(replenish_interval)
             .unwrap()
-            .allow_burst(NonZeroU32::new(u32::MAX).unwrap());
+            .allow_burst(NonZeroU32::new(burst_size).unwrap());
 
-        let replenished_in = quota.burst_size_replenished_in();
-        let full: u128 = 100_000_000_000u128 * u128::from(u32::MAX);
-        let truncated = full as u64;
-
-        assert_eq!(replenished_in, Duration::from_nanos(truncated));
-        assert_ne!(
-            full,
-            u128::from(truncated),
-            "Truncation should have occurred"
-        );
+        assert_eq!(quota.burst_size_replenished_in(), expected);
     }
 
     #[rstest]

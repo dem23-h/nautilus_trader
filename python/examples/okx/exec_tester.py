@@ -36,8 +36,8 @@ from nautilus_trader.adapters.okx import OKXExecutionClientFactory
 from nautilus_trader.adapters.okx import OKXInstrumentType
 from nautilus_trader.adapters.okx import OKXMarginMode
 from nautilus_trader.common import Environment
+from nautilus_trader.config import LiveRiskEngineConfig
 from nautilus_trader.live import LiveNode
-from nautilus_trader.live import LiveRiskEngineConfig
 from nautilus_trader.model import AccountId
 from nautilus_trader.model import ClientId
 from nautilus_trader.model import InstrumentId
@@ -96,10 +96,11 @@ def main() -> None:
     )
 
     node = builder.build()
-    node.add_native_strategy(
+    node.add_builtin_strategy(
         "ExecTester",
         ExecTesterConfig(
             strategy_id=StrategyId.from_str("EXEC_TESTER-001"),
+            use_hyphens_in_client_order_ids=False,  # OKX requires alphanumeric clOrdId
             instrument_id=instrument_id,
             client_id=ClientId.from_str(OKX),
             external_order_claims=[instrument_id],

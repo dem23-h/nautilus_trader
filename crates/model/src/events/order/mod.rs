@@ -36,8 +36,10 @@ pub mod cancel_rejected;
 pub mod canceled;
 pub mod canceled_batch;
 pub mod denied;
+pub mod denied_reason;
 pub mod emulated;
 pub mod expired;
+pub mod fill_voided;
 pub mod filled;
 pub mod initialized;
 pub mod modify_rejected;
@@ -76,6 +78,7 @@ pub enum OrderEventType {
     Updated,
     PartiallyFilled,
     Filled,
+    FillVoided,
 }
 
 pub trait OrderEvent: 'static + Send {
@@ -100,6 +103,7 @@ pub trait OrderEvent: 'static + Send {
     fn price(&self) -> Option<Price>;
     fn last_px(&self) -> Option<Price>;
     fn last_qty(&self) -> Option<Quantity>;
+    fn activation_price(&self) -> Option<Price>;
     fn trigger_price(&self) -> Option<Price>;
     fn trigger_type(&self) -> Option<TriggerType>;
     fn limit_offset(&self) -> Option<Decimal>;

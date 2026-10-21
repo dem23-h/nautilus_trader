@@ -28,7 +28,7 @@ use anyhow::Context;
 use async_trait::async_trait;
 use nautilus_common::{
     clients::ExecutionClient,
-    live::{get_runtime, runner::get_exec_event_sender},
+    live::{get_runtime, runner::get_exec_event_sender, task::TaskHandles},
     messages::execution::{
         BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReports,
         GenerateFillReportsBuilder, GenerateOrderStatusReport, GenerateOrderStatusReports,
@@ -277,7 +277,7 @@ pub struct CoinbaseExecutionClient {
     http_client: CoinbaseHttpClient,
     ws_user: CoinbaseWebSocketClient,
     ws_stream_handle: Option<JoinHandle<()>>,
-    pending_tasks: Mutex<Vec<JoinHandle<()>>>,
+    pending_tasks: TaskHandles,
     instruments_cache: Arc<AHashMap<String, InstrumentAny>>,
     fill_dedup: Arc<Mutex<FillDedup>>,
     cumulative_state: Arc<Mutex<CumulativeStateMap>>,
@@ -359,7 +359,7 @@ impl CoinbaseExecutionClient {
             http_client,
             ws_user,
             ws_stream_handle: None,
-            pending_tasks: Mutex::new(Vec::new()),
+            pending_tasks: TaskHandles::default(),
             instruments_cache: Arc::new(AHashMap::new()),
             fill_dedup: Arc::new(Mutex::new(FillDedup::new(FILL_DEDUP_CAPACITY))),
             cumulative_state: Arc::new(Mutex::new(CumulativeStateMap::with_capacity(
@@ -381,16 +381,11 @@ impl CoinbaseExecutionClient {
             }
         });
 
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        tasks.retain(|h| !h.is_finished());
-        tasks.push(handle);
+        self.pending_tasks.push(handle);
     }
 
     fn abort_pending_tasks(&self) {
-        let mut tasks = self.pending_tasks.lock().expect(MUTEX_POISONED);
-        for handle in tasks.drain(..) {
-            handle.abort();
-        }
+        self.pending_tasks.abort_all();
     }
 
     // Returns true when the exec client was created with a Margin account,
@@ -484,7 +479,7 @@ impl ExecutionClient for CoinbaseExecutionClient {
         // we rebuild the client outright to guarantee clean cmd_tx/out_rx
         // pairs and a fresh signal.
         if self.ws_user.is_active() || self.ws_user.is_reconnecting() {
-            log::info!("Tearing down stale user WS before reconnect");
+            log::debug!("Tearing down stale user WS before reconnect");
             self.ws_user.disconnect().await;
             // Abort any prior consumer task; the rebuilt ws_user gets a fresh
             // out_rx so the previous task is otherwise leaked.
@@ -534,7 +529,7 @@ impl ExecutionClient for CoinbaseExecutionClient {
             if instruments.is_empty() {
                 log::warn!("Coinbase instrument bootstrap returned no {product_kind} instruments");
             } else {
-                log::info!(
+                log::debug!(
                     "Coinbase exec client loaded {} {product_kind} instruments",
                     instruments.len()
                 );
@@ -650,7 +645,7 @@ impl ExecutionClient for CoinbaseExecutionClient {
         };
 
         if !account_state.balances.is_empty() {
-            log::info!(
+            log::debug!(
                 "Received account state with {} balance(s)",
                 account_state.balances.len()
             );
@@ -941,19 +936,11 @@ impl ExecutionClient for CoinbaseExecutionClient {
     }
 
     fn submit_order(&self, cmd: SubmitOrder) -> anyhow::Result<()> {
-        let order = {
-            let cache = self.core.cache();
-            let order = cache
-                .order(&cmd.client_order_id)
-                .ok_or_else(|| anyhow::anyhow!("Order not found: {}", cmd.client_order_id))?;
-
-            if order.is_closed() {
-                log::warn!("Cannot submit closed order {}", order.client_order_id());
-                return Ok(());
-            }
-
-            order.clone()
-        };
+        let order = self.core.cache().try_order_owned(&cmd.client_order_id)?;
+        if order.is_closed() {
+            log::warn!("Cannot submit closed order {}", order.client_order_id());
+            return Ok(());
+        }
 
         // The connect-time bootstrap caches only the product family this
         // client was configured for (Cash -> spot, Margin -> futures). An
@@ -1137,7 +1124,7 @@ impl ExecutionClient for CoinbaseExecutionClient {
                             false,
                         );
                     } else if is_coinbase_ambiguous_command_failure(&e) {
-                        log::error!(
+                        log::warn!(
                             "Ambiguous submit failure for {client_order_id}, awaiting reconciliation: {e}"
                         );
                     } else {
@@ -1260,7 +1247,7 @@ impl ExecutionClient for CoinbaseExecutionClient {
                 }
                 Err(e) => {
                     if is_coinbase_ambiguous_command_failure(&e) {
-                        log::error!(
+                        log::warn!(
                             "Ambiguous modify failure for {client_order_id}, awaiting reconciliation: {e}"
                         );
                     } else {
@@ -1313,7 +1300,7 @@ impl ExecutionClient for CoinbaseExecutionClient {
                 }
                 Err(e) => {
                     if is_coinbase_ambiguous_command_failure(&e) {
-                        log::error!(
+                        log::warn!(
                             "Ambiguous cancel failure for {client_order_id}, awaiting reconciliation: {e}"
                         );
                     } else {
@@ -1411,7 +1398,7 @@ impl ExecutionClient for CoinbaseExecutionClient {
                     }
                     Err(e) => {
                         if is_coinbase_ambiguous_command_failure(&e) {
-                            log::error!(
+                            log::warn!(
                                 "Ambiguous cancel-all failure for {} orders on {instrument_id}, awaiting reconciliation: {e}",
                                 chunk.len()
                             );
@@ -1500,7 +1487,7 @@ impl ExecutionClient for CoinbaseExecutionClient {
                     }
                     Err(e) => {
                         if is_coinbase_ambiguous_command_failure(&e) {
-                            log::error!(
+                            log::warn!(
                                 "Ambiguous batch cancel failure for {} orders, awaiting reconciliation: {e}",
                                 chunk.len()
                             );
@@ -2266,6 +2253,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::default(),
             UnixNanos::default(),
         ))
@@ -2499,8 +2487,20 @@ mod tests {
         }
         process_user_order_update(make_carrier(update), None, &emitter, &dedup, &state, None);
 
+        let next_update = make_user_order_update("1.0", "0", "110.00", "0.15", CbStatus::Filled);
+        process_user_order_update(
+            make_carrier(next_update),
+            None,
+            &emitter,
+            &dedup,
+            &state,
+            None,
+        );
+
         let fills = drain_fill_reports(&mut rx);
-        assert_eq!(fills.len(), 1, "replay should be deduplicated");
+        assert_eq!(fills.len(), 2, "replay should be deduplicated");
+        assert_eq!(fills[0].last_qty, Quantity::from("0.50000000"));
+        assert_eq!(fills[1].last_qty, Quantity::from("0.50000000"));
     }
 
     #[rstest]

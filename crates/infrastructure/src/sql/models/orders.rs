@@ -153,6 +153,10 @@ impl<'r> FromRow<'r, PgRow> for OrderEventAnyModel {
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderInitializedModel {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "SQL row mapping mirrors the full order initialized event constructor"
+    )]
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
         let event_id = row.try_get::<&str, _>("id").map(UUID4::from)?;
         let client_order_id = row
@@ -183,6 +187,10 @@ impl<'r> FromRow<'r, PgRow> for OrderInitializedModel {
         let ts_init = row.try_get::<String, _>("ts_init").map(UnixNanos::from)?;
         let price = row
             .try_get::<Option<&str>, _>("price")
+            .ok()
+            .and_then(|x| x.map(Price::from));
+        let activation_price = row
+            .try_get::<Option<&str>, _>("activation_price")
             .ok()
             .and_then(|x| x.map(Price::from));
         let trigger_price = row
@@ -259,7 +267,7 @@ impl<'r> FromRow<'r, PgRow> for OrderInitializedModel {
             .ok()
             .and_then(|x| x.map(|x| serde_json::from_value::<Vec<String>>(x).unwrap()))
             .map(|x| x.into_iter().map(|x| Ustr::from(x.as_str())).collect());
-        let order_event = OrderInitialized::new(
+        let order_event = OrderInitialized::new_checked(
             trader_id,
             strategy_id,
             instrument_id,
@@ -276,6 +284,7 @@ impl<'r> FromRow<'r, PgRow> for OrderInitializedModel {
             ts_event,
             ts_init,
             price,
+            activation_price,
             trigger_price,
             trigger_type,
             limit_offset,
@@ -293,7 +302,8 @@ impl<'r> FromRow<'r, PgRow> for OrderInitializedModel {
             exec_algorithm_params,
             exec_spawn_id,
             tags,
-        );
+        )
+        .map_err(|e| sqlx::Error::Decode(Box::new(e)))?;
         Ok(Self(order_event))
     }
 }
@@ -455,6 +465,7 @@ impl<'r> FromRow<'r, PgRow> for OrderFilledModel {
             false,
             position_id,
             commission,
+            None,
         );
         Ok(Self(order_event))
     }
@@ -571,6 +582,10 @@ impl<'r> FromRow<'r, PgRow> for OrderUpdatedModel {
 }
 
 impl<'r> FromRow<'r, PgRow> for OrderSnapshotModel {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "SQL row mapping mirrors the full order snapshot constructor"
+    )]
     fn from_row(row: &'r PgRow) -> Result<Self, sqlx::Error> {
         let trader_id = row.try_get::<&str, _>("trader_id").map(TraderId::from)?;
         let strategy_id = row
@@ -609,6 +624,10 @@ impl<'r> FromRow<'r, PgRow> for OrderSnapshotModel {
             .try_get::<Option<&str>, _>("price")
             .ok()
             .and_then(|x| x.map(Price::from));
+        let activation_price = row
+            .try_get::<Option<&str>, _>("activation_price")
+            .ok()
+            .and_then(|x| x.map(Price::from));
         let trigger_price = row
             .try_get::<Option<&str>, _>("trigger_price")
             .ok()
@@ -641,8 +660,8 @@ impl<'r> FromRow<'r, PgRow> for OrderSnapshotModel {
             .try_get::<Option<&str>, _>("liquidity_side")
             .ok()
             .and_then(|x| x.map(|x| LiquiditySide::from_str(x).expect("Invalid `LiquiditySide`")));
-        let avg_px = row.try_get::<Option<f64>, _>("avg_px").ok().flatten();
-        let slippage = row.try_get::<Option<f64>, _>("slippage").ok().flatten();
+        let avg_px = row.try_get::<Option<Decimal>, _>("avg_px").ok().flatten();
+        let slippage = row.try_get::<Option<Decimal>, _>("slippage").ok().flatten();
         let commissions = row
             .try_get::<Option<Vec<String>>, _>("commissions")?
             .map_or_else(Vec::new, |c| {
@@ -736,6 +755,7 @@ impl<'r> FromRow<'r, PgRow> for OrderSnapshotModel {
             order_side,
             quantity,
             price,
+            activation_price,
             trigger_price,
             trigger_type,
             limit_offset,

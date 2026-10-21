@@ -17,11 +17,18 @@
 
 use std::collections::HashMap;
 
-use nautilus_common::{actor::data_actor::ImportableActorConfig, python::actor::PyDataActor};
+use nautilus_common::{
+    actor::data_actor::ImportableActorConfig,
+    python::{
+        actor::{PyDataActor, PyDataActorInner},
+        cache::PyCache,
+    },
+};
 #[cfg(feature = "examples")]
 use nautilus_core::python::to_pytype_err;
 use nautilus_core::python::{to_pyruntime_err, to_pyvalue_err};
-use nautilus_model::identifiers::{ActorId, ComponentId, StrategyId};
+use nautilus_model::identifiers::{AccountId, ActorId, ComponentId, StrategyId, Venue};
+use nautilus_portfolio::python::PyPortfolio;
 #[cfg(feature = "examples")]
 use nautilus_trading::examples::strategies::{
     CompositeMarketMaker, CompositeMarketMakerConfig, DeltaNeutralVol, DeltaNeutralVolConfig,
@@ -34,9 +41,13 @@ use nautilus_trading::{
 };
 use pyo3::{prelude::*, types::PyDict};
 
-#[cfg(feature = "examples")]
-use crate::engine::BacktestEngine;
-use crate::{config::BacktestRunConfig, node::BacktestNode, result::BacktestResult};
+use super::engine::{
+    engine_cache, engine_portfolio, generate_account_report, generate_fills_report,
+    generate_order_fills_report, generate_orders_report, generate_positions_report,
+};
+use crate::{
+    config::BacktestRunConfig, engine::BacktestEngine, node::BacktestNode, result::BacktestResult,
+};
 
 #[pyo3_stub_gen::derive::gen_stub_pymethods]
 #[pymethods]
@@ -50,14 +61,24 @@ impl BacktestNode {
         Self::new(configs).map_err(to_pyruntime_err)
     }
 
+    /// Returns the run configurations.
+    #[getter]
+    #[pyo3(name = "configs")]
+    fn py_configs(&self) -> Vec<BacktestRunConfig> {
+        self.configs().to_vec()
+    }
+
     /// Builds backtest engines from the run configurations.
     ///
     /// For each config, creates a `BacktestEngine`, adds venues, and loads
-    /// instruments from the catalog.
+    /// instruments from the catalog. If building a config fails with
+    /// `BacktestRunConfig.raise_exception` disabled, logs the error and skips that config;
+    /// successful return does not guarantee an engine for every config.
     ///
     /// # Errors
     ///
-    /// Returns an error if engine creation, venue setup, or instrument loading fails.
+    /// Returns an error if building an engine from a config fails and
+    /// `BacktestRunConfig.raise_exception` is enabled for that config.
     #[pyo3(name = "build")]
     fn py_build(&mut self) -> PyResult<()> {
         self.build().map_err(to_pyruntime_err)
@@ -68,10 +89,14 @@ impl BacktestNode {
     /// Automatically calls `build()` if engines have not been created yet.
     /// For each run config, loads data from the catalog and runs the engine.
     /// Supports both oneshot (`chunk_size = None`) and streaming modes.
+    /// Configs without a built engine are skipped. If a run fails with
+    /// `BacktestRunConfig.raise_exception` disabled, logs the error, clears its loaded data,
+    /// leaves the engine undisposed, and omits its result.
     ///
     /// # Errors
     ///
-    /// Returns an error if building, data loading, or engine execution fails.
+    /// Returns an error if building, data loading, or engine execution fails and
+    /// `BacktestRunConfig.raise_exception` is enabled for the run config.
     #[pyo3(name = "run")]
     fn py_run(&mut self) -> PyResult<Vec<BacktestResult>> {
         self.run().map_err(to_pyruntime_err)
@@ -81,6 +106,104 @@ impl BacktestNode {
     #[pyo3(name = "dispose")]
     fn py_dispose(&mut self) {
         self.dispose();
+    }
+
+    /// Returns the cache for the given run config engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no engine exists for the run config ID.
+    #[pyo3(name = "get_engine_cache")]
+    fn py_get_engine_cache(&self, run_config_id: &str) -> PyResult<PyCache> {
+        Ok(engine_cache(self.require_engine(run_config_id)?))
+    }
+
+    /// Returns the portfolio for the given run config engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no engine exists for the run config ID.
+    #[pyo3(name = "get_engine_portfolio")]
+    fn py_get_engine_portfolio(&self, run_config_id: &str) -> PyResult<PyPortfolio> {
+        Ok(engine_portfolio(self.require_engine(run_config_id)?))
+    }
+
+    /// Generates an orders report for the given run config engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no engine exists or report generation fails.
+    #[pyo3(name = "generate_orders_report")]
+    fn py_generate_orders_report<'py>(
+        &self,
+        py: Python<'py>,
+        run_config_id: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        generate_orders_report(self.require_engine(run_config_id)?, py)
+    }
+
+    /// Generates an order fills report for the given run config engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no engine exists or report generation fails.
+    #[pyo3(name = "generate_order_fills_report")]
+    fn py_generate_order_fills_report<'py>(
+        &self,
+        py: Python<'py>,
+        run_config_id: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        generate_order_fills_report(self.require_engine(run_config_id)?, py)
+    }
+
+    /// Generates a fills report for the given run config engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no engine exists or report generation fails.
+    #[pyo3(name = "generate_fills_report")]
+    fn py_generate_fills_report<'py>(
+        &self,
+        py: Python<'py>,
+        run_config_id: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        generate_fills_report(self.require_engine(run_config_id)?, py)
+    }
+
+    /// Generates a positions report for the given run config engine.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no engine exists or report generation fails.
+    #[pyo3(name = "generate_positions_report")]
+    fn py_generate_positions_report<'py>(
+        &self,
+        py: Python<'py>,
+        run_config_id: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        generate_positions_report(self.require_engine(run_config_id)?, py)
+    }
+
+    /// Generates an account report for the given run config engine.
+    ///
+    /// At least one of `venue` or `account_id` must be provided.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if no engine exists, neither selector is provided, or report generation
+    /// fails.
+    #[pyo3(
+        name = "generate_account_report",
+        signature = (run_config_id, venue=None, account_id=None)
+    )]
+    fn py_generate_account_report<'py>(
+        &self,
+        py: Python<'py>,
+        run_config_id: &str,
+        venue: Option<Venue>,
+        account_id: Option<AccountId>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        generate_account_report(self.require_engine(run_config_id)?, py, venue, account_id)
     }
 
     #[allow(
@@ -234,7 +357,7 @@ impl BacktestNode {
             .kernel_mut()
             .trader
             .borrow_mut()
-            .add_actor_id_for_lifecycle(actor_id)
+            .add_actor_id_for_lifecycle::<PyDataActorInner>(actor_id)
             .map_err(to_pyruntime_err)?;
 
         log::info!("Registered Python actor {actor_id}");
@@ -408,12 +531,20 @@ impl BacktestNode {
         Ok(())
     }
 
-    /// Adds a compiled-in native Rust strategy to the engine for the given run config.
+    /// Adds a built-in example strategy to the engine for the given run config.
     ///
-    /// The type name determines which built-in strategy is constructed.
-    /// All execution happens in Rust; Python is the configuration layer.
-    #[pyo3(name = "add_native_strategy")]
-    fn py_add_native_strategy(
+    /// This method exists only to single-source bundled example strategy code across
+    /// Rust and Python tests/examples. It is not a first-class extension path for
+    /// adding native strategies.
+    #[pyo3(name = "add_builtin_strategy")]
+    #[cfg_attr(
+        not(feature = "examples"),
+        expect(
+            clippy::unused_self,
+            reason = "PyO3 method keeps the instance API when examples are disabled"
+        )
+    )]
+    fn py_add_builtin_strategy(
         &mut self,
         run_config_id: &str,
         type_name: &str,
@@ -425,8 +556,8 @@ impl BacktestNode {
                 to_pyruntime_err(format!("No engine for run config '{run_config_id}'"))
             })?;
 
-            let register = native_strategy_register(type_name).ok_or_else(|| {
-                to_pytype_err(format!("Unsupported native strategy type: {type_name}"))
+            let register = builtin_strategy_register(type_name).ok_or_else(|| {
+                to_pytype_err(format!("Unsupported built-in strategy type: {type_name}"))
             })?;
             register(engine, config)
         }
@@ -435,7 +566,7 @@ impl BacktestNode {
         {
             let _ = (run_config_id, type_name, config);
             Err(to_pyruntime_err(
-                "add_native_strategy requires the `examples` feature",
+                "add_builtin_strategy requires the `examples` feature",
             ))
         }
     }
@@ -445,11 +576,18 @@ impl BacktestNode {
     }
 }
 
-#[cfg(feature = "examples")]
-type NativeStrategyRegister = for<'py> fn(&mut BacktestEngine, &Bound<'py, PyAny>) -> PyResult<()>;
+impl BacktestNode {
+    fn require_engine(&self, run_config_id: &str) -> PyResult<&BacktestEngine> {
+        self.get_engine(run_config_id)
+            .ok_or_else(|| to_pyruntime_err(format!("No engine for run config '{run_config_id}'")))
+    }
+}
 
 #[cfg(feature = "examples")]
-fn native_strategy_register(type_name: &str) -> Option<NativeStrategyRegister> {
+type BuiltinStrategyRegister = for<'py> fn(&mut BacktestEngine, &Bound<'py, PyAny>) -> PyResult<()>;
+
+#[cfg(feature = "examples")]
+fn builtin_strategy_register(type_name: &str) -> Option<BuiltinStrategyRegister> {
     match type_name {
         "CompositeMarketMaker" => Some(register_composite_market_maker),
         "DeltaNeutralVol" => Some(register_delta_neutral_vol),
@@ -525,22 +663,22 @@ mod tests {
     #[case("EmaCross")]
     #[case("GridMarketMaker")]
     #[case("HurstVpinDirectional")]
-    fn test_native_strategy_register_accepts_supported_names(#[case] type_name: &str) {
-        assert!(super::native_strategy_register(type_name).is_some());
+    fn test_builtin_strategy_register_accepts_supported_names(#[case] type_name: &str) {
+        assert!(super::builtin_strategy_register(type_name).is_some());
     }
 
     #[rstest]
-    fn test_native_strategy_register_rejects_unknown_name() {
-        assert!(super::native_strategy_register("UnknownStrategy").is_none());
+    fn test_builtin_strategy_register_rejects_unknown_name() {
+        assert!(super::builtin_strategy_register("UnknownStrategy").is_none());
     }
 
     #[rstest]
-    fn test_native_strategy_register_rejects_mismatched_config() {
+    fn test_builtin_strategy_register_rejects_mismatched_config() {
         Python::initialize();
 
         let mut engine = BacktestEngine::new(BacktestEngineConfig::default()).unwrap();
         Python::attach(|py| {
-            let register = super::native_strategy_register("EmaCross").unwrap();
+            let register = super::builtin_strategy_register("EmaCross").unwrap();
             let config = PyDict::new(py);
             let error = register(&mut engine, config.as_any()).unwrap_err();
 
@@ -580,9 +718,7 @@ pub(crate) fn create_config_instance<'py>(
     let py_dict = PyDict::new(py);
 
     for (key, value) in config {
-        let json_str = serde_json::to_string(value)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize config value: {e}"))?;
-        let py_value = PyModule::import(py, "json")?.call_method("loads", (json_str,), None)?;
+        let py_value = config_value_to_py(py, key, value)?;
         py_dict.set_item(key, py_value)?;
     }
 
@@ -601,14 +737,7 @@ pub(crate) fn create_config_instance<'py>(
                 Ok(instance) => {
                     log::debug!("Created default config instance, setting attributes");
                     for (key, value) in config {
-                        let json_str = serde_json::to_string(value).map_err(|e| {
-                            anyhow::anyhow!("Failed to serialize config value: {e}")
-                        })?;
-                        let py_value = PyModule::import(py, "json")?.call_method(
-                            "loads",
-                            (json_str,),
-                            None,
-                        )?;
+                        let py_value = config_value_to_py(py, key, value)?;
 
                         if let Err(setattr_err) = instance.setattr(key, py_value) {
                             log::warn!("Failed to set attribute {key}: {setattr_err}");
@@ -636,4 +765,24 @@ pub(crate) fn create_config_instance<'py>(
     log::debug!("Created config instance: {config_instance:?}");
 
     Ok(Some(config_instance))
+}
+
+fn config_value_to_py<'py>(
+    py: Python<'py>,
+    key: &str,
+    value: &serde_json::Value,
+) -> anyhow::Result<Bound<'py, PyAny>> {
+    if key == "actor_id"
+        && let Some(actor_id) = value.as_str()
+    {
+        return Ok(ActorId::new_checked(actor_id)?
+            .into_pyobject(py)?
+            .into_any());
+    }
+
+    let json_str = serde_json::to_string(value)
+        .map_err(|e| anyhow::anyhow!("Failed to serialize config value: {e}"))?;
+    Ok(PyModule::import(py, "json")?
+        .call_method("loads", (json_str,), None)?
+        .into_any())
 }

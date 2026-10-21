@@ -41,7 +41,7 @@ use crate::common::{
         BitmexOrderType, BitmexPegPriceType,
     },
     parse::{
-        bitmex_account_id, clean_reason, convert_contract_quantity,
+        bitmex_account_id, bitmex_currency_divisor, clean_reason, convert_contract_quantity,
         derive_contract_decimal_and_increment, derive_trade_id, extract_trigger_type,
         map_bitmex_currency, normalize_trade_bin_prices, normalize_trade_bin_volume,
         parse_aggressor_side, parse_contracts_quantity, parse_instrument_id, parse_liquidity_side,
@@ -101,7 +101,8 @@ pub fn parse_instrument_any(
         BitmexInstrumentState::Open | BitmexInstrumentState::Closed => {}
         state @ (BitmexInstrumentState::Unlisted
         | BitmexInstrumentState::Settled
-        | BitmexInstrumentState::Delisted) => {
+        | BitmexInstrumentState::Delisted
+        | BitmexInstrumentState::Unknown) => {
             return InstrumentParseResult::Inactive { symbol, state };
         }
     }
@@ -134,7 +135,7 @@ pub fn parse_instrument_any(
                 error: e.to_string(),
             },
         },
-        BitmexInstrumentType::FuturesSpread => {
+        BitmexInstrumentType::FuturesSpread | BitmexInstrumentType::FuturesSpreads => {
             match parse_crypto_futures_spread_instrument(instrument, ts_init) {
                 Ok(inst) => InstrumentParseResult::Ok(Box::new(inst)),
                 Err(e) => InstrumentParseResult::Failed {
@@ -144,8 +145,10 @@ pub fn parse_instrument_any(
                 },
             }
         }
-        BitmexInstrumentType::PredictionMarket => {
-            // Prediction markets work similarly to futures (bounded 0-100, cash settled)
+        BitmexInstrumentType::PredictionMarket
+        | BitmexInstrumentType::LegacyFutures
+        | BitmexInstrumentType::LegacyFuturesN => {
+            // Prediction markets and legacy futures share the futures field structure
             match parse_futures_instrument(instrument, ts_init) {
                 Ok(inst) => InstrumentParseResult::Ok(Box::new(inst)),
                 Err(e) => InstrumentParseResult::Failed {
@@ -159,11 +162,12 @@ pub fn parse_instrument_any(
         | BitmexInstrumentType::CryptoIndex
         | BitmexInstrumentType::FxIndex
         | BitmexInstrumentType::LendingIndex
+        | BitmexInstrumentType::ReferenceBasket
         | BitmexInstrumentType::VolatilityIndex
         | BitmexInstrumentType::StockIndex
         | BitmexInstrumentType::YieldIndex => {
-            // Parse index instruments as perpetuals for cache purposes
-            // They need to be in cache for WebSocket price updates
+            // Parse index and reference basket instruments for cache purposes;
+            // they are needed for WebSocket price updates
             match parse_index_instrument(instrument, ts_init) {
                 Ok(inst) => InstrumentParseResult::Ok(Box::new(inst)),
                 Err(e) => InstrumentParseResult::Failed {
@@ -174,15 +178,14 @@ pub fn parse_instrument_any(
             }
         }
 
-        // Explicitly list unsupported types for clarity
-        BitmexInstrumentType::StockPerpetual
+        // TradFi perpetuals (FFSCSX) parse correctly but CryptoPerpetual carries
+        // AssetClass::Cryptocurrency, which misclassifies equity/FX/commodity perps.
+        // Keep unsupported until a PerpetualContract parse path is wired up.
+        // Options require a strike price field not yet present in BitmexInstrument.
+        BitmexInstrumentType::TradFiPerpetual
         | BitmexInstrumentType::CallOption
         | BitmexInstrumentType::PutOption
         | BitmexInstrumentType::SwapRate
-        | BitmexInstrumentType::ReferenceBasket
-        | BitmexInstrumentType::LegacyFutures
-        | BitmexInstrumentType::LegacyFuturesN
-        | BitmexInstrumentType::FuturesSpreads
         | BitmexInstrumentType::Other => InstrumentParseResult::Unsupported {
             symbol,
             instrument_type,
@@ -235,6 +238,7 @@ pub fn parse_index_instrument(
         None, // margin_maint
         None, // maker_fee
         None, // taker_fee
+        None, // tick_scheme
         None, // info
         ts_init,
         ts_init,
@@ -327,6 +331,7 @@ pub fn parse_spot_instrument(
         Some(margin_maint),
         Some(maker_fee),
         Some(taker_fee),
+        None,
         None, // info
         ts_event,
         ts_init,
@@ -383,8 +388,10 @@ pub fn parse_perpetual_instrument(
         .and_then(|margin| Decimal::try_from(*margin).ok())
         .unwrap_or(Decimal::ZERO);
 
-    // TODO: How to handle negative multipliers?
-    let multiplier = Some(Quantity::new_checked(definition.multiplier.abs(), 0)?);
+    let multiplier = Some(parse_instrument_multiplier(
+        definition,
+        settlement_currency,
+    )?);
     let max_quantity = convert_contract_quantity(
         definition.max_order_qty,
         contract_decimal,
@@ -425,6 +432,7 @@ pub fn parse_perpetual_instrument(
         Some(margin_maint),
         Some(maker_fee),
         Some(taker_fee),
+        None,
         None, // info
         ts_event,
         ts_init,
@@ -487,8 +495,10 @@ pub fn parse_futures_instrument(
         .and_then(|margin| Decimal::try_from(*margin).ok())
         .unwrap_or(Decimal::ZERO);
 
-    // TODO: How to handle negative multipliers?
-    let multiplier = Some(Quantity::new_checked(definition.multiplier.abs(), 0)?);
+    let multiplier = Some(parse_instrument_multiplier(
+        definition,
+        settlement_currency,
+    )?);
 
     let max_quantity = convert_contract_quantity(
         definition.max_order_qty,
@@ -531,12 +541,35 @@ pub fn parse_futures_instrument(
         Some(margin_maint),
         Some(maker_fee),
         Some(taker_fee),
+        None,
         None, // info
         ts_event,
         ts_init,
     );
 
     Ok(InstrumentAny::CryptoFuture(instrument))
+}
+
+fn parse_instrument_multiplier(
+    definition: &BitmexInstrument,
+    settlement_currency: Currency,
+) -> anyhow::Result<Quantity> {
+    if !definition.is_quanto {
+        return Quantity::new_checked(definition.multiplier.abs(), 0).map_err(Into::into);
+    }
+
+    let raw = Decimal::try_from(definition.multiplier.abs())
+        .map_err(|e| anyhow::anyhow!("Invalid multiplier {}: {e}", definition.multiplier))?;
+    let bitmex_currency = definition
+        .settl_currency
+        .as_ref()
+        .unwrap_or(&definition.quote_currency);
+    let divisor = bitmex_currency_divisor(bitmex_currency.as_str());
+    let value = raw.checked_div(divisor).ok_or_else(|| {
+        anyhow::anyhow!("Invalid multiplier divisor {divisor} for {bitmex_currency}")
+    })?;
+
+    Quantity::from_decimal_dp(value, settlement_currency.precision).map_err(Into::into)
 }
 
 /// Parse a BitMEX futures spread instrument into a Nautilus `InstrumentAny`.
@@ -636,6 +669,7 @@ pub fn parse_crypto_futures_spread_instrument(
         Some(margin_maint),
         Some(maker_fee),
         Some(taker_fee),
+        None,
         None,
         ts_event,
         ts_init,
@@ -933,7 +967,7 @@ pub fn parse_order_status_report(
     }
 
     if let Some(avg_px) = order.avg_px {
-        report = report.with_avg_px(avg_px)?;
+        report = report.with_avg_px(avg_px);
     }
 
     if let Some(trigger_price) = order.stop_px {
@@ -1195,6 +1229,20 @@ mod tests {
     }
 
     #[rstest]
+    fn test_parse_instrument_any_skips_unknown_instrument_state() {
+        let json_data = load_test_json("http_get_instrument_xbtusd.json");
+        let mut instrument: BitmexInstrument = serde_json::from_str(&json_data).unwrap();
+        instrument.state = BitmexInstrumentState::Unknown;
+
+        let result = parse_instrument_any(&instrument, UnixNanos::default());
+
+        assert!(
+            matches!(result, InstrumentParseResult::Inactive { .. }),
+            "expected Inactive for unknown state, was {result:?}"
+        );
+    }
+
+    #[rstest]
     fn test_parse_instrument_any_parses_active_crypto_futures_spread() {
         let json_data = load_test_json("http_get_instrument_xbtm26_xbtu26_spread.json");
         let instrument: BitmexInstrument = serde_json::from_str(&json_data).unwrap();
@@ -1262,7 +1310,10 @@ mod tests {
         assert_eq!(order2.ord_status, Some(BitmexOrderStatus::Filled));
         assert_eq!(order2.leaves_qty, Some(0));
         assert_eq!(order2.cum_qty, Some(200));
-        assert_eq!(order2.avg_px, Some(98950.5));
+        assert_eq!(
+            order2.avg_px,
+            Some(Decimal::from_str("98950.500000000004").unwrap())
+        );
     }
 
     #[rstest]
@@ -1640,7 +1691,7 @@ mod tests {
             triggered: None,
             working_indicator: Some(false),
             ord_rej_reason: None,
-            avg_px: Some(45050.0),
+            avg_px: Some(Decimal::from_str("45050.0").unwrap()),
             multi_leg_reporting_type: None,
             text: None,
             transact_time: Some(
@@ -1696,7 +1747,7 @@ mod tests {
             triggered: None,
             working_indicator: Some(true),
             ord_rej_reason: None,
-            avg_px: Some(48100.0),
+            avg_px: Some(Decimal::from_str("48100.0").unwrap()),
             multi_leg_reporting_type: None,
             text: None,
             transact_time: Some(
@@ -2984,12 +3035,51 @@ mod tests {
                 assert_eq!(perp.size_precision, 0);
                 assert_eq!(perp.price_increment.as_f64(), 0.5);
                 assert_eq!(perp.size_increment.as_f64(), 1.0);
+                assert_eq!(perp.multiplier, Quantity::from(100_000_000));
                 assert_eq!(perp.maker_fee.to_f64().unwrap(), -0.00025);
                 assert_eq!(perp.taker_fee.to_f64().unwrap(), 0.00075);
                 assert!(perp.is_inverse);
             }
             _ => panic!("Expected CryptoPerpetual variant"),
         }
+    }
+
+    #[rstest]
+    #[case("USD", "XBt", 1.0, "0.00000001", "0.00001300 XBT")]
+    #[case("USD", "XBt", 100.0, "0.00000100", "0.00130000 XBT")]
+    #[case("USD", "XBt", 1_000_000_000.0, "10.00000000", "13000.00000000 XBT")]
+    #[case("JPY", "USDt", 10_000.0, "0.01000000", "13.00000000 USDT")]
+    fn test_parse_quanto_perpetual_multiplier_in_settlement_units(
+        #[case] quote_currency: &str,
+        #[case] settl_currency: &str,
+        #[case] multiplier: f64,
+        #[case] expected_multiplier: &str,
+        #[case] expected_notional: &str,
+    ) {
+        let mut definition = create_test_perpetual_instrument();
+        definition.symbol = Ustr::from("ETHUSD");
+        definition.root_symbol = Ustr::from("ETH");
+        definition.underlying = Ustr::from("ETH");
+        definition.quote_currency = Ustr::from(quote_currency);
+        definition.lot_size = Some(1.0);
+        definition.multiplier = multiplier;
+        definition.settl_currency = Some(Ustr::from(settl_currency));
+        definition.underlying_to_position_multiplier = None;
+        definition.underlying_to_settle_multiplier = None;
+        definition.quote_to_settle_multiplier = Some(1_510.0);
+        definition.is_quanto = true;
+        definition.is_inverse = false;
+
+        let result = parse_perpetual_instrument(&definition, UnixNanos::default()).unwrap();
+        let InstrumentAny::CryptoPerpetual(instrument) = result else {
+            panic!("Expected CryptoPerpetual variant");
+        };
+        let notional =
+            instrument.calculate_notional_value(Quantity::from(1), Price::from("1300"), None);
+
+        assert!(instrument.is_quanto());
+        assert_eq!(instrument.multiplier, Quantity::from(expected_multiplier));
+        assert_eq!(notional, Money::from(expected_notional));
     }
 
     #[rstest]
@@ -3009,6 +3099,7 @@ mod tests {
                 assert_eq!(instrument.size_precision, 0);
                 assert_eq!(instrument.price_increment.as_f64(), 0.5);
                 assert_eq!(instrument.size_increment.as_f64(), 1.0);
+                assert_eq!(instrument.multiplier, Quantity::from(100_000_000));
                 assert_eq!(instrument.maker_fee.to_f64().unwrap(), -0.00025);
                 assert_eq!(instrument.taker_fee.to_f64().unwrap(), 0.00075);
                 assert!(instrument.is_inverse);
@@ -3018,6 +3109,33 @@ mod tests {
             }
             _ => panic!("Expected CryptoFuture variant"),
         }
+    }
+
+    #[rstest]
+    fn test_parse_quanto_futures_multiplier_in_settlement_units() {
+        let mut definition = create_test_futures_instrument();
+        definition.symbol = Ustr::from("ETHUSDU26");
+        definition.root_symbol = Ustr::from("ETH");
+        definition.underlying = Ustr::from("ETH");
+        definition.lot_size = Some(1.0);
+        definition.multiplier = 100.0;
+        definition.settl_currency = Some(Ustr::from("XBt"));
+        definition.underlying_to_position_multiplier = None;
+        definition.underlying_to_settle_multiplier = None;
+        definition.quote_to_settle_multiplier = Some(1_510.0);
+        definition.is_quanto = true;
+        definition.is_inverse = false;
+
+        let result = parse_futures_instrument(&definition, UnixNanos::default()).unwrap();
+        let InstrumentAny::CryptoFuture(instrument) = result else {
+            panic!("Expected CryptoFuture variant");
+        };
+        let notional =
+            instrument.calculate_notional_value(Quantity::from(1), Price::from("1300"), None);
+
+        assert!(instrument.is_quanto());
+        assert_eq!(instrument.multiplier, Quantity::from("0.00000100"));
+        assert_eq!(notional, Money::from("0.00130000 XBT"));
     }
 
     #[rstest]
@@ -3048,7 +3166,7 @@ mod tests {
             working_indicator: Some(false),
             ord_rej_reason: None,
             leaves_qty: Some(0), // No remaining quantity
-            avg_px: Some(50050.0),
+            avg_px: Some(Decimal::from_str("30000.500000000004").unwrap()),
             multi_leg_reporting_type: None,
             text: None,
             transact_time: Some(
@@ -3073,6 +3191,10 @@ mod tests {
         assert_eq!(report.order_status, OrderStatus::Filled);
         assert_eq!(report.account_id.to_string(), "BITMEX-123456");
         assert_eq!(report.filled_qty.as_f64(), 100.0);
+        assert_eq!(
+            report.avg_px,
+            Some(Decimal::from_str("30000.500000000004").unwrap())
+        );
     }
 
     #[rstest]
@@ -3274,7 +3396,7 @@ mod tests {
             working_indicator: None,
             ord_rej_reason: None,
             leaves_qty: Some(0),
-            avg_px: Some(50000.0),
+            avg_px: Some(Decimal::from_str("50000.0").unwrap()),
             multi_leg_reporting_type: None,
             text: None,
             transact_time: Some(

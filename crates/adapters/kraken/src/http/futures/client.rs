@@ -27,6 +27,7 @@ use std::{
 
 use ahash::AHashMap;
 use chrono::{DateTime, Utc};
+use nautilus_common::cache::InstrumentLookupError;
 use nautilus_core::{
     AtomicMap, AtomicTime, UUID4, consts::NAUTILUS_USER_AGENT, nanos::UnixNanos,
     time::get_atomic_clock_realtime,
@@ -49,7 +50,7 @@ use nautilus_network::{
     ratelimiter::quota::Quota,
     retry::{RetryConfig, RetryManager},
 };
-use rust_decimal::{Decimal, prelude::FromPrimitive};
+use rust_decimal::Decimal;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 use ustr::Ustr;
@@ -60,8 +61,8 @@ use crate::{
         consts::{KRAKEN_VENUE, NAUTILUS_KRAKEN_BROKER_ID},
         credential::KrakenCredential,
         enums::{
-            KrakenApiResult, KrakenEnvironment, KrakenFuturesOrderType, KrakenOrderSide,
-            KrakenProductType, KrakenSendStatus, KrakenTriggerSignal,
+            KrakenApiResult, KrakenEnvironment, KrakenFuturesOrderStatus, KrakenFuturesOrderType,
+            KrakenOrderSide, KrakenProductType, KrakenSendStatus, KrakenTriggerSignal,
         },
         parse::{
             bar_type_to_futures_resolution, parse_bar, parse_futures_fill_report,
@@ -72,6 +73,7 @@ use crate::{
         urls::get_kraken_http_base_url,
     },
     http::{
+        apply_count_limit,
         error::{KrakenHttpError, kraken_http_should_retry},
         models::OhlcData,
     },
@@ -1232,13 +1234,13 @@ impl KrakenFuturesHttpClient {
     pub async fn request_mark_price(
         &self,
         instrument_id: InstrumentId,
-    ) -> anyhow::Result<f64, KrakenHttpError> {
+    ) -> anyhow::Result<Decimal, KrakenHttpError> {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1263,13 +1265,13 @@ impl KrakenFuturesHttpClient {
     pub async fn request_index_price(
         &self,
         instrument_id: InstrumentId,
-    ) -> anyhow::Result<f64, KrakenHttpError> {
+    ) -> anyhow::Result<Decimal, KrakenHttpError> {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1301,9 +1303,9 @@ impl KrakenFuturesHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1312,9 +1314,13 @@ impl KrakenFuturesHttpClient {
         let since = start.map(|dt| dt.timestamp_millis());
         let before = end.map(|dt| dt.timestamp_millis());
 
+        // Executions are oldest-anchored for `sort=asc`; count-only fetches the
+        // newest page with `sort=desc` (reversed to ascending below)
+        let sort = if start.is_some() { "asc" } else { "desc" };
+
         let response = self
             .inner
-            .get_public_executions(&raw_symbol, since, before, Some("asc"), None)
+            .get_public_executions(&raw_symbol, since, before, Some(sort), None)
             .await?;
 
         let mut trades = Vec::new();
@@ -1322,20 +1328,18 @@ impl KrakenFuturesHttpClient {
         for element in &response.elements {
             let execution = &element.event.execution.execution;
             match parse_futures_public_execution(execution, &instrument, ts_init) {
-                Ok(trade_tick) => {
-                    trades.push(trade_tick);
-
-                    if let Some(limit_count) = limit
-                        && trades.len() >= limit_count as usize
-                    {
-                        return Ok(trades);
-                    }
-                }
+                Ok(trade_tick) => trades.push(trade_tick),
                 Err(e) => {
                     log::warn!("Failed to parse futures trade tick: {e}");
                 }
             }
         }
+
+        if start.is_none() {
+            trades.reverse();
+        }
+
+        apply_count_limit(&mut trades, start, limit);
 
         Ok(trades)
     }
@@ -1351,9 +1355,9 @@ impl KrakenFuturesHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1394,18 +1398,16 @@ impl KrakenFuturesHttpClient {
                         continue;
                     }
                     bars.push(bar);
-
-                    if let Some(limit_count) = limit
-                        && bars.len() >= limit_count as usize
-                    {
-                        return Ok(bars);
-                    }
                 }
                 Err(e) => {
                     log::warn!("Failed to parse futures bar: {e}");
                 }
             }
         }
+
+        // Kraken returns the page oldest-first; keep the most recent `limit`
+        // bars for count-only requests rather than the oldest (issue #4254).
+        apply_count_limit(&mut bars, start, limit);
 
         Ok(bars)
     }
@@ -1419,9 +1421,9 @@ impl KrakenFuturesHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1444,15 +1446,19 @@ impl KrakenFuturesHttpClient {
         // Pass sequence=0 so the snapshot does not advance the book's high-water sequence,
         // the WS subscription owns sequencing once it starts streaming deltas.
         for (i, level) in book_data.bids.iter().take(bid_limit).enumerate() {
-            let price = Price::new(level.price, price_precision);
-            let size = Quantity::new(level.qty, size_precision);
+            let price = Price::from_decimal_dp(level.price, price_precision)
+                .map_err(|e| KrakenHttpError::ParseError(e.to_string()))?;
+            let size = Quantity::from_decimal_dp(level.qty, size_precision)
+                .map_err(|e| KrakenHttpError::ParseError(e.to_string()))?;
             let order = BookOrder::new(OrderSide::Buy, price, size, i as u64);
             book.add(order, 0, 0, ts_event);
         }
 
         for (i, level) in book_data.asks.iter().take(ask_limit).enumerate() {
-            let price = Price::new(level.price, price_precision);
-            let size = Quantity::new(level.qty, size_precision);
+            let price = Price::from_decimal_dp(level.price, price_precision)
+                .map_err(|e| KrakenHttpError::ParseError(e.to_string()))?;
+            let size = Quantity::from_decimal_dp(level.qty, size_precision)
+                .map_err(|e| KrakenHttpError::ParseError(e.to_string()))?;
             let order = BookOrder::new(OrderSide::Sell, price, size, (bid_limit + i) as u64);
             book.add(order, 0, 0, ts_event);
         }
@@ -1474,9 +1480,9 @@ impl KrakenFuturesHttpClient {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
             .ok_or_else(|| {
-                KrakenHttpError::ParseError(format!(
-                    "Instrument not found in cache: {instrument_id}"
-                ))
+                KrakenHttpError::ParseError(
+                    InstrumentLookupError::not_found(instrument_id).to_string(),
+                )
             })?;
 
         let raw_symbol = instrument.raw_symbol().to_string();
@@ -1508,13 +1514,9 @@ impl KrakenFuturesHttpClient {
                 continue;
             }
 
-            let Some(rate) = Decimal::from_f64(entry.relative_funding_rate) else {
-                continue;
-            };
-
             rates.push(FundingRateUpdate::new(
                 instrument_id,
-                rate,
+                entry.relative_funding_rate,
                 None,
                 None,
                 ts_event,
@@ -1619,6 +1621,33 @@ impl KrakenFuturesHttpClient {
             anyhow::bail!("Failed to get open orders: {error_msg}");
         }
 
+        let position_sizes = if response
+            .open_orders
+            .iter()
+            .any(|order| order.unfilled_size.is_none())
+        {
+            match self.inner.get_open_positions().await {
+                Ok(response) if response.result == KrakenApiResult::Success => response
+                    .open_positions
+                    .into_iter()
+                    .map(|position| (position.symbol, position.size))
+                    .collect::<AHashMap<_, _>>(),
+                Ok(response) => {
+                    let error = response
+                        .error
+                        .unwrap_or_else(|| "Unknown error".to_string());
+                    log::warn!("Failed to get open positions for order quantities: {error}");
+                    AHashMap::new()
+                }
+                Err(e) => {
+                    log::warn!("Failed to get open positions for order quantities: {e}");
+                    AHashMap::new()
+                }
+            }
+        } else {
+            AHashMap::new()
+        };
+
         for order in &response.open_orders {
             if let Some(ref target_id) = instrument_id {
                 let instrument = self.get_cached_instrument(&target_id.symbol.inner());
@@ -1630,7 +1659,29 @@ impl KrakenFuturesHttpClient {
             }
 
             if let Some(instrument) = self.get_instrument_by_raw_symbol(&order.symbol) {
-                match parse_futures_order_status_report(order, &instrument, account_id, ts_init) {
+                let position_size = if order.unfilled_size.is_none()
+                    && matches!(
+                        order.order_type,
+                        KrakenFuturesOrderType::Stop
+                            | KrakenFuturesOrderType::StopLower
+                            | KrakenFuturesOrderType::StopLoss
+                            | KrakenFuturesOrderType::TakeProfit
+                    )
+                    && order.status == KrakenFuturesOrderStatus::Untouched
+                    && order.reduce_only == Some(true)
+                {
+                    position_sizes.get(&order.symbol).copied()
+                } else {
+                    None
+                };
+
+                match parse_futures_order_status_report(
+                    order,
+                    &instrument,
+                    account_id,
+                    position_size,
+                    ts_init,
+                ) {
                     Ok(report) => all_reports.push(report),
                     Err(e) => {
                         let order_id = &order.order_id;
@@ -1808,7 +1859,7 @@ impl KrakenFuturesHttpClient {
     ) -> anyhow::Result<KrakenFuturesSendOrderParams> {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let raw_symbol = instrument.raw_symbol().inner();
 
@@ -1935,7 +1986,7 @@ impl KrakenFuturesHttpClient {
     ) -> anyhow::Result<OrderStatusReport> {
         let instrument = self
             .get_cached_instrument(&instrument_id.symbol.inner())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let params = self.build_send_order_params(
             instrument_id,
@@ -1989,7 +2040,13 @@ impl KrakenFuturesHttpClient {
             .iter()
             .find(|o| o.order_id == venue_order_id)
         {
-            return parse_futures_order_status_report(order, &instrument, account_id, ts_init);
+            return parse_futures_order_status_report(
+                order,
+                &instrument,
+                account_id,
+                Some(quantity.as_decimal()),
+                ts_init,
+            );
         }
 
         // Order not in open orders - may have filled immediately (market order or aggressive limit)
@@ -2021,7 +2078,7 @@ impl KrakenFuturesHttpClient {
                     symbol: trigger_data.symbol.clone(),
                     side: trigger_data.side,
                     quantity: trigger_data.quantity,
-                    filled: 0.0,
+                    filled: Decimal::ZERO,
                     limit_price: trigger_data.limit_price,
                     stop_price: Some(trigger_data.trigger_price),
                     timestamp: trigger_data.timestamp.clone(),
@@ -2140,7 +2197,7 @@ impl KrakenFuturesHttpClient {
     ) -> anyhow::Result<()> {
         let _ = self
             .get_cached_instrument(&instrument_id.symbol.inner())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let order_id = venue_order_id.as_ref().map(|id| id.to_string());
         let cli_ord_id = client_order_id.as_ref().map(truncate_cl_ord_id);
@@ -2444,7 +2501,7 @@ impl KrakenFuturesHttpClient {
     ) -> anyhow::Result<KrakenFuturesEditOrderParams> {
         let _ = self
             .get_cached_instrument(&instrument_id.symbol.inner())
-            .ok_or_else(|| anyhow::anyhow!("Instrument not found in cache: {instrument_id}"))?;
+            .ok_or_else(|| InstrumentLookupError::not_found(instrument_id))?;
 
         let order_id = venue_order_id.as_ref().map(|id| id.to_string());
         let cli_ord_id = client_order_id.as_ref().map(truncate_cl_ord_id);
@@ -2497,7 +2554,7 @@ fn map_futures_trigger_signal(
 
 fn parse_multi_collateral_balances(account: &FuturesAccount, balances: &mut Vec<AccountBalance>) {
     for (currency_code, currency_info) in &account.currencies {
-        if currency_info.quantity == 0.0 {
+        if currency_info.quantity.is_zero() {
             continue;
         }
 
@@ -2513,7 +2570,7 @@ fn parse_multi_collateral_balances(account: &FuturesAccount, balances: &mut Vec<
         let available_amount = currency_info.available.unwrap_or(total_amount);
         let locked_amount = total_amount - available_amount;
 
-        push_balance_from_f64(
+        push_balance(
             balances,
             total_amount,
             locked_amount,
@@ -2525,36 +2582,24 @@ fn parse_multi_collateral_balances(account: &FuturesAccount, balances: &mut Vec<
     // Multi-collateral accounts track margin in USD even though the
     // actual collateral is held in various crypto currencies.
     if let Some(portfolio_value) = account.portfolio_value
-        && portfolio_value > 0.0
+        && portfolio_value > Decimal::ZERO
     {
         let usd_currency = Currency::USD();
         let available_usd = account.available_margin.unwrap_or(portfolio_value);
         let locked_usd = portfolio_value - available_usd;
 
-        push_balance_from_f64(balances, portfolio_value, locked_usd, usd_currency, "USD");
+        push_balance(balances, portfolio_value, locked_usd, usd_currency, "USD");
     }
 }
 
-// Kraken Futures serves balances as JSON numbers, which serde already parsed to
-// f64. Converting to Decimal here moves the value into the fixed-point
-// constructor; it does not recover any precision lost at the wire parse.
-fn push_balance_from_f64(
+fn push_balance(
     balances: &mut Vec<AccountBalance>,
-    total: f64,
-    locked: f64,
+    total: Decimal,
+    locked: Decimal,
     currency: Currency,
     ccy_label: &str,
 ) {
-    let Some(total_dec) = Decimal::from_f64(total) else {
-        log::warn!("Skipping {ccy_label} balance: non-finite total {total}");
-        return;
-    };
-    let Some(locked_dec) = Decimal::from_f64(locked) else {
-        log::warn!("Skipping {ccy_label} balance: non-finite locked {locked}");
-        return;
-    };
-
-    match AccountBalance::from_total_and_locked(total_dec, locked_dec, currency) {
+    match AccountBalance::from_total_and_locked(total, locked, currency) {
         Ok(balance) => balances.push(balance),
         Err(e) => log::warn!("Skipping {ccy_label} balance: {e}"),
     }
@@ -2562,27 +2607,23 @@ fn push_balance_from_f64(
 
 fn parse_multi_collateral_margins(account: &FuturesAccount, margins: &mut Vec<MarginBalance>) {
     if let Some(initial_margin) = account.initial_margin
-        && initial_margin > 0.0
+        && initial_margin > Decimal::ZERO
     {
         let usd_currency = Currency::USD();
         let maintenance = account
             .margin_requirements
             .as_ref()
             .and_then(|mr| mr.mm)
-            .unwrap_or(0.0);
+            .unwrap_or(Decimal::ZERO);
         // Kraken Futures reports cross-margin aggregates in USD; emit as an
         // account-wide entry keyed by USD.
-        margins.push(MarginBalance::new(
-            Money::new(initial_margin, usd_currency),
-            Money::new(maintenance, usd_currency),
-            None,
-        ));
+        push_margin(margins, initial_margin, maintenance, usd_currency);
     }
 }
 
 fn parse_margin_account_balances(account: &FuturesAccount, balances: &mut Vec<AccountBalance>) {
     for (currency_code, &amount) in &account.balances {
-        if amount == 0.0 {
+        if amount.is_zero() {
             continue;
         }
 
@@ -2601,28 +2642,42 @@ fn parse_margin_account_balances(account: &FuturesAccount, balances: &mut Vec<Ac
             .unwrap_or(amount);
         let locked = amount - available;
 
-        push_balance_from_f64(balances, amount, locked, currency, currency_code);
+        push_balance(balances, amount, locked, currency, currency_code);
     }
 }
 
 fn parse_margin_account_margins(account: &FuturesAccount, margins: &mut Vec<MarginBalance>) {
     if let Some(ref mr) = account.margin_requirements {
-        let im = mr.im.unwrap_or(0.0);
-        let mm = mr.mm.unwrap_or(0.0);
-        if im > 0.0 || mm > 0.0 {
+        let im = mr.im.unwrap_or(Decimal::ZERO);
+        let mm = mr.mm.unwrap_or(Decimal::ZERO);
+        if im > Decimal::ZERO || mm > Decimal::ZERO {
             let usd_currency = Currency::USD();
-            margins.push(MarginBalance::new(
-                Money::new(im, usd_currency),
-                Money::new(mm, usd_currency),
-                None,
-            ));
+            push_margin(margins, im, mm, usd_currency);
         }
+    }
+}
+
+fn push_margin(
+    margins: &mut Vec<MarginBalance>,
+    initial: Decimal,
+    maintenance: Decimal,
+    currency: Currency,
+) {
+    let initial = Money::from_decimal(initial, currency);
+    let maintenance = Money::from_decimal(maintenance, currency);
+
+    match (initial, maintenance) {
+        (Ok(initial), Ok(maintenance)) => {
+            margins.push(MarginBalance::new(initial, maintenance, None));
+        }
+        (Err(e), _) => log::warn!("Skipping margin balance with invalid initial margin: {e}"),
+        (_, Err(e)) => log::warn!("Skipping margin balance with invalid maintenance margin: {e}"),
     }
 }
 
 fn parse_cash_account_balances(account: &FuturesAccount, balances: &mut Vec<AccountBalance>) {
     for (currency_code, &amount) in &account.balances {
-        if amount == 0.0 {
+        if amount.is_zero() {
             continue;
         }
 
@@ -2634,7 +2689,7 @@ fn parse_cash_account_balances(account: &FuturesAccount, balances: &mut Vec<Acco
             CurrencyType::Crypto,
         );
 
-        push_balance_from_f64(balances, amount, 0.0, currency, currency_code);
+        push_balance(balances, amount, Decimal::ZERO, currency, currency_code);
     }
 }
 
@@ -2643,6 +2698,7 @@ mod tests {
     use ahash::AHashMap;
     use nautilus_model::instruments::CryptoPerpetual;
     use rstest::rstest;
+    use rust_decimal_macros::dec;
 
     use super::*;
 
@@ -2703,14 +2759,14 @@ mod tests {
             currencies: AHashMap::new(),
             auxiliary: None,
             margin_requirements: Some(FuturesMarginRequirements {
-                im: Some(500.0),
-                mm: Some(250.0),
+                im: Some(dec!(500)),
+                mm: Some(dec!(250)),
                 lt: None,
                 tt: None,
             }),
-            portfolio_value: Some(10000.0),
-            available_margin: Some(9500.0),
-            initial_margin: Some(500.0),
+            portfolio_value: Some(dec!(10000)),
+            available_margin: Some(dec!(9500)),
+            initial_margin: Some(dec!(500)),
             pnl: None,
         };
 
@@ -2721,8 +2777,8 @@ mod tests {
         let margin = &margins[0];
         assert!(margin.instrument_id.is_none());
         assert_eq!(margin.currency.code.as_str(), "USD");
-        assert_eq!(margin.initial.as_f64(), 500.0);
-        assert_eq!(margin.maintenance.as_f64(), 250.0);
+        assert_eq!(margin.initial.as_decimal(), dec!(500));
+        assert_eq!(margin.maintenance.as_decimal(), dec!(250));
     }
 
     #[rstest]
@@ -2735,7 +2791,7 @@ mod tests {
             margin_requirements: None,
             portfolio_value: None,
             available_margin: None,
-            initial_margin: Some(0.0),
+            initial_margin: Some(Decimal::ZERO),
             pnl: None,
         };
 
@@ -2753,8 +2809,8 @@ mod tests {
             currencies: AHashMap::new(),
             auxiliary: None,
             margin_requirements: Some(FuturesMarginRequirements {
-                im: Some(100.0),
-                mm: Some(50.0),
+                im: Some(dec!(100)),
+                mm: Some(dec!(50)),
                 lt: None,
                 tt: None,
             }),
@@ -2769,8 +2825,8 @@ mod tests {
 
         assert_eq!(margins.len(), 1);
         let margin = &margins[0];
-        assert_eq!(margin.initial.as_f64(), 100.0);
-        assert_eq!(margin.maintenance.as_f64(), 50.0);
+        assert_eq!(margin.initial.as_decimal(), dec!(100));
+        assert_eq!(margin.maintenance.as_decimal(), dec!(50));
     }
 
     #[rstest]
@@ -2799,10 +2855,10 @@ mod tests {
         currencies.insert(
             "BTC".to_string(),
             FuturesFlexCurrency {
-                quantity: 1.5,
+                quantity: dec!(1.5),
                 value: None,
                 collateral: None,
-                available: Some(1.2),
+                available: Some(dec!(1.2)),
             },
         );
 
@@ -2812,8 +2868,8 @@ mod tests {
             currencies,
             auxiliary: None,
             margin_requirements: None,
-            portfolio_value: Some(50000.0),
-            available_margin: Some(45000.0),
+            portfolio_value: Some(dec!(50000)),
+            available_margin: Some(dec!(45000)),
             initial_margin: None,
             pnl: None,
         };
@@ -2826,22 +2882,9 @@ mod tests {
     }
 
     #[rstest]
-    fn test_parse_margin_account_balances_free_is_derived_from_total_minus_locked() {
-        // `free` must be derived via Money fixed-point subtraction so the
-        // `AccountBalance` invariant `total == locked + free` holds exactly.
-        // Kraken's raw `af` can drift at currency precision and violate
-        // `AccountBalance::new_checked`.
+    fn test_parse_margin_account_balances_preserves_exact_values() {
         let mut bals = AHashMap::new();
-        // Values chosen so that Kraken's raw `af` rounds independently from
-        // `amount - af` at currency precision 8, producing a drifted sum when
-        // `free` is set directly from `af` instead of derived from `total - locked`.
-        // With these f64 values (constructed via arithmetic to hit precise bit
-        // patterns): round(amount * 1e8) = 1_000_000_003, round(af * 1e8) = 4,
-        // and round((amount - af) * 1e8) = 1_000_000_000, so 4 + 1_000_000_000
-        // != 1_000_000_003 and the old parse path violates the invariant.
-        let af_f = 35.0_f64 * 1e-9;
-        let amount_f = 10.0_f64 + af_f;
-        bals.insert("XBT".to_string(), amount_f);
+        bals.insert("XBT".to_string(), dec!(10.00000003));
 
         let account = FuturesAccount {
             account_type: KrakenFuturesAccountType::MarginAccount,
@@ -2851,7 +2894,7 @@ mod tests {
                 usd: None,
                 pv: None,
                 pnl: None,
-                af: Some(af_f),
+                af: Some(dec!(0.00000004)),
                 funding: None,
             }),
             margin_requirements: None,
@@ -2866,33 +2909,17 @@ mod tests {
 
         assert_eq!(balances.len(), 1);
         let balance = &balances[0];
-        // Invariant: total == locked + free (enforced by AccountBalance::new_checked,
-        // but assert here to pin the derivation property at the parse site).
+        assert_eq!(balance.total.as_decimal(), dec!(10.00000003));
+        assert_eq!(balance.locked.as_decimal(), dec!(9.99999999));
+        assert_eq!(balance.free.as_decimal(), dec!(0.00000004));
         assert_eq!(balance.total, balance.locked + balance.free);
-        // Free is the derived side (total - locked), not the raw `af` value.
-        assert_eq!(balance.free, balance.total - balance.locked);
-    }
-
-    #[rstest]
-    #[case::nan_total(f64::NAN, 0.0)]
-    #[case::infinity_total(f64::INFINITY, 0.0)]
-    #[case::neg_infinity_total(f64::NEG_INFINITY, 0.0)]
-    #[case::nan_locked(1.0, f64::NAN)]
-    #[case::infinity_locked(1.0, f64::INFINITY)]
-    fn test_push_balance_from_f64_skips_non_finite(#[case] total: f64, #[case] locked: f64) {
-        let currency = Currency::new("BTC", 8, 0, "BTC", CurrencyType::Crypto);
-        let mut balances = Vec::new();
-
-        push_balance_from_f64(&mut balances, total, locked, currency, "BTC");
-
-        assert!(balances.is_empty());
     }
 
     #[rstest]
     fn test_parse_cash_account_balances() {
         let mut bals = AHashMap::new();
-        bals.insert("ETH".to_string(), 10.0);
-        bals.insert("BTC".to_string(), 0.0); // zero, should be skipped
+        bals.insert("ETH".to_string(), dec!(10));
+        bals.insert("BTC".to_string(), Decimal::ZERO); // zero, should be skipped
 
         let account = FuturesAccount {
             account_type: KrakenFuturesAccountType::CashAccount,
@@ -2911,8 +2938,8 @@ mod tests {
 
         assert_eq!(balances.len(), 1);
         let balance = &balances[0];
-        assert_eq!(balance.total.as_f64(), 10.0);
-        assert_eq!(balance.locked.as_f64(), 0.0);
+        assert_eq!(balance.total.as_decimal(), dec!(10));
+        assert_eq!(balance.locked.as_decimal(), Decimal::ZERO);
     }
 
     #[rstest]
@@ -2989,6 +3016,7 @@ mod tests {
             4,
             Price::from("1"),
             Quantity::from("0.0001"),
+            None,
             None,
             None,
             None,

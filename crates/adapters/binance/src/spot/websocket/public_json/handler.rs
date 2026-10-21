@@ -35,7 +35,8 @@ use super::messages::{
     BinanceCombinedStreamEvent, BinanceSpotBookTickerMsg, BinanceSpotDepthDiffMsg,
     BinanceSpotKlineMsg, BinanceSpotPartialDepthMsg, BinanceSpotPartialDepthPayload,
     BinanceSpotPublicWsCommand, BinanceSpotPublicWsMessage, BinanceSpotServerShutdownMsg,
-    BinanceSpotTradeMsg, BinanceSpotWsErrorResponse, BinanceSpotWsResponse, BinanceWsSubscription,
+    BinanceSpotTickerMsg, BinanceSpotTradeMsg, BinanceSpotWsErrorResponse, BinanceSpotWsResponse,
+    BinanceWsSubscription,
 };
 use crate::common::{consts::BINANCE_RATE_LIMIT_KEY_SUBSCRIPTION, enums::BinanceWsEventType};
 
@@ -196,7 +197,7 @@ impl BinanceSpotPublicWsHandler {
         if let Ok(text) = std::str::from_utf8(&raw)
             && text == RECONNECTED
         {
-            log::info!("WebSocket reconnected signal received");
+            log::debug!("WebSocket reconnected signal received");
             return vec![BinanceSpotPublicWsMessage::Reconnected];
         }
 
@@ -333,6 +334,14 @@ impl BinanceSpotPublicWsHandler {
                 .ok()
                 .into_iter()
                 .collect(),
+            BinanceWsEventType::Ticker24Hr => {
+                serde_json::from_value::<BinanceSpotTickerMsg>(payload)
+                    .map(BinanceSpotPublicWsMessage::Ticker)
+                    .map_err(|e| log::warn!("Failed to parse Spot ticker: {e}"))
+                    .ok()
+                    .into_iter()
+                    .collect()
+            }
             _ => vec![BinanceSpotPublicWsMessage::RawJson(payload)],
         }
     }

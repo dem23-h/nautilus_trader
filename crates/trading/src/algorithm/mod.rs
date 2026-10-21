@@ -32,18 +32,18 @@
 //! 2. The order is routed to the algorithm's `{id}.execute` endpoint.
 //! 3. The algorithm receives the order via `on_order()`.
 //! 4. The algorithm spawns child orders using `spawn_market()`, `spawn_limit()`, etc.
-//! 5. Spawned orders are submitted through the RiskEngine.
+//! 5. Spawned orders are submitted through the `RiskEngine`.
 //! 6. The algorithm receives fill events and manages remaining quantity.
 
 pub mod config;
 pub mod core;
 pub mod twap;
 
-pub use core::{ExecutionAlgorithmCore, StrategyEventHandlers};
+pub use core::{ExecutionAlgorithmCore, ExecutionAlgorithmNative, StrategyEventHandlers};
 
 pub use config::{ExecutionAlgorithmConfig, ImportableExecAlgorithmConfig};
 use nautilus_common::{
-    actor::{DataActor, registry::try_get_actor_unchecked},
+    actor::{DataActor, DataActorNative, registry::try_get_actor_unchecked},
     enums::ComponentState,
     logging::{CMD, EVT, RECV, SEND},
     messages::execution::{CancelOrder, ModifyOrder, SubmitOrder, TradingCommand},
@@ -55,10 +55,10 @@ use nautilus_model::{
     enums::{OrderStatus, TimeInForce, TriggerType},
     events::{
         OrderAccepted, OrderCancelRejected, OrderCanceled, OrderDenied, OrderEmulated,
-        OrderEventAny, OrderExpired, OrderFilled, OrderInitialized, OrderModifyRejected,
-        OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased, OrderSubmitted,
-        OrderTriggered, OrderUpdated, PositionChanged, PositionClosed, PositionEvent,
-        PositionOpened,
+        OrderEventAny, OrderExpired, OrderFillVoided, OrderFilled, OrderInitialized,
+        OrderModifyRejected, OrderPendingCancel, OrderPendingUpdate, OrderRejected, OrderReleased,
+        OrderSubmitted, OrderTriggered, OrderUpdated, PositionChanged, PositionClosed,
+        PositionEvent, PositionOpened,
     },
     identifiers::{AccountId, ClientId, ExecAlgorithmId, PositionId, StrategyId, TraderId},
     orders::{LimitOrder, MarketOrder, MarketToLimitOrder, Order, OrderAny, OrderError, OrderList},
@@ -82,16 +82,19 @@ use ustr::Ustr;
 ///
 /// # Implementation
 ///
-/// User algorithms should implement the required methods and hold an
-/// [`ExecutionAlgorithmCore`] member. The struct should `Deref` and `DerefMut`
-/// to `ExecutionAlgorithmCore` (which itself derefs to `DataActorCore`).
+/// Use the `nautilus_execution_algorithm!` macro to generate the native runtime
+/// wiring and `ExecutionAlgorithm` implementation, including the required
+/// `on_order()` method. Normal execution algorithm logic should call facade
+/// methods such as `submit_order()`, `spawn_market()`, and
+/// `unsubscribe_all_strategy_events()`. Native runtime code that needs the
+/// internal core should use [`ExecutionAlgorithmNative`].
 pub trait ExecutionAlgorithm: DataActor {
-    /// Provides mutable access to the internal `ExecutionAlgorithmCore`.
-    fn core_mut(&mut self) -> &mut ExecutionAlgorithmCore;
-
     /// Returns the execution algorithm ID.
-    fn id(&mut self) -> ExecAlgorithmId {
-        self.core_mut().exec_algorithm_id
+    fn id(&self) -> ExecAlgorithmId
+    where
+        Self: ExecutionAlgorithmNative,
+    {
+        ExecutionAlgorithmNative::exec_algorithm_core(self).exec_algorithm_id
     }
 
     /// Executes a trading command.
@@ -106,27 +109,34 @@ pub trait ExecutionAlgorithm: DataActor {
     /// Returns an error if command handling fails.
     fn execute(&mut self, command: TradingCommand) -> anyhow::Result<()>
     where
+        Self: ExecutionAlgorithmNative,
         Self: 'static + std::fmt::Debug + Sized,
     {
-        let core = self.core_mut();
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
         if core.config.log_commands {
             let id = &core.actor.actor_id;
             log::info!("{id} {RECV}{CMD} {command:?}");
         }
 
-        if core.state() != ComponentState::Running {
+        if DataActorNative::core(core).state() != ComponentState::Running {
             return Ok(());
         }
 
         match command {
             TradingCommand::SubmitOrder(cmd) => {
                 self.subscribe_to_strategy_events(cmd.strategy_id);
-                let order = self.core_mut().get_order(&cmd.client_order_id)?;
+                let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
+                core.remember_submit_params(cmd.client_order_id, cmd.params.clone());
+                let order = core.get_order(&cmd.client_order_id)?;
                 self.on_order(order)
             }
             TradingCommand::SubmitOrderList(cmd) => {
                 self.subscribe_to_strategy_events(cmd.strategy_id);
-                let orders = self.core_mut().get_orders_for_list(&cmd.order_list)?;
+                let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
+                for client_order_id in &cmd.order_list.client_order_ids {
+                    core.remember_submit_params(*client_order_id, cmd.params.clone());
+                }
+                let orders = core.get_orders_for_list(&cmd.order_list)?;
                 self.on_order_list(cmd.order_list, orders)
             }
             TradingCommand::CancelOrder(cmd) => self.handle_cancel_order(cmd),
@@ -165,6 +175,73 @@ pub trait ExecutionAlgorithm: DataActor {
         Ok(())
     }
 
+    /// Denies an order by applying and publishing an `OrderDenied` event.
+    ///
+    /// An order absent from the cache is added first, with its `OrderInitialized` event published
+    /// before the denial. A closed cached order is left unchanged. Use an `OrderDeniedReason`
+    /// string for the standardized reason.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The algorithm is not registered with a trader.
+    /// - The order cannot be added to the cache.
+    /// - The denial cannot be applied, including an invalid order state transition.
+    ///
+    /// No event is published when the denial cannot be applied.
+    fn deny_order(&mut self, order: &OrderAny, reason: Ustr) -> anyhow::Result<()>
+    where
+        Self: ExecutionAlgorithmNative,
+    {
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
+        registered_trader_id(core)?;
+        let ts_now = core.clock_mut().timestamp_ns();
+        let event = OrderEventAny::Denied(OrderDenied::new(
+            order.trader_id(),
+            order.strategy_id(),
+            order.instrument_id(),
+            order.client_order_id(),
+            reason,
+            UUID4::new(),
+            ts_now,
+            ts_now,
+        ));
+
+        let publish_initialized = {
+            let cache_rc = core.cache_rc();
+            let mut cache = cache_rc.borrow_mut();
+
+            if cache
+                .order(&order.client_order_id())
+                .is_some_and(|cached_order| cached_order.is_closed())
+            {
+                return Ok(());
+            }
+
+            let publish_initialized = if cache.order_exists(&order.client_order_id()) {
+                false
+            } else {
+                cache.add_order(order.clone(), None, None, false)?;
+                true
+            };
+
+            cache.update_order(&event)?;
+            publish_initialized
+        };
+
+        if publish_initialized {
+            publish_order_initialized(order);
+        }
+        publish_order_event(&event);
+
+        // A denied order never executes, so its stored submit params are dropped here
+        // rather than waiting for an execution completion that will never arrive.
+        ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
+            .remove_submit_params(&order.client_order_id());
+
+        Ok(())
+    }
+
     /// Handles a cancel order command for algorithm-managed orders.
     ///
     /// This generates an internal cancel event and publishes it. The order
@@ -173,9 +250,12 @@ pub trait ExecutionAlgorithm: DataActor {
     /// # Errors
     ///
     /// Returns an error if cancellation fails.
-    fn handle_cancel_order(&mut self, command: CancelOrder) -> anyhow::Result<()> {
+    fn handle_cancel_order(&mut self, command: CancelOrder) -> anyhow::Result<()>
+    where
+        Self: ExecutionAlgorithmNative,
+    {
         let (order, is_pending_cancel) = {
-            let cache = self.core_mut().cache();
+            let cache = ExecutionAlgorithmNative::exec_algorithm_core_mut(self).cache_ref();
 
             let Some(order) = cache.order(&command.client_order_id) else {
                 log::warn!(
@@ -201,7 +281,7 @@ pub trait ExecutionAlgorithm: DataActor {
         let event = OrderEventAny::Canceled(self.generate_order_canceled(&order));
 
         let order = {
-            let cache_rc = self.core_mut().cache_rc();
+            let cache_rc = ExecutionAlgorithmNative::exec_algorithm_core_mut(self).cache_rc();
             let mut cache = cache_rc.borrow_mut();
             match cache.update_order(&event) {
                 Ok(order) => order,
@@ -220,13 +300,22 @@ pub trait ExecutionAlgorithm: DataActor {
 
         let topic = format!("events.order.{}", order.strategy_id());
         msgbus::publish_order_event(topic.into(), &event);
+        msgbus::publish_order_event(
+            msgbus::switchboard::get_order_canceled_topic(order.instrument_id()),
+            &event,
+        );
 
         Ok(())
     }
 
-    /// Generates an OrderCanceled event for an order.
-    fn generate_order_canceled(&mut self, order: &OrderAny) -> OrderCanceled {
-        let ts_now = self.core_mut().clock().timestamp_ns();
+    /// Generates an `OrderCanceled` event for an order.
+    fn generate_order_canceled(&mut self, order: &OrderAny) -> OrderCanceled
+    where
+        Self: ExecutionAlgorithmNative,
+    {
+        let ts_now = ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
+            .clock_mut()
+            .timestamp_ns();
 
         OrderCanceled::new(
             order.trader_id(),
@@ -242,18 +331,21 @@ pub trait ExecutionAlgorithm: DataActor {
         )
     }
 
-    /// Generates an OrderPendingUpdate event for an order.
-    fn generate_order_pending_update(&mut self, order: &OrderAny) -> OrderPendingUpdate {
-        let ts_now = self.core_mut().clock().timestamp_ns();
+    /// Generates an `OrderPendingUpdate` event for an order.
+    fn generate_order_pending_update(&mut self, order: &OrderAny) -> OrderPendingUpdate
+    where
+        Self: ExecutionAlgorithmNative,
+    {
+        let ts_now = ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
+            .clock_mut()
+            .timestamp_ns();
 
         OrderPendingUpdate::new(
             order.trader_id(),
             order.strategy_id(),
             order.instrument_id(),
             order.client_order_id(),
-            order
-                .account_id()
-                .expect("Order must have account_id for pending update"),
+            order.account_id(),
             UUID4::new(),
             ts_now,
             ts_now,
@@ -262,18 +354,21 @@ pub trait ExecutionAlgorithm: DataActor {
         )
     }
 
-    /// Generates an OrderPendingCancel event for an order.
-    fn generate_order_pending_cancel(&mut self, order: &OrderAny) -> OrderPendingCancel {
-        let ts_now = self.core_mut().clock().timestamp_ns();
+    /// Generates an `OrderPendingCancel` event for an order.
+    fn generate_order_pending_cancel(&mut self, order: &OrderAny) -> OrderPendingCancel
+    where
+        Self: ExecutionAlgorithmNative,
+    {
+        let ts_now = ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
+            .clock_mut()
+            .timestamp_ns();
 
         OrderPendingCancel::new(
             order.trader_id(),
             order.strategy_id(),
             order.instrument_id(),
             order.client_order_id(),
-            order
-                .account_id()
-                .expect("Order must have account_id for pending cancel"),
+            order.account_id(),
             UUID4::new(),
             ts_now,
             ts_now,
@@ -287,8 +382,8 @@ pub trait ExecutionAlgorithm: DataActor {
     /// Creates a new market order with:
     /// - A unique client order ID: `{primary_id}-E{sequence}`.
     /// - The primary order's trader ID, strategy ID, and instrument ID.
-    /// - The algorithm's exec_algorithm_id.
-    /// - exec_spawn_id set to the primary order's client order ID.
+    /// - The algorithm's `exec_algorithm_id`.
+    /// - `exec_spawn_id` set to the primary order's client order ID.
     ///
     /// If `reduce_primary` is true, the primary order's quantity will be reduced
     /// by the spawned quantity. If the spawned order is subsequently denied or
@@ -302,16 +397,19 @@ pub trait ExecutionAlgorithm: DataActor {
         reduce_only: bool,
         tags: Option<Vec<Ustr>>,
         reduce_primary: bool,
-    ) -> MarketOrder {
+    ) -> MarketOrder
+    where
+        Self: ExecutionAlgorithmNative,
+    {
         // Generate spawn ID first so we can track the reduction
-        let core = self.core_mut();
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
         let client_order_id = core.spawn_client_order_id(&primary.client_order_id());
-        let ts_init = core.clock().timestamp_ns();
+        let ts_init = core.clock_mut().timestamp_ns();
         let exec_algorithm_id = core.exec_algorithm_id;
 
         if reduce_primary {
             self.reduce_primary_order(primary, quantity);
-            self.core_mut()
+            ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
                 .track_pending_spawn_reduction(client_order_id, quantity);
         }
 
@@ -343,8 +441,8 @@ pub trait ExecutionAlgorithm: DataActor {
     /// Creates a new limit order with:
     /// - A unique client order ID: `{primary_id}-E{sequence}`
     /// - The primary order's trader ID, strategy ID, and instrument ID
-    /// - The algorithm's exec_algorithm_id
-    /// - exec_spawn_id set to the primary order's client order ID
+    /// - The algorithm's `exec_algorithm_id`
+    /// - `exec_spawn_id` set to the primary order's client order ID
     ///
     /// If `reduce_primary` is true, the primary order's quantity will be reduced
     /// by the spawned quantity. If the spawned order is subsequently denied or
@@ -364,16 +462,19 @@ pub trait ExecutionAlgorithm: DataActor {
         emulation_trigger: Option<TriggerType>,
         tags: Option<Vec<Ustr>>,
         reduce_primary: bool,
-    ) -> LimitOrder {
+    ) -> LimitOrder
+    where
+        Self: ExecutionAlgorithmNative,
+    {
         // Generate spawn ID first so we can track the reduction
-        let core = self.core_mut();
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
         let client_order_id = core.spawn_client_order_id(&primary.client_order_id());
-        let ts_init = core.clock().timestamp_ns();
+        let ts_init = core.clock_mut().timestamp_ns();
         let exec_algorithm_id = core.exec_algorithm_id;
 
         if reduce_primary {
             self.reduce_primary_order(primary, quantity);
-            self.core_mut()
+            ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
                 .track_pending_spawn_reduction(client_order_id, quantity);
         }
 
@@ -411,8 +512,8 @@ pub trait ExecutionAlgorithm: DataActor {
     /// Creates a new market-to-limit order with:
     /// - A unique client order ID: `{primary_id}-E{sequence}`
     /// - The primary order's trader ID, strategy ID, and instrument ID
-    /// - The algorithm's exec_algorithm_id
-    /// - exec_spawn_id set to the primary order's client order ID
+    /// - The algorithm's `exec_algorithm_id`
+    /// - `exec_spawn_id` set to the primary order's client order ID
     ///
     /// If `reduce_primary` is true, the primary order's quantity will be reduced
     /// by the spawned quantity. If the spawned order is subsequently denied or
@@ -430,16 +531,19 @@ pub trait ExecutionAlgorithm: DataActor {
         emulation_trigger: Option<TriggerType>,
         tags: Option<Vec<Ustr>>,
         reduce_primary: bool,
-    ) -> MarketToLimitOrder {
+    ) -> MarketToLimitOrder
+    where
+        Self: ExecutionAlgorithmNative,
+    {
         // Generate spawn ID first so we can track the reduction
-        let core = self.core_mut();
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
         let client_order_id = core.spawn_client_order_id(&primary.client_order_id());
-        let ts_init = core.clock().timestamp_ns();
+        let ts_init = core.clock_mut().timestamp_ns();
         let exec_algorithm_id = core.exec_algorithm_id;
 
         if reduce_primary {
             self.reduce_primary_order(primary, quantity);
-            self.core_mut()
+            ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
                 .track_pending_spawn_reduction(client_order_id, quantity);
         }
 
@@ -483,7 +587,10 @@ pub trait ExecutionAlgorithm: DataActor {
     /// # Panics
     ///
     /// Panics if `spawn_qty` exceeds the primary order's `leaves_qty`.
-    fn reduce_primary_order(&mut self, primary: &mut OrderAny, spawn_qty: Quantity) {
+    fn reduce_primary_order(&mut self, primary: &mut OrderAny, spawn_qty: Quantity)
+    where
+        Self: ExecutionAlgorithmNative,
+    {
         let leaves_qty = primary.leaves_qty();
         assert!(
             leaves_qty >= spawn_qty,
@@ -493,8 +600,8 @@ pub trait ExecutionAlgorithm: DataActor {
         let primary_qty = primary.quantity();
         let new_qty = Quantity::from_raw(primary_qty.raw - spawn_qty.raw, primary_qty.precision);
 
-        let core = self.core_mut();
-        let ts_now = core.clock().timestamp_ns();
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
+        let ts_now = core.clock_mut().timestamp_ns();
 
         let updated = OrderUpdated::new(
             primary.trader_id(),
@@ -531,14 +638,17 @@ pub trait ExecutionAlgorithm: DataActor {
     ///
     /// This is called when a spawned order fails before acceptance. The quantity
     /// that was deducted from the primary order is restored (up to the spawned
-    /// order's leaves_qty to handle partial fills).
-    fn restore_primary_order_quantity(&mut self, order: &OrderAny) {
+    /// order's `leaves_qty` to handle partial fills).
+    fn restore_primary_order_quantity(&mut self, order: &OrderAny)
+    where
+        Self: ExecutionAlgorithmNative,
+    {
         let Some(exec_spawn_id) = order.exec_spawn_id() else {
             return;
         };
 
         let reduction_qty = {
-            let core = self.core_mut();
+            let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
             core.take_pending_spawn_reduction(&order.client_order_id())
         };
 
@@ -547,7 +657,7 @@ pub trait ExecutionAlgorithm: DataActor {
         };
 
         let primary = {
-            let cache = self.core_mut().cache();
+            let cache = ExecutionAlgorithmNative::exec_algorithm_core_mut(self).cache_ref();
             cache.order(&exec_spawn_id).map(|o| o.clone())
         };
 
@@ -569,8 +679,8 @@ pub trait ExecutionAlgorithm: DataActor {
             primary.quantity().precision,
         );
 
-        let core = self.core_mut();
-        let ts_now = core.clock().timestamp_ns();
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
+        let ts_now = core.clock_mut().timestamp_ns();
 
         let updated = OrderUpdated::new(
             primary.trader_id(),
@@ -624,17 +734,25 @@ pub trait ExecutionAlgorithm: DataActor {
         order: OrderAny,
         position_id: Option<PositionId>,
         client_id: Option<ClientId>,
-    ) -> anyhow::Result<()> {
-        let core = self.core_mut();
+    ) -> anyhow::Result<()>
+    where
+        Self: ExecutionAlgorithmNative,
+    {
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
 
         let trader_id = registered_trader_id(core)?;
-        let ts_init = core.clock().timestamp_ns();
+        let ts_init = core.clock_mut().timestamp_ns();
 
         // For spawned orders, use the parent's strategy ID
         let strategy_id = order.strategy_id();
 
+        let primary_id = order
+            .exec_spawn_id()
+            .unwrap_or_else(|| order.client_order_id());
+        let params = core.submit_params(&primary_id);
+
         let order_exists = {
-            let cache = core.cache();
+            let cache = core.cache_ref();
             cache.order_exists(&order.client_order_id())
         };
 
@@ -657,7 +775,7 @@ pub trait ExecutionAlgorithm: DataActor {
             order.init_event().clone(),
             order.exec_algorithm_id(),
             position_id,
-            None, // params
+            params,
             UUID4::new(),
             ts_init,
             None, // correlation_id
@@ -688,7 +806,10 @@ pub trait ExecutionAlgorithm: DataActor {
         price: Option<Price>,
         trigger_price: Option<Price>,
         client_id: Option<ClientId>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        Self: ExecutionAlgorithmNative,
+    {
         let qty_changing = quantity.is_some_and(|q| q != order.quantity());
         let price_changing = price.is_some() && price != order.price();
         let trigger_changing = trigger_price.is_some() && trigger_price != order.trigger_price();
@@ -696,7 +817,7 @@ pub trait ExecutionAlgorithm: DataActor {
         if !qty_changing && !price_changing && !trigger_changing {
             log::error!(
                 "Cannot create command ModifyOrder: \
-                quantity, price and trigger were either None \
+                quantity, price, and trigger were either None \
                 or the same as existing values"
             );
             return Ok(());
@@ -710,7 +831,7 @@ pub trait ExecutionAlgorithm: DataActor {
             return Ok(());
         }
 
-        let core = self.core_mut();
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
         let trader_id = registered_trader_id(core)?;
         let strategy_id = order.strategy_id();
 
@@ -720,7 +841,7 @@ pub trait ExecutionAlgorithm: DataActor {
             let event = OrderEventAny::PendingUpdate(event);
 
             {
-                let cache_rc = self.core_mut().cache_rc();
+                let cache_rc = ExecutionAlgorithmNative::exec_algorithm_core_mut(self).cache_rc();
                 let mut cache = cache_rc.borrow_mut();
                 match cache.update_order(&event) {
                     Ok(updated) => *order = updated,
@@ -739,9 +860,15 @@ pub trait ExecutionAlgorithm: DataActor {
 
             let topic = format!("events.order.{strategy_id}");
             msgbus::publish_order_event(topic.into(), &event);
+            msgbus::publish_order_event(
+                msgbus::switchboard::get_order_pending_update_topic(order.instrument_id()),
+                &event,
+            );
         }
 
-        let ts_init = self.core_mut().clock().timestamp_ns();
+        let ts_init = ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
+            .clock_mut()
+            .timestamp_ns();
         let command = ModifyOrder::new(
             trader_id,
             client_id,
@@ -758,8 +885,13 @@ pub trait ExecutionAlgorithm: DataActor {
             None, // correlation_id
         );
 
-        if self.core_mut().config.log_commands {
-            let id = &self.core_mut().actor.actor_id;
+        if ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
+            .config
+            .log_commands
+        {
+            let id = &ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
+                .actor
+                .actor_id;
             log::info!("{id} {SEND}{CMD} {command:?}");
         }
 
@@ -799,7 +931,10 @@ pub trait ExecutionAlgorithm: DataActor {
         quantity: Option<Quantity>,
         price: Option<Price>,
         trigger_price: Option<Price>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        Self: ExecutionAlgorithmNative,
+    {
         // Validate order status
         let status = order.status();
         if status != OrderStatus::Initialized && status != OrderStatus::Released {
@@ -832,8 +967,8 @@ pub trait ExecutionAlgorithm: DataActor {
             anyhow::bail!("Cannot modify order in place: no parameters differ from current values");
         }
 
-        let core = self.core_mut();
-        let ts_now = core.clock().timestamp_ns();
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
+        let ts_now = core.clock_mut().timestamp_ns();
 
         let updated = OrderUpdated::new(
             order.trader_id(),
@@ -875,7 +1010,10 @@ pub trait ExecutionAlgorithm: DataActor {
         &mut self,
         order: &mut OrderAny,
         client_id: Option<ClientId>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<()>
+    where
+        Self: ExecutionAlgorithmNative,
+    {
         if order.is_closed() || order.is_pending_cancel() {
             log::warn!(
                 "Cannot cancel order: state is {:?}, {order:?}",
@@ -884,7 +1022,7 @@ pub trait ExecutionAlgorithm: DataActor {
             return Ok(());
         }
 
-        let core = self.core_mut();
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
         let trader_id = registered_trader_id(core)?;
         let strategy_id = order.strategy_id();
 
@@ -894,7 +1032,7 @@ pub trait ExecutionAlgorithm: DataActor {
             let event = OrderEventAny::PendingCancel(event);
 
             {
-                let cache_rc = self.core_mut().cache_rc();
+                let cache_rc = ExecutionAlgorithmNative::exec_algorithm_core_mut(self).cache_rc();
                 let mut cache = cache_rc.borrow_mut();
                 match cache.update_order(&event) {
                     Ok(updated) => *order = updated,
@@ -913,9 +1051,15 @@ pub trait ExecutionAlgorithm: DataActor {
 
             let topic = format!("events.order.{strategy_id}");
             msgbus::publish_order_event(topic.into(), &event);
+            msgbus::publish_order_event(
+                msgbus::switchboard::get_order_pending_cancel_topic(order.instrument_id()),
+                &event,
+            );
         }
 
-        let ts_init = self.core_mut().clock().timestamp_ns();
+        let ts_init = ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
+            .clock_mut()
+            .timestamp_ns();
         let command = CancelOrder::new(
             trader_id,
             client_id,
@@ -929,8 +1073,13 @@ pub trait ExecutionAlgorithm: DataActor {
             None, // correlation_id
         );
 
-        if self.core_mut().config.log_commands {
-            let id = &self.core_mut().actor.actor_id;
+        if ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
+            .config
+            .log_commands
+        {
+            let id = &ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
+                .actor
+                .actor_id;
             log::info!("{id} {SEND}{CMD} {command:?}");
         }
 
@@ -958,9 +1107,10 @@ pub trait ExecutionAlgorithm: DataActor {
     /// This is called automatically when the first order is received from a strategy.
     fn subscribe_to_strategy_events(&mut self, strategy_id: StrategyId)
     where
+        Self: ExecutionAlgorithmNative,
         Self: 'static + std::fmt::Debug + Sized,
     {
-        let core = self.core_mut();
+        let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
         if core.is_strategy_subscribed(&strategy_id) {
             return;
         }
@@ -1009,24 +1159,34 @@ pub trait ExecutionAlgorithm: DataActor {
     /// Unsubscribes from all strategy event handlers.
     ///
     /// This should be called before reset to properly clean up msgbus subscriptions.
-    fn unsubscribe_all_strategy_events(&mut self) {
-        let handlers = self.core_mut().take_strategy_event_handlers();
+    fn unsubscribe_all_strategy_events(&mut self)
+    where
+        Self: ExecutionAlgorithmNative,
+    {
+        let handlers =
+            ExecutionAlgorithmNative::exec_algorithm_core_mut(self).take_strategy_event_handlers();
+
         for (strategy_id, h) in handlers {
             msgbus::unsubscribe_order_events(h.order_topic.into(), &h.order_handler);
             msgbus::unsubscribe_position_events(h.position_topic.into(), &h.position_handler);
             log::info!("Unsubscribed from events for strategy {strategy_id}");
         }
-        self.core_mut().clear_subscribed_strategies();
+        ExecutionAlgorithmNative::exec_algorithm_core_mut(self).clear_subscribed_strategies();
     }
 
     /// Handles an order event, filtering for algorithm-owned orders.
-    fn handle_order_event(&mut self, event: OrderEventAny) {
-        if self.core_mut().state() != ComponentState::Running {
+    fn handle_order_event(&mut self, event: OrderEventAny)
+    where
+        Self: ExecutionAlgorithmNative,
+    {
+        if DataActorNative::core(ExecutionAlgorithmNative::exec_algorithm_core_mut(self)).state()
+            != ComponentState::Running
+        {
             return;
         }
 
         let order = {
-            let cache = self.core_mut().cache();
+            let cache = ExecutionAlgorithmNative::exec_algorithm_core_mut(self).cache_ref();
             cache.order(&event.client_order_id()).map(|o| o.clone())
         };
 
@@ -1043,7 +1203,7 @@ pub trait ExecutionAlgorithm: DataActor {
         }
 
         {
-            let core = self.core_mut();
+            let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
             if core.config.log_events {
                 let id = &core.actor.actor_id;
                 log::info!("{id} {RECV}{EVT} {event}");
@@ -1065,17 +1225,17 @@ pub trait ExecutionAlgorithm: DataActor {
             }
             OrderEventAny::Accepted(e) => {
                 // Commit reduction - order accepted by venue
-                self.core_mut()
+                ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
                     .take_pending_spawn_reduction(&order.client_order_id());
                 self.on_order_accepted(*e);
             }
             OrderEventAny::Canceled(e) => {
-                self.core_mut()
+                ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
                     .take_pending_spawn_reduction(&order.client_order_id());
                 self.on_algo_order_canceled(*e);
             }
             OrderEventAny::Expired(e) => {
-                self.core_mut()
+                ExecutionAlgorithmNative::exec_algorithm_core_mut(self)
                     .take_pending_spawn_reduction(&order.client_order_id());
                 self.on_order_expired(*e);
             }
@@ -1085,20 +1245,26 @@ pub trait ExecutionAlgorithm: DataActor {
             OrderEventAny::ModifyRejected(e) => self.on_order_modify_rejected(*e),
             OrderEventAny::CancelRejected(e) => self.on_order_cancel_rejected(*e),
             OrderEventAny::Updated(e) => self.on_order_updated(*e),
-            OrderEventAny::Filled(e) => self.on_algo_order_filled(*e),
+            OrderEventAny::Filled(e) => self.on_algo_order_filled(e.clone()),
+            OrderEventAny::FillVoided(e) => self.on_order_fill_voided(e),
         }
 
         self.on_order_event(event);
     }
 
     /// Handles a position event.
-    fn handle_position_event(&mut self, event: PositionEvent) {
-        if self.core_mut().state() != ComponentState::Running {
+    fn handle_position_event(&mut self, event: PositionEvent)
+    where
+        Self: ExecutionAlgorithmNative,
+    {
+        if DataActorNative::core(ExecutionAlgorithmNative::exec_algorithm_core_mut(self)).state()
+            != ComponentState::Running
+        {
             return;
         }
 
         {
-            let core = self.core_mut();
+            let core = ExecutionAlgorithmNative::exec_algorithm_core_mut(self);
             if core.config.log_events {
                 let id = &core.actor.actor_id;
                 log::info!("{id} {RECV}{EVT} {event:?}");
@@ -1122,7 +1288,10 @@ pub trait ExecutionAlgorithm: DataActor {
     /// # Errors
     ///
     /// Returns an error if start fails.
-    fn on_start(&mut self) -> anyhow::Result<()> {
+    fn on_start(&mut self) -> anyhow::Result<()>
+    where
+        Self: ExecutionAlgorithmNative,
+    {
         let id = self.id();
         log::info!("Starting {id}");
         Ok(())
@@ -1142,9 +1311,12 @@ pub trait ExecutionAlgorithm: DataActor {
     /// # Errors
     ///
     /// Returns an error if reset fails.
-    fn on_reset(&mut self) -> anyhow::Result<()> {
+    fn on_reset(&mut self) -> anyhow::Result<()>
+    where
+        Self: ExecutionAlgorithmNative,
+    {
         self.unsubscribe_all_strategy_events();
-        self.core_mut().reset();
+        ExecutionAlgorithmNative::exec_algorithm_core_mut(self).reset();
         Ok(())
     }
 
@@ -1223,6 +1395,10 @@ pub trait ExecutionAlgorithm: DataActor {
     #[allow(unused_variables)]
     fn on_algo_order_filled(&mut self, event: OrderFilled) {}
 
+    /// Called when an applied order fill is partly or fully voided.
+    #[allow(unused_variables)]
+    fn on_order_fill_voided(&mut self, event: &OrderFillVoided) {}
+
     /// Called for any order event (after specific handler).
     #[allow(unused_variables)]
     fn on_order_event(&mut self, event: OrderEventAny) {}
@@ -1255,7 +1431,8 @@ fn publish_order_event(event: &OrderEventAny) {
 }
 
 fn registered_trader_id(core: &ExecutionAlgorithmCore) -> anyhow::Result<TraderId> {
-    core.trader_id()
+    DataActorNative::core(core)
+        .trader_id()
         .ok_or_else(|| anyhow::anyhow!("ExecutionAlgorithm not registered: trader_id is not set"))
 }
 
@@ -1273,61 +1450,110 @@ mod tests {
     use std::{cell::RefCell, rc::Rc};
 
     use nautilus_common::{
-        actor::DataActor, cache::Cache, clock::TestClock, component::Component,
-        enums::ComponentTrigger, msgbus, msgbus::TypedHandler, nautilus_actor,
+        actor::DataActor,
+        cache::Cache,
+        clock::{Clock, TestClock},
+        component::Component,
+        enums::ComponentTrigger,
+        msgbus,
+        msgbus::TypedHandler,
     };
     use nautilus_model::{
-        enums::OrderSide,
+        enums::{OrderSide, OrderStatus, OrderType},
         events::{
-            OrderAccepted, OrderCanceled, OrderDenied, OrderRejected,
+            OrderAccepted, OrderCanceled, OrderDenied, OrderDeniedReason, OrderRejected,
             order::spec::{
-                OrderAcceptedSpec, OrderCanceledSpec, OrderDeniedSpec, OrderFilledSpec,
-                OrderRejectedSpec,
+                OrderAcceptedSpec, OrderCanceledSpec, OrderDeniedSpec, OrderFillVoidedSpec,
+                OrderFilledSpec, OrderRejectedSpec,
             },
         },
         identifiers::{
-            AccountId, ClientOrderId, ExecAlgorithmId, InstrumentId, StrategyId, TraderId,
-            VenueOrderId,
+            AccountId, ActorId, ClientOrderId, ComponentId, ExecAlgorithmId, InstrumentId,
+            StrategyId, TraderId, VenueOrderId,
         },
-        orders::{LimitOrder, MarketOrder, OrderAny, stubs::TestOrderStubs},
+        orders::{LimitOrder, MarketOrder, OrderAny, OrderTestBuilder, stubs::TestOrderStubs},
         types::{Price, Quantity},
     };
     use rstest::rstest;
 
     use super::*;
+    use crate::nautilus_execution_algorithm;
 
     #[derive(Debug)]
     struct TestAlgorithm {
         core: ExecutionAlgorithmCore,
-        on_order_called: bool,
-        last_order_client_id: Option<ClientOrderId>,
+        order_client_ids: Vec<ClientOrderId>,
     }
+
+    #[derive(Debug)]
+    struct CoreFreeExecutionAlgorithm {
+        state: ComponentState,
+        orders_seen: usize,
+    }
+
+    #[derive(Debug)]
+    struct MacroTestCustomField {
+        inner: ExecutionAlgorithmCore,
+    }
+
+    impl Component for CoreFreeExecutionAlgorithm {
+        fn component_id(&self) -> ComponentId {
+            ComponentId::new("CoreFreeExecutionAlgorithm")
+        }
+
+        fn state(&self) -> ComponentState {
+            self.state
+        }
+
+        fn transition_state(&mut self, trigger: ComponentTrigger) -> anyhow::Result<()> {
+            self.state = self.state.transition(&trigger)?;
+            Ok(())
+        }
+
+        fn register(
+            &mut self,
+            _trader_id: TraderId,
+            _clock: Rc<RefCell<dyn Clock>>,
+            _cache: Rc<RefCell<Cache>>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl DataActor for CoreFreeExecutionAlgorithm {}
+
+    impl ExecutionAlgorithm for CoreFreeExecutionAlgorithm {
+        fn on_order(&mut self, _order: OrderAny) -> anyhow::Result<()> {
+            self.orders_seen += 1;
+            Ok(())
+        }
+    }
+
+    impl DataActor for MacroTestCustomField {}
+
+    nautilus_execution_algorithm!(MacroTestCustomField, inner, {
+        fn on_order(&mut self, _order: OrderAny) -> anyhow::Result<()> {
+            Ok(())
+        }
+    });
 
     impl TestAlgorithm {
         fn new(config: ExecutionAlgorithmConfig) -> Self {
             Self {
                 core: ExecutionAlgorithmCore::new(config),
-                on_order_called: false,
-                last_order_client_id: None,
+                order_client_ids: Vec::new(),
             }
         }
     }
 
     impl DataActor for TestAlgorithm {}
 
-    nautilus_actor!(TestAlgorithm);
-
-    impl ExecutionAlgorithm for TestAlgorithm {
-        fn core_mut(&mut self) -> &mut ExecutionAlgorithmCore {
-            &mut self.core
-        }
-
+    nautilus_execution_algorithm!(TestAlgorithm, {
         fn on_order(&mut self, order: OrderAny) -> anyhow::Result<()> {
-            self.on_order_called = true;
-            self.last_order_client_id = Some(order.client_order_id());
+            self.order_client_ids.push(order.client_order_id());
             Ok(())
         }
-    }
+    });
 
     fn create_test_algorithm() -> TestAlgorithm {
         // Use unique ID to avoid thread-local registry/msgbus conflicts in parallel tests
@@ -1374,9 +1600,8 @@ mod tests {
     #[rstest]
     fn test_algorithm_creation() {
         let algo = create_test_algorithm();
-        assert!(algo.core.exec_algorithm_id.inner().starts_with("TEST-"));
-        assert!(!algo.on_order_called);
-        assert!(algo.last_order_client_id.is_none());
+        assert!(algo.id().inner().starts_with("TEST-"));
+        assert!(algo.order_client_ids.is_empty());
     }
 
     #[rstest]
@@ -1384,8 +1609,191 @@ mod tests {
         let mut algo = create_test_algorithm();
         register_algorithm(&mut algo);
 
-        assert!(algo.core.trader_id().is_some());
-        assert_eq!(algo.core.trader_id(), Some(TraderId::from("TRADER-001")));
+        assert_eq!(algo.trader_id(), Some(TraderId::from("TRADER-001")));
+    }
+
+    #[rstest]
+    fn test_algorithm_deny_order_updates_cache_and_publishes_once() {
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let strategy_id = StrategyId::from("STRAT-ALGO-DENY");
+        let order = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            strategy_id,
+            InstrumentId::from("BTC/USDT.BINANCE"),
+            ClientOrderId::from("O-ALGO-DENY"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        {
+            let cache_rc = algo.core.cache_rc();
+            cache_rc
+                .borrow_mut()
+                .add_order(order.clone(), None, None, false)
+                .unwrap();
+        }
+        let reason = OrderDeniedReason::ValidationFailed {
+            detail: "invalid execution schedule".to_string(),
+        }
+        .to_string();
+        let reason = Ustr::from(&reason);
+        let (handler, events) = subscribe_order_topic(strategy_id);
+
+        algo.deny_order(&order, reason).unwrap();
+        algo.deny_order(&order, reason).unwrap();
+
+        msgbus::unsubscribe_order_events(format!("events.order.{strategy_id}").into(), &handler);
+        let cached_order = algo.cache().order(&order.client_order_id()).unwrap();
+        let events = events.borrow();
+
+        assert_eq!(cached_order.status(), OrderStatus::Denied);
+        assert_eq!(events.len(), 1);
+        assert!(matches!(
+            &events[0],
+            OrderEventAny::Denied(event)
+                if event.reason == reason
+                    && event.strategy_id == strategy_id
+                    && event.client_order_id == order.client_order_id()
+        ));
+    }
+
+    #[rstest]
+    fn test_algorithm_deny_order_initializes_missing_order_once() {
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let strategy_id = StrategyId::from("STRAT-ALGO-DENY-MISSING");
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .strategy_id(strategy_id)
+            .instrument_id(InstrumentId::from("BTC/USDT.BINANCE"))
+            .client_order_id(ClientOrderId::from("O-ALGO-DENY-MISSING"))
+            .quantity(Quantity::from("1.0"))
+            .build();
+        let reason = Ustr::from("VALIDATION_FAILED: invalid execution schedule");
+        let (handler, events) = subscribe_order_topic(strategy_id);
+
+        algo.deny_order(&order, reason).unwrap();
+        algo.deny_order(&order, reason).unwrap();
+
+        msgbus::unsubscribe_order_events(format!("events.order.{strategy_id}").into(), &handler);
+        let cached_order = algo.cache().order(&order.client_order_id()).unwrap();
+        let events = events.borrow();
+
+        assert_eq!(cached_order.status(), OrderStatus::Denied);
+        assert_eq!(cached_order.event_count(), 2);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            OrderEventAny::Initialized(event)
+                if event.strategy_id == strategy_id
+                    && event.client_order_id == order.client_order_id()
+        ));
+        assert!(matches!(
+            &events[1],
+            OrderEventAny::Denied(event)
+                if event.reason == reason
+                    && event.strategy_id == strategy_id
+                    && event.client_order_id == order.client_order_id()
+        ));
+    }
+
+    #[rstest]
+    fn test_algorithm_deny_order_does_not_publish_when_apply_fails() {
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let strategy_id = StrategyId::from("STRAT-ALGO-DENY-APPLY");
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .strategy_id(strategy_id)
+            .instrument_id(InstrumentId::from("BTC/USDT.BINANCE"))
+            .client_order_id(ClientOrderId::from("O-ALGO-DENY-APPLY"))
+            .quantity(Quantity::from("1.0"))
+            .build();
+        let order = TestOrderStubs::make_accepted_order(&order);
+        {
+            let cache_rc = algo.core.cache_rc();
+            cache_rc
+                .borrow_mut()
+                .add_order(order.clone(), None, None, false)
+                .unwrap();
+        }
+        let (handler, events) = subscribe_order_topic(strategy_id);
+
+        let mut params = nautilus_core::Params::new();
+        params.insert(
+            "route".to_string(),
+            serde_json::Value::String("A".to_string()),
+        );
+        algo.core
+            .remember_submit_params(order.client_order_id(), Some(params));
+
+        let error = algo
+            .deny_order(
+                &order,
+                Ustr::from("VALIDATION_FAILED: invalid execution schedule"),
+            )
+            .unwrap_err();
+
+        msgbus::unsubscribe_order_events(format!("events.order.{strategy_id}").into(), &handler);
+        let cached_order = algo.cache().order(&order.client_order_id()).unwrap();
+
+        assert!(matches!(
+            error.downcast_ref::<OrderError>(),
+            Some(OrderError::InvalidStateTransition)
+        ));
+        assert_eq!(cached_order.status(), OrderStatus::Accepted);
+        assert!(events.borrow().is_empty());
+        // A failed denial is not terminal, so the submit params must be retained
+        assert!(algo.core.submit_params(&order.client_order_id()).is_some());
+    }
+
+    #[rstest]
+    fn test_algorithm_deny_order_removes_submit_params() {
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let strategy_id = StrategyId::from("STRAT-ALGO-DENY-PARAMS");
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .strategy_id(strategy_id)
+            .instrument_id(InstrumentId::from("BTC/USDT.BINANCE"))
+            .client_order_id(ClientOrderId::from("O-ALGO-DENY-PARAMS"))
+            .quantity(Quantity::from("1.0"))
+            .build();
+        {
+            let cache_rc = algo.core.cache_rc();
+            cache_rc
+                .borrow_mut()
+                .add_order(order.clone(), None, None, false)
+                .unwrap();
+        }
+
+        let mut params = nautilus_core::Params::new();
+        params.insert(
+            "route".to_string(),
+            serde_json::Value::String("A".to_string()),
+        );
+        algo.core
+            .remember_submit_params(order.client_order_id(), Some(params));
+        assert!(algo.core.submit_params(&order.client_order_id()).is_some());
+
+        algo.deny_order(&order, Ustr::from("VALIDATION_FAILED: test"))
+            .unwrap();
+
+        assert!(algo.core.submit_params(&order.client_order_id()).is_none());
     }
 
     #[rstest]
@@ -1460,8 +1868,42 @@ mod tests {
 
     #[rstest]
     fn test_algorithm_id() {
-        let mut algo = create_test_algorithm();
+        let algo = create_test_algorithm();
         assert!(algo.id().inner().starts_with("TEST-"));
+    }
+
+    #[rstest]
+    fn test_execution_algorithm_behavior_does_not_require_native_core_access() {
+        fn assert_execution_algorithm<T: ExecutionAlgorithm + DataActor + Component>() {}
+
+        assert_execution_algorithm::<CoreFreeExecutionAlgorithm>();
+
+        let mut algorithm = CoreFreeExecutionAlgorithm {
+            state: ComponentState::PreInitialized,
+            orders_seen: 0,
+        };
+        let order = OrderTestBuilder::new(OrderType::Market)
+            .instrument_id(InstrumentId::from("BTC/USDT.BINANCE"))
+            .quantity(Quantity::from("1.0"))
+            .build();
+
+        algorithm.on_order(order).unwrap();
+
+        assert_eq!(algorithm.orders_seen, 1);
+    }
+
+    #[rstest]
+    fn test_nautilus_execution_algorithm_macro_custom_field() {
+        let exec_algorithm_id = ExecAlgorithmId::from("MACRO-001");
+        let algorithm = MacroTestCustomField {
+            inner: ExecutionAlgorithmCore::new(ExecutionAlgorithmConfig {
+                exec_algorithm_id: Some(exec_algorithm_id),
+                ..Default::default()
+            }),
+        };
+
+        assert_eq!(algorithm.id(), exec_algorithm_id);
+        assert_eq!(algorithm.actor_id(), ActorId::from("MACRO-001"));
     }
 
     #[rstest]
@@ -1587,6 +2029,7 @@ mod tests {
         algo.on_order_cancel_rejected(OrderCancelRejected::default());
         algo.on_order_updated(OrderUpdated::default());
         algo.on_algo_order_filled(OrderFilledSpec::builder().build());
+        algo.on_order_fill_voided(&OrderFillVoidedSpec::builder().build());
     }
 
     #[rstest]
@@ -1774,12 +2217,13 @@ mod tests {
         params.insert(ustr::Ustr::from("interval_secs"), ustr::Ustr::from("10"));
         let primary_tags = vec![ustr::Ustr::from("PRIMARY_TAG")];
         let linked_order_ids = vec![ClientOrderId::from("LINK-1")];
+        let client_order_id = ClientOrderId::from("O-001");
 
         let mut primary = OrderAny::Market(MarketOrder::new(
             TraderId::from("TRADER-001"),
             StrategyId::from("STRAT-001"),
             InstrumentId::from("BTC/USDT.BINANCE"),
-            ClientOrderId::from("O-001"),
+            client_order_id,
             OrderSide::Buy,
             Quantity::from("1.0"),
             TimeInForce::Gtc,
@@ -1793,7 +2237,7 @@ mod tests {
             None, // parent_order_id
             Some(algo.id()),
             Some(params.clone()),
-            None, // exec_spawn_id
+            Some(client_order_id),
             Some(primary_tags.clone()),
         ));
 
@@ -2071,6 +2515,193 @@ mod tests {
         assert_eq!(spawned.quantity, Quantity::from("0.4"));
         assert_eq!(primary.quantity(), Quantity::from("0.6"));
     }
+    #[rstest]
+    fn test_algorithm_forwards_captured_params_to_spawned_order() {
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let strategy_id = StrategyId::from("STRAT-FWD-001");
+        let mut primary = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            strategy_id,
+            InstrumentId::from("BTC/USDT.BINANCE"),
+            ClientOrderId::from("O-FWD-001"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        {
+            let cache_rc = algo.core.cache_rc();
+            let mut cache = cache_rc.borrow_mut();
+            cache.add_order(primary.clone(), None, None, true).unwrap();
+        }
+
+        let mut params = nautilus_core::Params::new();
+        params.insert("is_leverage".to_string(), serde_json::Value::Bool(true));
+        let command = SubmitOrder::new(
+            TraderId::from("TRADER-001"),
+            None,
+            strategy_id,
+            primary.instrument_id(),
+            primary.client_order_id(),
+            primary.init_event().clone(),
+            primary.exec_algorithm_id(),
+            None,
+            Some(params),
+            UUID4::new(),
+            0.into(),
+            None,
+        );
+        algo.execute(TradingCommand::SubmitOrder(command)).unwrap();
+
+        let received = Rc::new(RefCell::new(None::<SubmitOrder>));
+        let handler = msgbus::TypedIntoHandler::from({
+            let captured = received.clone();
+            move |cmd: TradingCommand| {
+                if let TradingCommand::SubmitOrder(cmd) = cmd {
+                    *captured.borrow_mut() = Some(cmd);
+                }
+            }
+        });
+        msgbus::register_trading_command_endpoint(
+            MessagingSwitchboard::risk_engine_execute(),
+            handler,
+        );
+
+        let spawned = algo.spawn_market(
+            &mut primary,
+            Quantity::from("0.4"),
+            TimeInForce::Ioc,
+            false,
+            None,
+            false, // reduce_primary
+        );
+        algo.submit_order(OrderAny::Market(spawned), None, None)
+            .unwrap();
+
+        let captured = received.borrow();
+        let cmd = captured.as_ref().expect("expected a forwarded SubmitOrder");
+        assert_eq!(cmd.client_order_id, ClientOrderId::from("O-FWD-001-E1"));
+        assert_eq!(
+            cmd.params.as_ref().and_then(|p| p.get_bool("is_leverage")),
+            Some(true),
+        );
+    }
+
+    #[rstest]
+    fn test_algorithm_submit_order_list_captures_params_per_order() {
+        use nautilus_common::messages::execution::SubmitOrderList;
+        use nautilus_model::identifiers::OrderListId;
+
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let strategy_id = StrategyId::from("STRAT-LIST-001");
+        let order1 = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            strategy_id,
+            InstrumentId::from("BTC/USDT.BINANCE"),
+            ClientOrderId::from("O-LIST-001"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let order2 = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            strategy_id,
+            InstrumentId::from("BTC/USDT.BINANCE"),
+            ClientOrderId::from("O-LIST-002"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        {
+            let cache_rc = algo.core.cache_rc();
+            let mut cache = cache_rc.borrow_mut();
+            cache.add_order(order1.clone(), None, None, true).unwrap();
+            cache.add_order(order2.clone(), None, None, true).unwrap();
+        }
+
+        let order_list = OrderList::new(
+            OrderListId::from("OL-001"),
+            order1.instrument_id(),
+            strategy_id,
+            vec![order1.client_order_id(), order2.client_order_id()],
+            0.into(),
+        );
+
+        let mut params = nautilus_core::Params::new();
+        params.insert("is_leverage".to_string(), serde_json::Value::Bool(true));
+        let command = SubmitOrderList::new(
+            TraderId::from("TRADER-001"),
+            None,
+            strategy_id,
+            order_list,
+            vec![order1.init_event().clone(), order2.init_event().clone()],
+            order1.exec_algorithm_id(),
+            None,
+            Some(params),
+            UUID4::new(),
+            0.into(),
+            None,
+        );
+        algo.execute(TradingCommand::SubmitOrderList(command))
+            .unwrap();
+
+        assert_eq!(
+            algo.order_client_ids,
+            [
+                ClientOrderId::from("O-LIST-001"),
+                ClientOrderId::from("O-LIST-002"),
+            ],
+        );
+
+        for id in ["O-LIST-001", "O-LIST-002"] {
+            assert_eq!(
+                algo.core
+                    .submit_params(&ClientOrderId::from(id))
+                    .and_then(|p| p.get_bool("is_leverage")),
+                Some(true),
+                "expected forwarded params for {id}",
+            );
+        }
+    }
 
     #[rstest]
     fn test_algorithm_generate_order_canceled() {
@@ -2105,6 +2736,74 @@ mod tests {
         assert_eq!(event.strategy_id, StrategyId::from("STRAT-001"));
         assert_eq!(event.instrument_id, InstrumentId::from("BTC/USDT.BINANCE"));
         assert_eq!(event.client_order_id, ClientOrderId::from("O-001"));
+    }
+
+    #[rstest]
+    fn test_algorithm_handle_cancel_order_publishes_instrument_canceled_topic() {
+        let mut algo = create_test_algorithm();
+        register_algorithm(&mut algo);
+
+        let strategy_id = StrategyId::from("STRAT-ALGO-CANCEL-PUBLISH");
+        let instrument_id = InstrumentId::from("BTC/USDT.BINANCE");
+        let order = OrderAny::Market(MarketOrder::new(
+            TraderId::from("TRADER-001"),
+            strategy_id,
+            instrument_id,
+            ClientOrderId::from("O-ALGO-CANCEL"),
+            OrderSide::Buy,
+            Quantity::from("1.0"),
+            TimeInForce::Gtc,
+            UUID4::new(),
+            0.into(),
+            false,
+            false,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let order = TestOrderStubs::make_accepted_order(&order);
+
+        {
+            let cache_rc = algo.core.cache_rc();
+            let mut cache = cache_rc.borrow_mut();
+            cache.add_order(order.clone(), None, None, false).unwrap();
+        }
+
+        let received = Rc::new(RefCell::new(Vec::<OrderEventAny>::new()));
+        let handler = TypedHandler::from({
+            let received = received.clone();
+            move |event: &OrderEventAny| {
+                received.borrow_mut().push(event.clone());
+            }
+        });
+        let topic = msgbus::switchboard::get_order_canceled_topic(instrument_id);
+        msgbus::subscribe_order_events(topic.into(), handler.clone(), None);
+
+        let command = CancelOrder::new(
+            order.trader_id(),
+            None,
+            strategy_id,
+            instrument_id,
+            order.client_order_id(),
+            order.venue_order_id(),
+            UUID4::new(),
+            0.into(),
+            None,
+            None,
+        );
+        algo.handle_cancel_order(command).unwrap();
+
+        msgbus::unsubscribe_order_events(topic.into(), &handler);
+        let received = received.borrow();
+        assert_eq!(received.len(), 1);
+        assert!(matches!(received[0], OrderEventAny::Canceled(_)));
+        assert_eq!(received[0].client_order_id(), order.client_order_id());
+        assert_eq!(received[0].instrument_id(), instrument_id);
     }
 
     #[rstest]
@@ -2217,12 +2916,13 @@ mod tests {
 
         let instrument_id = InstrumentId::from("BTC/USDT.BINANCE");
         let exec_algorithm_id = algo.id();
+        let client_order_id = ClientOrderId::from("O-001");
 
         let mut primary = OrderAny::Market(MarketOrder::new(
             TraderId::from("TRADER-001"),
             StrategyId::from("STRAT-001"),
             instrument_id,
-            ClientOrderId::from("O-001"),
+            client_order_id,
             OrderSide::Buy,
             Quantity::from("1.0"),
             TimeInForce::Gtc,
@@ -2236,7 +2936,7 @@ mod tests {
             None,
             Some(exec_algorithm_id),
             None,
-            None,
+            Some(client_order_id),
             None,
         ));
 
@@ -2282,13 +2982,7 @@ mod tests {
 
         algo.handle_order_event(OrderEventAny::Denied(denied));
 
-        let restored_primary = {
-            let cache = algo.core.cache();
-            cache
-                .order(&ClientOrderId::from("O-001"))
-                .map(|o| o.clone())
-                .unwrap()
-        };
+        let restored_primary = algo.cache().order(&client_order_id).unwrap();
         assert_eq!(restored_primary.quantity(), Quantity::from("1.0"));
     }
 
@@ -2299,12 +2993,13 @@ mod tests {
 
         let instrument_id = InstrumentId::from("BTC/USDT.BINANCE");
         let exec_algorithm_id = algo.id();
+        let client_order_id = ClientOrderId::from("O-001");
 
         let mut primary = OrderAny::Market(MarketOrder::new(
             TraderId::from("TRADER-001"),
             StrategyId::from("STRAT-001"),
             instrument_id,
-            ClientOrderId::from("O-001"),
+            client_order_id,
             OrderSide::Buy,
             Quantity::from("1.0"),
             TimeInForce::Gtc,
@@ -2318,7 +3013,7 @@ mod tests {
             None,
             Some(exec_algorithm_id),
             None,
-            None,
+            Some(client_order_id),
             None,
         ));
 
@@ -2367,13 +3062,7 @@ mod tests {
 
         algo.handle_order_event(OrderEventAny::Rejected(rejected));
 
-        let restored_primary = {
-            let cache = algo.core.cache();
-            cache
-                .order(&ClientOrderId::from("O-001"))
-                .map(|o| o.clone())
-                .unwrap()
-        };
+        let restored_primary = algo.cache().order(&client_order_id).unwrap();
         assert_eq!(restored_primary.quantity(), Quantity::from("1.0"));
     }
 
@@ -2384,12 +3073,13 @@ mod tests {
 
         let instrument_id = InstrumentId::from("BTC/USDT.BINANCE");
         let exec_algorithm_id = algo.id();
+        let client_order_id = ClientOrderId::from("O-001");
 
         let mut primary = OrderAny::Market(MarketOrder::new(
             TraderId::from("TRADER-001"),
             StrategyId::from("STRAT-001"),
             instrument_id,
-            ClientOrderId::from("O-001"),
+            client_order_id,
             OrderSide::Buy,
             Quantity::from("1.0"),
             TimeInForce::Gtc,
@@ -2403,7 +3093,7 @@ mod tests {
             None,
             Some(exec_algorithm_id),
             None,
-            None,
+            Some(client_order_id),
             None,
         ));
 
@@ -2449,13 +3139,7 @@ mod tests {
 
         algo.handle_order_event(OrderEventAny::Denied(denied));
 
-        let final_primary = {
-            let cache = algo.core.cache();
-            cache
-                .order(&ClientOrderId::from("O-001"))
-                .map(|o| o.clone())
-                .unwrap()
-        };
+        let final_primary = algo.cache().order(&client_order_id).unwrap();
         assert_eq!(final_primary.quantity(), Quantity::from("1.0"));
     }
 
@@ -2466,12 +3150,13 @@ mod tests {
 
         let instrument_id = InstrumentId::from("BTC/USDT.BINANCE");
         let exec_algorithm_id = algo.id();
+        let client_order_id = ClientOrderId::from("O-001");
 
         let mut primary = OrderAny::Market(MarketOrder::new(
             TraderId::from("TRADER-001"),
             StrategyId::from("STRAT-001"),
             instrument_id,
-            ClientOrderId::from("O-001"),
+            client_order_id,
             OrderSide::Buy,
             Quantity::from("1.0"),
             TimeInForce::Gtc,
@@ -2485,7 +3170,7 @@ mod tests {
             None,
             Some(exec_algorithm_id),
             None,
-            None,
+            Some(client_order_id),
             None,
         ));
 
@@ -2548,13 +3233,7 @@ mod tests {
         );
         let events = events.borrow();
 
-        let restored_primary = {
-            let cache = algo.core.cache();
-            cache
-                .order(&ClientOrderId::from("O-001"))
-                .map(|o| o.clone())
-                .unwrap()
-        };
+        let restored_primary = algo.cache().order(&client_order_id).unwrap();
         assert_eq!(restored_primary.quantity(), Quantity::from("0.7"));
         assert_eq!(events.len(), 1);
         assert!(matches!(
@@ -2570,12 +3249,13 @@ mod tests {
 
         let instrument_id = InstrumentId::from("BTC/USDT.BINANCE");
         let exec_algorithm_id = algo.id();
+        let client_order_id = ClientOrderId::from("O-001");
 
         let mut primary = OrderAny::Market(MarketOrder::new(
             TraderId::from("TRADER-001"),
             StrategyId::from("STRAT-001"),
             instrument_id,
-            ClientOrderId::from("O-001"),
+            client_order_id,
             OrderSide::Buy,
             Quantity::from("1.0"),
             TimeInForce::Gtc,
@@ -2589,7 +3269,7 @@ mod tests {
             None,
             Some(exec_algorithm_id),
             None,
-            None,
+            Some(client_order_id),
             None,
         ));
 
@@ -2638,13 +3318,7 @@ mod tests {
 
         algo.handle_order_event(OrderEventAny::Accepted(accepted));
 
-        let primary_after_accept = {
-            let cache = algo.core.cache();
-            cache
-                .order(&ClientOrderId::from("O-001"))
-                .map(|o| o.clone())
-                .unwrap()
-        };
+        let primary_after_accept = algo.cache().order(&client_order_id).unwrap();
         assert_eq!(primary_after_accept.quantity(), Quantity::from("0.5"));
 
         // Cancel after acceptance - no restoration should occur
@@ -2667,13 +3341,7 @@ mod tests {
 
         algo.handle_order_event(OrderEventAny::Canceled(canceled));
 
-        let final_primary = {
-            let cache = algo.core.cache();
-            cache
-                .order(&ClientOrderId::from("O-001"))
-                .map(|o| o.clone())
-                .unwrap()
-        };
+        let final_primary = algo.cache().order(&client_order_id).unwrap();
         assert_eq!(final_primary.quantity(), Quantity::from("0.5"));
     }
 
@@ -2685,12 +3353,13 @@ mod tests {
 
         let instrument_id = InstrumentId::from("BTC/USDT.BINANCE");
         let exec_algorithm_id = algo.id();
+        let client_order_id = ClientOrderId::from("O-001");
 
         let mut primary = OrderAny::Market(MarketOrder::new(
             TraderId::from("TRADER-001"),
             StrategyId::from("STRAT-001"),
             instrument_id,
-            ClientOrderId::from("O-001"),
+            client_order_id,
             OrderSide::Buy,
             Quantity::from("1.0"),
             TimeInForce::Gtc,
@@ -2704,7 +3373,7 @@ mod tests {
             None,
             Some(exec_algorithm_id),
             None,
-            None,
+            Some(client_order_id),
             None,
         ));
 

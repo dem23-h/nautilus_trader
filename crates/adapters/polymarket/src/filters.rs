@@ -249,13 +249,18 @@ impl PredicateFilter {
     /// Only [`InstrumentAny::BinaryOption`] instruments are checked; non-binary variants are accepted.
     pub fn not_expired(now_ns: UnixNanos) -> Self {
         Self::new("not_expired", move |instrument| {
-            if let Some(expiration_ns) = Instrument::expiration_ns(instrument) {
-                expiration_ns > now_ns
-            } else {
-                true // no expiration means not expired
-            }
+            !is_expired(instrument, now_ns)
         })
     }
+}
+
+/// Returns `true` if `instrument` has a real expiration timestamp at or before `now_ns`.
+///
+/// An `expiration_ns` of `0` is treated as a "no expiration" sentinel, the same as a missing
+/// timestamp, so both report as not expired.
+pub(crate) fn is_expired(instrument: &InstrumentAny, now_ns: UnixNanos) -> bool {
+    Instrument::expiration_ns(instrument)
+        .is_some_and(|expiration_ns| expiration_ns.as_u64() != 0 && expiration_ns <= now_ns)
 }
 
 impl Debug for PredicateFilter {
@@ -328,10 +333,10 @@ pub struct TagFilter {
 
 impl TagFilter {
     /// Creates a new [`TagFilter`] from a known tag ID.
-    pub fn from_tag_id(tag_id: impl Into<String>) -> Self {
+    pub fn from_tag_id(tag_id: u64) -> Self {
         Self {
             inner: GammaQueryFilter::new(GetGammaMarketsParams {
-                tag_id: Some(tag_id.into()),
+                tag_id: Some(vec![tag_id]),
                 ..Default::default()
             }),
         }
@@ -432,6 +437,7 @@ mod tests {
             None, // margin_maint
             None, // maker_fee
             None, // taker_fee
+            None, // tick_scheme
             None, // info
             UnixNanos::default(),
             UnixNanos::default(),
@@ -477,6 +483,15 @@ mod tests {
         let expiration = UnixNanos::from(1_100_000_000_000_000_000u64); // ~2004
         let instrument = stub_binary_option_with_expiration(Some("Yes"), expiration);
         let filter = PredicateFilter::not_expired(simulated_now);
+        assert!(filter.accept(&instrument));
+    }
+
+    #[rstest]
+    fn test_not_expired_accepts_zero_sentinel_expiration() {
+        // A zero expiration is the "no expiration" sentinel, so it must be treated as not expired
+        let now = UnixNanos::from(1_000_000u64);
+        let instrument = stub_binary_option_with_expiration(Some("Yes"), UnixNanos::from(0u64));
+        let filter = PredicateFilter::not_expired(now);
         assert!(filter.accept(&instrument));
     }
 
@@ -578,7 +593,7 @@ mod tests {
 
     #[rstest]
     fn test_tag_filter_default_accept_new_market() {
-        let filter = TagFilter::from_tag_id("123");
+        let filter = TagFilter::from_tag_id(123);
         let nm = stub_new_market("nvda-market", vec!["stocks".to_string()], None);
         assert!(filter.accept_new_market(&nm)); // default: accept all
     }

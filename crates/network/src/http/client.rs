@@ -37,6 +37,13 @@ const DEFAULT_POOL_IDLE_TIMEOUT_SECS: u64 = 60;
 /// Default HTTP/2 keep-alive interval in seconds.
 const DEFAULT_HTTP2_KEEP_ALIVE_SECS: u64 = 30;
 
+/// Default maximum HTTP response body size in bytes (100 MiB).
+///
+/// Bounds peak memory per response so a hostile or malfunctioning endpoint
+/// cannot exhaust memory by streaming an arbitrarily large body. Mirrors the
+/// caps already enforced on the WebSocket and raw-socket paths.
+const DEFAULT_MAX_RESPONSE_BYTES: usize = 100 * 1024 * 1024;
+
 /// An HTTP client that supports rate limiting and timeouts.
 ///
 /// Built on `reqwest` for async I/O. Allows per-endpoint and default quotas
@@ -58,8 +65,8 @@ const DEFAULT_HTTP2_KEEP_ALIVE_SECS: u64 = 30;
 pub struct HttpClient {
     /// The underlying HTTP client used to make requests.
     pub(crate) client: InnerHttpClient,
-    /// The rate limiter to control the request rate.
-    pub(crate) rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+    /// The rate limiters that control the request rate.
+    pub(crate) rate_limiters: Arc<[Arc<RateLimiter<Ustr, MonotonicClock>>]>,
 }
 
 impl HttpClient {
@@ -76,6 +83,61 @@ impl HttpClient {
         default_quota: Option<Quota>,
         timeout_secs: Option<u64>,
         proxy_url: Option<String>,
+    ) -> Result<Self, HttpClientError> {
+        let keyed_quotas = keyed_quotas
+            .into_iter()
+            .map(|(key, quota)| (Ustr::from(&key), quota))
+            .collect();
+
+        let rate_limiter = Arc::new(RateLimiter::new_with_quota(default_quota, keyed_quotas));
+
+        Self::new_with_rate_limiter(headers, header_keys, timeout_secs, proxy_url, rate_limiter)
+    }
+
+    /// Creates a new [`HttpClient`] instance sharing an externally-owned rate limiter.
+    ///
+    /// Use this constructor to share a single [`RateLimiter`] across multiple
+    /// [`HttpClient`] instances (for example, the HTTP clients owned by an
+    /// exchange adapter's data and execution clients). All quota state lives
+    /// inside the limiter, so passing the same `Arc` produces a single shared
+    /// bucket.
+    ///
+    /// # Errors
+    ///
+    /// - Returns `InvalidProxy` if the proxy URL is malformed.
+    /// - Returns `ClientBuildError` if building the underlying `reqwest::Client` fails.
+    pub fn new_with_rate_limiter(
+        headers: HashMap<String, String>,
+        header_keys: Vec<String>,
+        timeout_secs: Option<u64>,
+        proxy_url: Option<String>,
+        rate_limiter: Arc<RateLimiter<Ustr, MonotonicClock>>,
+    ) -> Result<Self, HttpClientError> {
+        Self::new_with_rate_limiters(
+            headers,
+            header_keys,
+            timeout_secs,
+            proxy_url,
+            vec![rate_limiter],
+        )
+    }
+
+    /// Creates a new [`HttpClient`] instance sharing multiple externally-owned rate limiters.
+    ///
+    /// Each request awaits every limiter with the same keys. A limiter with no default quota
+    /// ignores keys it does not own, allowing independent quota scopes such as per-IP and
+    /// per-account limits to apply to one request.
+    ///
+    /// # Errors
+    ///
+    /// - Returns `InvalidProxy` if the proxy URL is malformed.
+    /// - Returns `ClientBuildError` if building the underlying `reqwest::Client` fails.
+    pub fn new_with_rate_limiters(
+        headers: HashMap<String, String>,
+        header_keys: Vec<String>,
+        timeout_secs: Option<u64>,
+        proxy_url: Option<String>,
+        rate_limiters: Vec<Arc<RateLimiter<Ustr, MonotonicClock>>>,
     ) -> Result<Self, HttpClientError> {
         install_cryptographic_provider();
 
@@ -107,7 +169,7 @@ impl HttpClient {
         // Configure proxy if provided
         if let Some(proxy_url) = proxy_url {
             let proxy = reqwest::Proxy::all(&proxy_url)
-                .map_err(|e| HttpClientError::InvalidProxy(format!("{proxy_url}: {e}")))?;
+                .map_err(|_| HttpClientError::InvalidProxy("proxy URL is malformed".to_string()))?;
             client_builder = client_builder.proxy(proxy);
         }
 
@@ -115,28 +177,29 @@ impl HttpClient {
             .build()
             .map_err(|e| HttpClientError::ClientBuildError(e.to_string()))?;
 
-        // Pre-intern header keys as HeaderName, keeping both vectors aligned
+        // Pre-intern header keys as HeaderName, keeping both vectors aligned,
+        // an invalid key is an error: a silent drop would make response extraction read nothing.
         let (valid_keys, header_names): (Vec<String>, Vec<HeaderName>) = header_keys
             .into_iter()
-            .filter_map(|k| HeaderName::from_str(&k).ok().map(|name| (k, name)))
+            .map(|k| {
+                HeaderName::from_str(&k)
+                    .map(|name| (k.clone(), name))
+                    .map_err(|e| HttpClientError::Error(format!("Invalid header key '{k}': {e}")))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
             .unzip();
 
         let client = InnerHttpClient {
             client,
-            header_keys: Arc::new(valid_keys),
-            header_names: Arc::new(header_names),
+            header_keys: Arc::from(valid_keys),
+            header_names: Arc::from(header_names),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         };
-
-        let keyed_quotas = keyed_quotas
-            .into_iter()
-            .map(|(key, quota)| (Ustr::from(&key), quota))
-            .collect();
-
-        let rate_limiter = Arc::new(RateLimiter::new_with_quota(default_quota, keyed_quotas));
 
         Ok(Self {
             client,
-            rate_limiter,
+            rate_limiters: rate_limiters.into(),
         })
     }
 
@@ -187,8 +250,7 @@ impl HttpClient {
         keys: Option<Vec<String>>,
     ) -> Result<HttpResponse, HttpClientError> {
         let keys = keys.map(into_ustr_vec);
-        let rate_limiter = self.rate_limiter.clone();
-        rate_limiter.await_keys_ready(keys.as_deref()).await;
+        self.await_rate_limits(keys.as_deref()).await;
 
         self.client
             .send_request_with_query(method, url, params, headers, body, timeout_secs)
@@ -211,12 +273,17 @@ impl HttpClient {
         timeout_secs: Option<u64>,
         keys: Option<Vec<Ustr>>,
     ) -> Result<HttpResponse, HttpClientError> {
-        let rate_limiter = self.rate_limiter.clone();
-        rate_limiter.await_keys_ready(keys.as_deref()).await;
+        self.await_rate_limits(keys.as_deref()).await;
 
         self.client
             .send_request(method, url, params, headers, body, timeout_secs)
             .await
+    }
+
+    pub(crate) async fn await_rate_limits(&self, keys: Option<&[Ustr]>) {
+        for rate_limiter in self.rate_limiters.iter() {
+            rate_limiter.await_keys_ready(keys).await;
+        }
     }
 
     /// Sends an HTTP GET request.
@@ -317,8 +384,10 @@ impl HttpClient {
 #[derive(Clone, Debug)]
 pub struct InnerHttpClient {
     pub(crate) client: reqwest::Client,
-    pub(crate) header_keys: Arc<Vec<String>>,
-    pub(crate) header_names: Arc<Vec<HeaderName>>,
+    pub(crate) header_keys: Arc<[String]>,
+    pub(crate) header_names: Arc<[HeaderName]>,
+    /// Maximum response body size in bytes; bodies exceeding this are rejected.
+    pub(crate) max_response_bytes: usize,
 }
 
 impl InnerHttpClient {
@@ -456,13 +525,52 @@ impl InnerHttpClient {
         }
 
         let status = HttpStatus::new(response.status());
-        let body = response.bytes().await.map_err(HttpClientError::from)?;
+        let body = self.read_body_capped(response).await?;
 
         Ok(HttpResponse {
             status,
             headers,
             body,
         })
+    }
+
+    /// Reads the response body, rejecting any body that exceeds `max_response_bytes`.
+    ///
+    /// A `Content-Length` larger than the cap is rejected up front; otherwise the
+    /// body is streamed chunk-by-chunk and aborted as soon as the accumulated size
+    /// would exceed the cap, so an oversized or unbounded (chunked) body is never
+    /// fully buffered into memory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the body exceeds the configured maximum size, or if
+    /// reading a chunk fails.
+    async fn read_body_capped(
+        &self,
+        mut response: Response,
+    ) -> Result<bytes::Bytes, HttpClientError> {
+        let max = self.max_response_bytes;
+
+        // Fast path: reject up front when the advertised length already exceeds the cap.
+        if let Some(len) = response.content_length()
+            && len > max as u64
+        {
+            return Err(HttpClientError::Error(format!(
+                "HTTP response body of {len} bytes exceeds maximum of {max} bytes",
+            )));
+        }
+
+        let mut buf = bytes::BytesMut::new();
+        while let Some(chunk) = response.chunk().await.map_err(HttpClientError::from)? {
+            if buf.len() + chunk.len() > max {
+                return Err(HttpClientError::Error(format!(
+                    "HTTP response body exceeds maximum of {max} bytes",
+                )));
+            }
+            buf.extend_from_slice(&chunk);
+        }
+
+        Ok(buf.freeze())
     }
 }
 
@@ -477,6 +585,7 @@ impl Default for InnerHttpClient {
             client,
             header_keys: Arc::default(),
             header_names: Arc::default(),
+            max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
         }
     }
 }
@@ -517,15 +626,20 @@ fn encode_url_params<'a>(
 #[cfg(test)]
 #[cfg(target_os = "linux")] // Only run network tests on Linux (CI stability)
 mod tests {
-    use std::net::SocketAddr;
+    use std::{net::SocketAddr, num::NonZeroU32};
 
     use axum::{
         Router,
         routing::{delete, get, patch, post},
         serve,
     };
+    use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
     use http::status::StatusCode;
     use rstest::rstest;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::oneshot,
+    };
 
     use super::*;
 
@@ -543,6 +657,11 @@ mod tests {
                     "Eventually responded"
                 }),
             )
+            .route(
+                "/large",
+                // Returns a 1 MiB body to exercise the response size cap.
+                get(|| async { "x".repeat(1024 * 1024) }),
+            )
     }
 
     async fn start_test_server() -> Result<SocketAddr, Box<dyn std::error::Error + Send + Sync>> {
@@ -554,6 +673,66 @@ mod tests {
         });
 
         Ok(addr)
+    }
+
+    async fn spawn_rejecting_connect_proxy() -> (SocketAddr, oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (request_tx, request_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx
+                .send(String::from_utf8(request).unwrap())
+                .unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        (addr, request_rx)
+    }
+
+    #[tokio::test]
+    async fn test_http_client_awaits_multiple_rate_limiters() {
+        let quota = Quota::per_minute(NonZeroU32::MIN);
+        let request_key = Ustr::from("scope:request");
+        let order_key = Ustr::from("scope:order");
+        let request_limiter = Arc::new(RateLimiter::new_with_quota(
+            None,
+            vec![(request_key, quota)],
+        ));
+        let order_limiter = Arc::new(RateLimiter::new_with_quota(None, vec![(order_key, quota)]));
+        let client = HttpClient::new_with_rate_limiters(
+            HashMap::new(),
+            Vec::new(),
+            None,
+            None,
+            vec![Arc::clone(&request_limiter), Arc::clone(&order_limiter)],
+        )
+        .unwrap();
+
+        client
+            .await_rate_limits(Some(&[request_key, order_key]))
+            .await;
+
+        assert!(request_limiter.check_key(&request_key).is_err());
+        assert!(order_limiter.check_key(&order_key).is_err());
     }
 
     #[tokio::test]
@@ -576,6 +755,62 @@ mod tests {
 
         assert!(response.status.is_success());
         assert_eq!(String::from_utf8_lossy(&response.body), "hello-world!");
+    }
+
+    #[tokio::test]
+    async fn test_response_body_within_cap_is_returned() {
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}");
+
+        // Cap above the 1 MiB payload: body should be returned intact.
+        let client = InnerHttpClient {
+            max_response_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        };
+
+        let response = client
+            .send_request(
+                reqwest::Method::GET,
+                format!("{url}/large"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status.is_success());
+        assert_eq!(response.body.len(), 1024 * 1024);
+    }
+
+    #[tokio::test]
+    async fn test_response_body_exceeding_cap_is_rejected() {
+        let addr = start_test_server().await.unwrap();
+        let url = format!("http://{addr}");
+
+        // Cap below the 1 MiB payload: the request must fail rather than buffer it.
+        let client = InnerHttpClient {
+            max_response_bytes: 16 * 1024,
+            ..Default::default()
+        };
+
+        let result = client
+            .send_request(
+                reqwest::Method::GET,
+                format!("{url}/large"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
+
+        let err = result.expect_err("oversized response body should be rejected");
+        assert!(
+            err.to_string().contains("exceeds maximum"),
+            "unexpected error: {err}",
+        );
     }
 
     #[tokio::test]
@@ -726,6 +961,110 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    #[tokio::test]
+    async fn test_http_client_without_proxy_requests_directly() {
+        let addr = start_test_server().await.unwrap();
+        let client = HttpClient::new(HashMap::new(), vec![], vec![], None, Some(2), None).unwrap();
+        let response = client
+            .request(
+                Method::GET,
+                format!("http://{addr}/get"),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("direct request");
+
+        assert_eq!(response.status.as_u16(), StatusCode::OK.as_u16());
+        assert_eq!(response.body.as_ref(), b"hello-world!");
+    }
+
+    #[tokio::test]
+    async fn test_http_client_uses_connect_and_proxy_authorization_for_https() {
+        const USERNAME: &str = "proxytest";
+        const PASSWORD: &str = "fixture42";
+        let (proxy_addr, request_rx) = spawn_rejecting_connect_proxy().await;
+        let client = HttpClient::new(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            Some(2),
+            Some(format!("http://{USERNAME}:{PASSWORD}@{proxy_addr}")),
+        )
+        .unwrap();
+        let error = client
+            .request(
+                Method::GET,
+                "https://fixture.example.test/path".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("proxy should reject CONNECT");
+        let request = request_rx.await.expect("captured CONNECT request");
+        let mut lines = request.split("\r\n");
+        let request_line = lines.next().expect("CONNECT request line");
+        let auth_value = lines
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("proxy-authorization")
+                    .then_some(value.trim())
+            })
+            .expect("Proxy-Authorization header");
+        let expected_auth = format!("Basic {}", BASE64.encode(format!("{USERNAME}:{PASSWORD}")));
+
+        assert_eq!(request_line, "CONNECT fixture.example.test:443 HTTP/1.1");
+        assert_eq!(auth_value, expected_auth);
+        assert!(!error.to_string().contains(PASSWORD));
+        assert!(!error.to_string().contains(&BASE64.encode(PASSWORD)));
+        assert!(!error.to_string().contains(&expected_auth));
+    }
+
+    #[tokio::test]
+    async fn test_http_client_unreachable_proxy_error_redacts_credentials() {
+        const USERNAME: &str = "proxy-user";
+        const SECRET: &str = "unreachable-proxy-secret";
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        drop(listener);
+        let client = HttpClient::new(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            Some(1),
+            Some(format!("http://{USERNAME}:{SECRET}@{proxy_addr}")),
+        )
+        .unwrap();
+        let error = client
+            .request(
+                Method::GET,
+                "https://fixture.example.test/".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect_err("unreachable proxy should fail");
+
+        assert!(!error.to_string().contains(SECRET));
+        assert!(!error.to_string().contains(&BASE64.encode(SECRET)));
+        assert!(
+            !error
+                .to_string()
+                .contains(&BASE64.encode(format!("{USERNAME}:{SECRET}")))
+        );
+    }
+
     #[rstest]
     fn test_http_client_with_valid_proxy() {
         // Create client with a valid proxy URL
@@ -772,6 +1111,26 @@ mod tests {
 
         assert!(result.is_err());
         assert!(matches!(result, Err(HttpClientError::InvalidProxy(_))));
+    }
+
+    #[rstest]
+    fn test_http_client_invalid_proxy_error_redacts_credentials() {
+        const SECRET: &str = "unique-proxy-secret";
+        let result = HttpClient::new(
+            HashMap::new(),
+            vec![],
+            vec![],
+            None,
+            None,
+            Some(format!("http://proxytest:{SECRET}@[::1")),
+        );
+        let error = result.expect_err("malformed proxy URL should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid proxy URL: proxy URL is malformed"
+        );
+        assert!(!error.to_string().contains(SECRET));
     }
 
     #[rstest]

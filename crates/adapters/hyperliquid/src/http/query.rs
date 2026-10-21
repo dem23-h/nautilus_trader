@@ -67,6 +67,8 @@ pub struct OrderParams {
 #[derive(Debug, Clone, Serialize)]
 pub struct CancelParams {
     pub cancels: Vec<HyperliquidExecCancelByCloidRequest>,
+    #[serde(rename = "f", skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
 }
 
 /// Parameters for modifying an order.
@@ -97,6 +99,12 @@ pub struct UpdateIsolatedMarginParams {
 /// Parameters for L2 book request.
 #[derive(Debug, Clone, Serialize)]
 pub struct L2BookParams {
+    pub coin: String,
+}
+
+/// Parameters for recent trades request.
+#[derive(Debug, Clone, Serialize)]
+pub struct RecentTradesParams {
     pub coin: String,
 }
 
@@ -162,6 +170,7 @@ pub struct FundingHistoryParams {
 #[serde(untagged)]
 pub enum InfoRequestParams {
     L2Book(L2BookParams),
+    RecentTrades(RecentTradesParams),
     UserFills(UserFillsParams),
     OrderStatus(OrderStatusParams),
     OpenOrders(OpenOrdersParams),
@@ -248,6 +257,16 @@ impl InfoRequest {
         }
     }
 
+    /// Creates a request to get recent public trades for a coin.
+    pub fn recent_trades(coin: &str) -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::RecentTrades,
+            params: InfoRequestParams::RecentTrades(RecentTradesParams {
+                coin: coin.to_string(),
+            }),
+        }
+    }
+
     /// Creates a request to get user fills.
     pub fn user_fills(user: &str) -> Self {
         Self {
@@ -283,6 +302,16 @@ impl InfoRequest {
     pub fn frontend_open_orders(user: &str) -> Self {
         Self {
             request_type: HyperliquidInfoRequestType::FrontendOpenOrders,
+            params: InfoRequestParams::OpenOrders(OpenOrdersParams {
+                user: user.to_string(),
+            }),
+        }
+    }
+
+    /// Creates a request to get historical orders for a user.
+    pub fn historical_orders(user: &str) -> Self {
+        Self {
+            request_type: HyperliquidInfoRequestType::HistoricalOrders,
             params: InfoRequestParams::OpenOrders(OpenOrdersParams {
                 user: user.to_string(),
             }),
@@ -402,7 +431,10 @@ impl ExchangeAction {
     pub fn cancel(cancels: Vec<HyperliquidExecCancelByCloidRequest>) -> Self {
         Self {
             action_type: ExchangeActionType::Cancel,
-            params: ExchangeActionParams::Cancel(CancelParams { cancels }),
+            params: ExchangeActionParams::Cancel(CancelParams {
+                cancels,
+                fast: None,
+            }),
         }
     }
 
@@ -410,7 +442,10 @@ impl ExchangeAction {
     pub fn cancel_by_cloid(cancels: Vec<HyperliquidExecCancelByCloidRequest>) -> Self {
         Self {
             action_type: ExchangeActionType::CancelByCloid,
-            params: ExchangeActionParams::Cancel(CancelParams { cancels }),
+            params: ExchangeActionParams::Cancel(CancelParams {
+                cancels,
+                fast: None,
+            }),
         }
     }
 
@@ -493,6 +528,15 @@ mod tests {
         assert_eq!(req.request_type, HyperliquidInfoRequestType::L2Book);
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"coin\":\"BTC\""));
+    }
+
+    #[rstest]
+    fn test_info_request_recent_trades() {
+        let req = InfoRequest::recent_trades("BTC");
+
+        assert_eq!(req.request_type, HyperliquidInfoRequestType::RecentTrades);
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#"{"type":"recentTrades","coin":"BTC"}"#);
     }
 
     #[rstest]
@@ -647,7 +691,7 @@ mod tests {
     #[rstest]
     fn test_modify_serialization() {
         let modify_request = HyperliquidExecModifyOrderRequest {
-            oid: 12345,
+            oid: 12345.into(),
             order: HyperliquidExecPlaceOrderRequest {
                 asset: 0,
                 is_buy: true,

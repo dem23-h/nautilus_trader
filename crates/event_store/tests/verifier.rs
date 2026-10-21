@@ -28,15 +28,14 @@ use std::{
     process::Command,
 };
 
-use bincode::config::standard;
 use bytes::Bytes;
 use indexmap::IndexMap;
 use nautilus_core::UnixNanos;
 use nautilus_event_store::{
     AppendEntry, DataClass, DataCursorSnapshot, EventStore, EventStoreEntry, GapRange, Headers,
     IndexKey, IndexKind, MarkerBackend, MarkerManifest, RedbBackend, RedbMarkerBackend,
-    RegisteredComponents, RunManifest, RunStatus, StreamCursor, Topic, Verifier, VerifyFinding,
-    compute_entry_hash, compute_marker_hash,
+    RegisteredComponents, RunManifest, RunStatus, SnapshotAnchor, StreamCursor, Topic, Verifier,
+    VerifyFinding, codec, compute_entry_hash, compute_marker_hash,
 };
 use redb::ReadableTable;
 use rstest::rstest;
@@ -195,6 +194,24 @@ fn flip_stored_entry_payload_byte(path: &std::path::Path, seq: u64) {
     txn.commit().expect("commit flip");
 }
 
+fn truncate_stored_entry(path: &std::path::Path, seq: u64) {
+    let entries: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("entries");
+    let db = redb::Database::create(path).expect("open redb");
+    let txn = db.begin_write().expect("begin write");
+    {
+        let mut table = txn.open_table(entries).expect("open entries");
+        let mut bytes = {
+            let row = table.get(seq).expect("get entry").expect("entry present");
+            row.value().to_vec()
+        };
+        bytes.truncate(bytes.len() / 2);
+        table
+            .insert(seq, bytes.as_slice())
+            .expect("overwrite entry");
+    }
+    txn.commit().expect("commit truncate");
+}
+
 fn zero_tail_truncate(path: &std::path::Path) {
     let original_len = fs::metadata(path).expect("metadata").len();
     let retained_len = original_len / 2;
@@ -292,6 +309,63 @@ fn binary_clean_marker_sidecar_reports_clean_without_error() {
 }
 
 #[rstest]
+fn binary_corrupt_entry_run_with_failing_marker_sidecar_relays_entry_findings() {
+    // A failing sidecar must not mask the entry run's corrupt findings
+    let tmp = TempDir::new().expect("tempdir");
+    let run_id = "1700000000-cafe0114";
+    write_sealed_run(&tmp, run_id);
+    flip_stored_entry_payload_byte(&run_path(&tmp, run_id), 2);
+
+    // A valid redb file without a marker manifest fails the sidecar open cleanly
+    drop(redb::Database::create(marker_path(&tmp, run_id)).expect("create marker file"));
+
+    let output = verify_bin(&run_path(&tmp, run_id));
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={stdout} stderr={stderr}",
+    );
+    assert!(stdout.contains("corrupt"), "stdout was: {stdout}");
+    assert!(
+        stdout.contains("hash mismatch at seq 2"),
+        "stdout was: {stdout}",
+    );
+    assert!(stdout.contains("markers=error"), "stdout was: {stdout}");
+}
+
+#[rstest]
+fn binary_undecodable_entry_is_reported_and_scan_continues() {
+    // A truncated row fails to decode at seq 2; the walk must continue so later
+    // entries count and the index pointing at the bad row reports drift.
+    let tmp = TempDir::new().expect("tempdir");
+    let run_id = "1700000000-cafe0115";
+    write_sealed_run(&tmp, run_id);
+    truncate_stored_entry(&run_path(&tmp, run_id), 2);
+
+    let output = verify_bin(&run_path(&tmp, run_id));
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout");
+    let stderr = String::from_utf8(output.stderr).expect("stderr");
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout={stdout} stderr={stderr}",
+    );
+    assert!(
+        stdout.contains("undecodable entry at seq 2"),
+        "stdout was: {stdout}",
+    );
+    assert!(stdout.contains("entries_scanned=3"), "stdout was: {stdout}",);
+    assert!(
+        stdout.contains("corrupted target seq 2"),
+        "stdout was: {stdout}",
+    );
+}
+
+#[rstest]
 fn binary_marker_hash_mismatch_exits_corrupt_without_quarantine() {
     let tmp = TempDir::new().expect("tempdir");
     let run_id = "1700000000-cafe0112";
@@ -340,7 +414,7 @@ fn binary_hash_mismatch_exits_corrupt_without_quarantine() {
     let path = run_path(&tmp, run_id);
     let mut tampered = build_entry(2, 11);
     tampered.payload = Bytes::from_static(b"\xFF");
-    let bytes = bincode::serde::encode_to_vec(&tampered, standard()).expect("encode");
+    let bytes = codec::encode_to_vec(&tampered).expect("encode");
     {
         let db = redb::Database::create(&path).expect("open redb");
         let txn = db.begin_write().expect("begin write");
@@ -577,7 +651,7 @@ fn open_redb_rejects_missing_run() {
 #[rstest]
 fn manufactured_seq_swap_surfaces_as_finding() {
     // Build a sealed run, then overwrite the bytes at table key=2 with the
-    // bincode-encoded entry whose embedded seq is 99. The hash recomputes
+    // codec-encoded entry whose embedded seq is 99. The hash recomputes
     // correctly because the hash hashes entry.seq=99, so scan_seq returns
     // Ok(Some(entry)) without raising HashMismatch. The verifier must catch
     // the key/embedded-seq divergence.
@@ -588,7 +662,7 @@ fn manufactured_seq_swap_surfaces_as_finding() {
     let path = tmp.path().join(INSTANCE_ID).join(format!("{run_id}.redb"));
     let entries: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("entries");
     let substitute = build_entry(99, 11);
-    let bytes = bincode::serde::encode_to_vec(&substitute, standard()).expect("encode");
+    let bytes = codec::encode_to_vec(&substitute).expect("encode");
     {
         let db = redb::Database::create(&path).expect("open redb");
         let txn = db.begin_write().expect("begin write");
@@ -611,6 +685,89 @@ fn manufactured_seq_swap_surfaces_as_finding() {
                 table_key: 2,
                 embedded_seq: 99,
             }
+        )),
+        "findings was: {:?}",
+        report.findings,
+    );
+}
+
+#[rstest]
+fn corrupt_snapshot_anchor_is_a_finding_not_clean() {
+    // The restore path reads the anchor before tail replay; a run whose anchor fails
+    // to decode must not verify clean and then fail at restore time.
+    let tmp = TempDir::new().expect("tempdir");
+    let run_id = "1700000000-cafe0110";
+    write_sealed_run(&tmp, run_id);
+
+    let path = run_path(&tmp, run_id);
+    let snapshot_anchor: redb::TableDefinition<&str, &[u8]> =
+        redb::TableDefinition::new("snapshot_anchor");
+    {
+        let db = redb::Database::create(&path).expect("open redb");
+        let txn = db.begin_write().expect("begin write");
+        {
+            let mut table = txn.open_table(snapshot_anchor).expect("open table");
+            table
+                .insert("latest", b"\xFF\xFF\xFF\xFF\xFF\xFF\xFF\xFF".as_slice())
+                .expect("overwrite latest snapshot anchor");
+        }
+        txn.commit().expect("commit overwrite");
+    }
+
+    let verifier = Verifier::open_redb_file(&path).expect("open verifier");
+    let report = verifier.verify().expect("verify");
+
+    assert!(!report.is_clean(), "findings was: {:?}", report.findings);
+    assert!(
+        report.findings.iter().any(|f| matches!(
+            f,
+            VerifyFinding::SnapshotAnchorInvalid { reason } if reason.contains("unreadable")
+        )),
+        "findings was: {:?}",
+        report.findings,
+    );
+}
+
+#[rstest]
+fn snapshot_anchor_past_durable_watermark_is_a_finding() {
+    // A tail-trimmed run whose anchor points past the durable watermark cannot
+    // restore (the reader rejects the plan); the verifier must surface it.
+    let tmp = TempDir::new().expect("tempdir");
+    let run_id = "1700000000-cafe0111";
+    {
+        let mut backend = RedbBackend::new(tmp.path());
+        backend.open_run(manifest(run_id)).expect("open run");
+        backend
+            .append_batch(&[
+                append_with(1, 10, Vec::new()),
+                append_with(2, 11, Vec::new()),
+            ])
+            .expect("append");
+        backend
+            .record_snapshot_anchor(SnapshotAnchor::new(2, "cache://snapshots/2", "blake3:abc"))
+            .expect("record anchor");
+        backend.seal(RunStatus::Ended).expect("seal");
+    }
+
+    let path = run_path(&tmp, run_id);
+    let entries: redb::TableDefinition<u64, &[u8]> = redb::TableDefinition::new("entries");
+    {
+        let db = redb::Database::create(&path).expect("open redb");
+        let txn = db.begin_write().expect("begin write");
+        {
+            let mut table = txn.open_table(entries).expect("open table");
+            table.remove(2_u64).expect("remove seq 2");
+        }
+        txn.commit().expect("commit removal");
+    }
+
+    let verifier = Verifier::open_redb_file(&path).expect("open verifier");
+    let report = verifier.verify().expect("verify");
+
+    assert!(
+        report.findings.iter().any(|f| matches!(
+            f,
+            VerifyFinding::SnapshotAnchorInvalid { reason } if reason.contains("exceeds durable")
         )),
         "findings was: {:?}",
         report.findings,

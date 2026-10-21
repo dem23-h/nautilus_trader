@@ -17,7 +17,6 @@
 
 use std::{
     collections::VecDeque,
-    str::FromStr,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -56,9 +55,10 @@ use super::{
     parse::{
         parse_ws_asset_context, parse_ws_candle, parse_ws_fill_report, parse_ws_open_interest,
         parse_ws_order_book_deltas, parse_ws_order_book_depth10, parse_ws_order_status_report,
-        parse_ws_quote_tick, parse_ws_trade_tick,
+        parse_ws_public_trade, parse_ws_quote_tick, parse_ws_trade_tick,
     },
     post::PostRouter,
+    trades::TradeStreamUses,
 };
 use crate::data_types::{
     HyperliquidAllDexsAssetCtxs, HyperliquidAllMids, HyperliquidDexAssetCtx,
@@ -100,6 +100,8 @@ pub enum HandlerCommand {
         coin: Ustr,
         data_types: AHashSet<AssetContextDataType>,
     },
+    /// Update the logical consumers of a `trades` stream for a coin.
+    UpdateTradeSubs { coin: Ustr, uses: TradeStreamUses },
     /// Cache the ordered instrument IDs needed to normalize `allDexsAssetCtxs`.
     CacheAllDexAssetCtxsInstrumentIds(AHashMap<Ustr, Vec<Option<InstrumentId>>>),
     /// Cache spot fill coin mappings for instrument lookup.
@@ -111,10 +113,10 @@ pub enum HandlerCommand {
 
 #[derive(Default)]
 struct AssetContextCaches {
-    mark_price: AHashMap<Ustr, String>,
-    index_price: AHashMap<Ustr, String>,
-    funding_rate: AHashMap<Ustr, String>,
-    open_interest: AHashMap<Ustr, String>,
+    mark_price: AHashMap<Ustr, Decimal>,
+    index_price: AHashMap<Ustr, Decimal>,
+    funding_rate: AHashMap<Ustr, Decimal>,
+    open_interest: AHashMap<Ustr, Decimal>,
 }
 
 impl AssetContextCaches {
@@ -170,9 +172,11 @@ pub(super) struct FeedHandler {
     bar_types_cache: AHashMap<String, BarType>,
     bar_cache: AHashMap<String, CandleData>,
     asset_context_subs: AHashMap<Ustr, AHashSet<AssetContextDataType>>,
+    trade_subs: AHashMap<Ustr, TradeStreamUses>,
     all_dex_asset_ctxs_instrument_ids: AHashMap<Ustr, Vec<Option<InstrumentId>>>,
     depth10_subs: AHashSet<Ustr>,
     processed_trade_ids: FifoCache<u64, 10_000>,
+    processed_public_trade_ids: FifoCache<(Ustr, u64), 10_000>,
     asset_context_caches: AssetContextCaches,
 }
 
@@ -209,9 +213,11 @@ impl FeedHandler {
             bar_types_cache: AHashMap::new(),
             bar_cache: AHashMap::new(),
             asset_context_subs: AHashMap::new(),
+            trade_subs: AHashMap::new(),
             all_dex_asset_ctxs_instrument_ids: AHashMap::new(),
             depth10_subs: AHashSet::new(),
             processed_trade_ids: FifoCache::new(),
+            processed_public_trade_ids: FifoCache::new(),
             asset_context_caches: AssetContextCaches::default(),
         }
     }
@@ -360,6 +366,13 @@ impl FeedHandler {
                                 self.asset_context_subs.insert(coin, data_types);
                             }
                         }
+                        HandlerCommand::UpdateTradeSubs { coin, uses } => {
+                            if uses.is_empty() {
+                                self.trade_subs.remove(&coin);
+                            } else {
+                                self.trade_subs.insert(coin, uses);
+                            }
+                        }
                         HandlerCommand::CacheAllDexAssetCtxsInstrumentIds(mappings) => {
                             self.all_dex_asset_ctxs_instrument_ids = mappings;
                         }
@@ -403,8 +416,10 @@ impl FeedHandler {
                                         self.account_id,
                                         ts_init,
                                         &self.asset_context_subs,
+                                        &self.trade_subs,
                                         &self.depth10_subs,
                                         &mut self.processed_trade_ids,
+                                        &mut self.processed_public_trade_ids,
                                         &mut self.asset_context_caches,
                                         &mut self.bar_cache,
                                         &self.all_dex_asset_ctxs_instrument_ids,
@@ -430,7 +445,7 @@ impl FeedHandler {
                             }
                         }
                         Message::Close(_) => {
-                            log::info!("Received WebSocket close frame");
+                            log::debug!("Received WebSocket close frame");
                             return None;
                         }
                         _ => {}
@@ -454,8 +469,10 @@ impl FeedHandler {
         account_id: Option<AccountId>,
         ts_init: UnixNanos,
         asset_context_subs: &AHashMap<Ustr, AHashSet<AssetContextDataType>>,
+        trade_subs: &AHashMap<Ustr, TradeStreamUses>,
         depth10_subs: &AHashSet<Ustr>,
         processed_trade_ids: &mut FifoCache<u64, 10_000>,
+        processed_public_trade_ids: &mut FifoCache<(Ustr, u64), 10_000>,
         asset_context_caches: &mut AssetContextCaches,
         bar_cache: &mut AHashMap<String, CandleData>,
         all_dex_asset_ctxs_instrument_ids: &AHashMap<Ustr, Vec<Option<InstrumentId>>>,
@@ -545,9 +562,13 @@ impl FeedHandler {
                 }
             }
             HyperliquidWsMessage::Trades { data } => {
-                if let Some(msg) = Self::handle_trades(&data, instruments, ts_init) {
-                    result.push(msg);
-                }
+                result.extend(Self::handle_trades(
+                    &data,
+                    instruments,
+                    trade_subs,
+                    processed_public_trade_ids,
+                    ts_init,
+                ));
             }
             HyperliquidWsMessage::AllMids { data } => {
                 let mut mids = std::collections::HashMap::with_capacity(
@@ -748,16 +769,45 @@ impl FeedHandler {
     fn handle_trades(
         data: &[super::messages::WsTradeData],
         instruments: &AHashMap<Ustr, InstrumentAny>,
+        trade_subs: &AHashMap<Ustr, TradeStreamUses>,
+        processed_public_trade_ids: &mut FifoCache<(Ustr, u64), 10_000>,
         ts_init: UnixNanos,
-    ) -> Option<NautilusWsMessage> {
+    ) -> Vec<NautilusWsMessage> {
         let mut trade_ticks = Vec::new();
+        let mut public_trades = Vec::new();
 
         for trade in data {
             if let Some(instrument) = instruments.get(&trade.coin) {
-                match parse_ws_trade_tick(trade, instrument, ts_init) {
-                    Ok(tick) => trade_ticks.push(tick),
-                    Err(e) => {
-                        log::error!("Error parsing trade tick: {e}");
+                let uses = trade_subs.get(&trade.coin).copied().unwrap_or_default();
+
+                if uses.ticks {
+                    match parse_ws_trade_tick(trade, instrument, ts_init) {
+                        Ok(tick) => trade_ticks.push(tick),
+                        Err(e) => {
+                            log::error!("Error parsing trade tick: {e}");
+                        }
+                    }
+                }
+
+                if uses.public_trades {
+                    let trade_key = (trade.coin, trade.tid);
+                    if processed_public_trade_ids.contains(&trade_key) {
+                        log::debug!(
+                            "Skipping replayed public trade: coin={}, tid={}",
+                            trade.coin,
+                            trade.tid
+                        );
+                        continue;
+                    }
+
+                    match parse_ws_public_trade(trade, instrument, ts_init) {
+                        Ok(trade) => {
+                            processed_public_trade_ids.add(trade_key);
+                            public_trades.push(trade);
+                        }
+                        Err(e) => {
+                            log::error!("Error parsing public trade: {e}");
+                        }
                     }
                 }
             } else {
@@ -765,11 +815,18 @@ impl FeedHandler {
             }
         }
 
-        if trade_ticks.is_empty() {
-            None
-        } else {
-            Some(NautilusWsMessage::Trades(trade_ticks))
+        let mut result = Vec::with_capacity(1 + public_trades.len());
+        if !trade_ticks.is_empty() {
+            result.push(NautilusWsMessage::Trades(trade_ticks));
         }
+        result.extend(public_trades.into_iter().map(|trade| {
+            let instrument_id = trade.instrument_id;
+            NautilusWsMessage::CustomData(Data::Custom(CustomData::new(
+                Arc::new(trade),
+                Self::public_trade_data_type(instrument_id),
+            )))
+        }));
+        result
     }
 
     fn handle_bbo(
@@ -907,9 +964,7 @@ impl FeedHandler {
                             && subscribed_types
                                 .is_some_and(|s| s.contains(&AssetContextDataType::MarkPrice))
                         {
-                            asset_context_caches
-                                .mark_price
-                                .insert(*coin, mark_px.clone());
+                            asset_context_caches.mark_price.insert(*coin, *mark_px);
                             result.push(NautilusWsMessage::MarkPrice(mark_price));
                         }
 
@@ -918,7 +973,7 @@ impl FeedHandler {
                                 .is_some_and(|s| s.contains(&AssetContextDataType::IndexPrice))
                         {
                             if let Some(px) = oracle_px {
-                                asset_context_caches.index_price.insert(*coin, px.clone());
+                                asset_context_caches.index_price.insert(*coin, *px);
                             }
 
                             if let Some(index) = index_price {
@@ -931,9 +986,7 @@ impl FeedHandler {
                                 .is_some_and(|s| s.contains(&AssetContextDataType::FundingRate))
                         {
                             if let Some(rate) = funding {
-                                asset_context_caches
-                                    .funding_rate
-                                    .insert(*coin, rate.clone());
+                                asset_context_caches.funding_rate.insert(*coin, *rate);
                             }
 
                             if let Some(funding) = funding_rate {
@@ -951,11 +1004,9 @@ impl FeedHandler {
                 && open_interest_changed
                 && subscribed_types.is_some_and(|s| s.contains(&AssetContextDataType::OpenInterest))
             {
-                match parse_ws_open_interest(value, instrument, ts_init) {
+                match parse_ws_open_interest(*value, instrument, ts_init) {
                     Ok(open_interest_data) => {
-                        asset_context_caches
-                            .open_interest
-                            .insert(*coin, value.clone());
+                        asset_context_caches.open_interest.insert(*coin, *value);
 
                         let data_type =
                             Self::open_interest_data_type(open_interest_data.instrument_id);
@@ -1034,32 +1085,23 @@ impl FeedHandler {
         instrument_id: InstrumentId,
         ctx: super::messages::PerpsAssetCtx,
     ) -> anyhow::Result<HyperliquidDexAssetCtx> {
-        let mark_price = ctx
-            .shared
-            .mark_px
-            .parse::<Price>()
-            .map_err(anyhow::Error::msg)?;
-        let oracle_price = ctx.oracle_px.parse::<Price>().map_err(anyhow::Error::msg)?;
-        let prev_day_price = ctx
-            .shared
-            .prev_day_px
-            .parse::<Price>()
-            .map_err(anyhow::Error::msg)?;
+        let mark_price = Price::from_decimal(ctx.shared.mark_px).map_err(anyhow::Error::msg)?;
+        let oracle_price = Price::from_decimal(ctx.oracle_px).map_err(anyhow::Error::msg)?;
+        let prev_day_price =
+            Price::from_decimal(ctx.shared.prev_day_px).map_err(anyhow::Error::msg)?;
         let mid_price = ctx
             .shared
             .mid_px
-            .map(|value| value.parse::<Price>().map_err(anyhow::Error::msg))
+            .map(|value| Price::from_decimal(value).map_err(anyhow::Error::msg))
             .transpose()?;
-        let funding_rate = Decimal::from_str(&ctx.funding)?;
-        let open_interest = Decimal::from_str(&ctx.open_interest)?;
-        let premium = ctx.premium.as_deref().map(Decimal::from_str).transpose()?;
-        let day_ntl_volume = Decimal::from_str(&ctx.shared.day_ntl_vlm)?;
-        let day_base_volume = Decimal::from_str(
-            ctx.shared
-                .day_base_vlm
-                .as_deref()
-                .ok_or_else(|| anyhow::anyhow!("missing dayBaseVlm"))?,
-        )?;
+        let funding_rate = ctx.funding;
+        let open_interest = ctx.open_interest;
+        let premium = ctx.premium;
+        let day_ntl_volume = ctx.shared.day_ntl_vlm;
+        let day_base_volume = ctx
+            .shared
+            .day_base_vlm
+            .ok_or_else(|| anyhow::anyhow!("missing dayBaseVlm"))?;
         let impact_prices = match ctx.shared.impact_pxs {
             Some(values) => match values.as_slice() {
                 [bid, ask] => Some(HyperliquidImpactPrices {
@@ -1126,6 +1168,19 @@ impl FeedHandler {
         );
         DataType::new(
             "HyperliquidOpenInterest",
+            Some(metadata),
+            Some(instrument_id.to_string()),
+        )
+    }
+
+    fn public_trade_data_type(instrument_id: InstrumentId) -> DataType {
+        let mut metadata = Params::new();
+        metadata.insert(
+            "instrument_id".to_string(),
+            serde_json::Value::String(instrument_id.to_string()),
+        );
+        DataType::new(
+            "HyperliquidPublicTrade",
             Some(metadata),
             Some(instrument_id.to_string()),
         )
@@ -1249,6 +1304,8 @@ mod tests {
     };
     use nautilus_network::websocket::SubscriptionState;
     use rstest::rstest;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
     use serde_json::json;
     use ustr::Ustr;
 
@@ -1293,6 +1350,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             UnixNanos::default(),
             UnixNanos::default(),
         ))
@@ -1303,13 +1361,13 @@ mod tests {
             coin: Ustr::from("BTC"),
             levels: [
                 vec![WsLevelData {
-                    px: "100.00".to_string(),
-                    sz: "1.0".to_string(),
+                    px: dec!(100.00),
+                    sz: dec!(1.0),
                     n: 1,
                 }],
                 vec![WsLevelData {
-                    px: "100.01".to_string(),
-                    sz: "1.0".to_string(),
+                    px: dec!(100.01),
+                    sz: dec!(1.0),
                     n: 1,
                 }],
             ],
@@ -1322,34 +1380,34 @@ mod tests {
             coin: Ustr::from("BTC"),
             ctx: SpotAssetCtx {
                 shared: SharedAssetCtx {
-                    day_ntl_vlm: "1000000.0".to_string(),
-                    prev_day_px: "49000.0".to_string(),
-                    mark_px: "50000.0".to_string(),
-                    mid_px: Some("50001.0".to_string()),
+                    day_ntl_vlm: dec!(1000000.0),
+                    prev_day_px: dec!(49000.0),
+                    mark_px: dec!(50000.0),
+                    mid_px: Some(dec!(50001.0)),
                     impact_pxs: None,
-                    day_base_vlm: Some("100.0".to_string()),
+                    day_base_vlm: Some(dec!(100.0)),
                 },
-                circulating_supply: "19000000.0".to_string(),
+                circulating_supply: dec!(19000000.0),
             },
         }
     }
 
-    fn btc_active_asset_ctx(open_interest: &str) -> WsActiveAssetCtxData {
+    fn btc_active_asset_ctx(open_interest: Decimal) -> WsActiveAssetCtxData {
         WsActiveAssetCtxData::Perp {
             coin: Ustr::from("BTC"),
             ctx: PerpsAssetCtx {
                 shared: SharedAssetCtx {
-                    day_ntl_vlm: "1000000.0".to_string(),
-                    prev_day_px: "49000.0".to_string(),
-                    mark_px: "50000.0".to_string(),
-                    mid_px: Some("50001.0".to_string()),
+                    day_ntl_vlm: dec!(1000000.0),
+                    prev_day_px: dec!(49000.0),
+                    mark_px: dec!(50000.0),
+                    mid_px: Some(dec!(50001.0)),
                     impact_pxs: Some(vec!["50000.0".to_string(), "50002.0".to_string()]),
-                    day_base_vlm: Some("100.0".to_string()),
+                    day_base_vlm: Some(dec!(100.0)),
                 },
-                funding: "0.0001".to_string(),
-                open_interest: open_interest.to_string(),
-                oracle_px: "50005.0".to_string(),
-                premium: Some("-0.0001".to_string()),
+                funding: dec!(0.0001),
+                open_interest,
+                oracle_px: dec!(50005.0),
+                premium: Some(dec!(-0.0001)),
             },
         }
     }
@@ -1498,7 +1556,7 @@ mod tests {
         let mut asset_context_caches = AssetContextCaches::default();
 
         let msgs = FeedHandler::handle_asset_context(
-            &btc_active_asset_ctx("100000.0"),
+            &btc_active_asset_ctx(dec!(100000.0)),
             &instruments,
             &asset_context_subs,
             &mut asset_context_caches,
@@ -1581,31 +1639,31 @@ mod tests {
                 vec![
                     PerpsAssetCtx {
                         shared: SharedAssetCtx {
-                            day_ntl_vlm: "1516669192.1953897476".to_string(),
-                            prev_day_px: "76317.0".to_string(),
-                            mark_px: "77562.0".to_string(),
-                            mid_px: Some("77558.5".to_string()),
+                            day_ntl_vlm: dec!(1516669192.1953897476),
+                            prev_day_px: dec!(76317.0),
+                            mark_px: dec!(77562.0),
+                            mid_px: Some(dec!(77558.5)),
                             impact_pxs: Some(vec!["77558.0".to_string(), "77559.0".to_string()]),
-                            day_base_vlm: Some("19707.77457".to_string()),
+                            day_base_vlm: Some(dec!(19707.77457)),
                         },
-                        funding: "-0.0000015186".to_string(),
-                        open_interest: "27353.17682".to_string(),
-                        oracle_px: "77605.0".to_string(),
-                        premium: Some("-0.0005927453".to_string()),
+                        funding: dec!(-0.0000015186),
+                        open_interest: dec!(27353.17682),
+                        oracle_px: dec!(77605.0),
+                        premium: Some(dec!(-0.0005927453)),
                     },
                     PerpsAssetCtx {
                         shared: SharedAssetCtx {
-                            day_ntl_vlm: "591989409.9392402172".to_string(),
-                            prev_day_px: "2094.6".to_string(),
-                            mark_px: "2123.7".to_string(),
-                            mid_px: Some("2123.95".to_string()),
+                            day_ntl_vlm: dec!(591989409.9392402172),
+                            prev_day_px: dec!(2094.6),
+                            mark_px: dec!(2123.7),
+                            mid_px: Some(dec!(2123.95)),
                             impact_pxs: Some(vec!["2123.65".to_string(), "2124.0".to_string()]),
-                            day_base_vlm: Some("281686.8234999999".to_string()),
+                            day_base_vlm: Some(dec!(281686.8234999999)),
                         },
-                        funding: "0.0000125".to_string(),
-                        open_interest: "605822.2557999999".to_string(),
-                        oracle_px: "2124.6".to_string(),
-                        premium: Some("-0.0002824061".to_string()),
+                        funding: dec!(0.0000125),
+                        open_interest: dec!(605822.2557999999),
+                        oracle_px: dec!(2124.6),
+                        premium: Some(dec!(-0.0002824061)),
                     },
                 ],
             )],
@@ -1678,14 +1736,14 @@ mod tests {
         let mut asset_context_caches = AssetContextCaches::default();
 
         let first = FeedHandler::handle_asset_context(
-            &btc_active_asset_ctx("100000.0"),
+            &btc_active_asset_ctx(dec!(100000.0)),
             &instruments,
             &asset_context_subs,
             &mut asset_context_caches,
             UnixNanos::default(),
         );
         let second = FeedHandler::handle_asset_context(
-            &btc_active_asset_ctx("100000.0"),
+            &btc_active_asset_ctx(dec!(100000.0)),
             &instruments,
             &asset_context_subs,
             &mut asset_context_caches,
@@ -1700,10 +1758,10 @@ mod tests {
     fn asset_context_caches_clear_removed_data_types() {
         let coin = Ustr::from("BTC");
         let mut caches = AssetContextCaches::default();
-        caches.mark_price.insert(coin, "98455.5".to_string());
-        caches.index_price.insert(coin, "98460.0".to_string());
-        caches.funding_rate.insert(coin, "0.0001".to_string());
-        caches.open_interest.insert(coin, "1500.0".to_string());
+        caches.mark_price.insert(coin, dec!(98455.5));
+        caches.index_price.insert(coin, dec!(98460.0));
+        caches.funding_rate.insert(coin, dec!(0.0001));
+        caches.open_interest.insert(coin, dec!(1500.0));
 
         let previous_data_types = AHashSet::from_iter([
             AssetContextDataType::MarkPrice,
@@ -1718,15 +1776,9 @@ mod tests {
 
         caches.clear_removed(coin, Some(&previous_data_types), &next_data_types);
 
-        assert_eq!(
-            caches.mark_price.get(&coin).map(String::as_str),
-            Some("98455.5")
-        );
+        assert_eq!(caches.mark_price.get(&coin).copied(), Some(dec!(98455.5)));
         assert!(caches.index_price.get(&coin).is_none());
-        assert_eq!(
-            caches.funding_rate.get(&coin).map(String::as_str),
-            Some("0.0001")
-        );
+        assert_eq!(caches.funding_rate.get(&coin).copied(), Some(dec!(0.0001)));
         assert!(caches.open_interest.get(&coin).is_none());
     }
 }

@@ -9,6 +9,10 @@ inputs:
     description: Free disk space
     required: false
     default: "false"
+  free-disk-space-max-build:
+    description: Remove additional tools unused by large Linux build jobs
+    required: false
+    default: "false"
   build-type:
     description: Type of build (pre-commit, test, release)
     required: false
@@ -38,7 +42,8 @@ inputs:
   uv-cache-enabled:
     description: >-
       Whether to persist the uv cache with GitHub Actions cache: true, false, or
-      auto (enabled on GitHub-hosted runners, disabled on self-hosted runners).
+      auto (enabled on GitHub-hosted runners, disabled on self-hosted runners and
+      macOS runners).
     required: false
     default: "auto"
   prek-cache-enabled:
@@ -58,25 +63,32 @@ runs:
     # > --------------------------------------------------
     # > OS
     # Auto-skip on the nautilus-ci-runner-* self-hosted pool: those machines
-    # have ample disk and the action's tool-cache/docker-images cleanup
-    # actively erases the pre-installed Python toolcache and cached Docker
-    # layers we want to keep across runs. Depot runners and GitHub-hosted
-    # runners still need the cleanup, so they remain unaffected.
-    - name: Free disk space (Ubuntu)
+    # have ample disk and the tool-cache/docker-images cleanup actively erases
+    # the pre-installed Python toolcache and cached Docker layers we want to
+    # keep across runs. Depot runners and GitHub-hosted runners still need the
+    # cleanup, so they remain unaffected.
+    - name: Free disk space (Linux)
       if: >-
         inputs.free-disk-space == 'true'
         && runner.os == 'Linux'
         && !startsWith(runner.name, 'nautilus-ci-runner-')
-      # https://github.com/jlumbroso/free-disk-space
-      uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-      with:
-        tool-cache: ${{ inputs.build-type != 'pre-commit' }}
-        android: true
-        dotnet: true
-        haskell: ${{ inputs.build-type != 'pre-commit' }}
-        large-packages: ${{ inputs.build-type != 'pre-commit' }}
-        docker-images: true
-        swap-storage: true
+      shell: bash
+      env:
+        BUILD_TYPE: ${{ inputs.build-type }}
+        MAX_BUILD: ${{ inputs.free-disk-space-max-build }}
+        RUNNER_ENV: ${{ runner.environment }}
+      run: |
+        args="--android --dotnet --docker-images --swap-storage"
+        if [ "$BUILD_TYPE" != "pre-commit" ]; then
+          args="$args --tool-cache --haskell --large-packages"
+        fi
+        if [ "$RUNNER_ENV" = "github-hosted" ]; then
+          args="$args --extra"
+        fi
+        if [ "$MAX_BUILD" = "true" ]; then
+          args="$args --max-build"
+        fi
+        bash scripts/ci/free-disk-space.sh $args
 
     - name: Free disk space (macOS)
       if: inputs.free-disk-space == 'true' && runner.os == 'macOS'
@@ -151,11 +163,12 @@ runs:
       id: rust-toolchain
       shell: bash
       run: |
-        echo "TOOLCHAIN=$(bash scripts/rust-toolchain.sh)" >> $GITHUB_ENV
+        TOOLCHAIN="$(bash scripts/rust-toolchain.sh)"
+        echo "TOOLCHAIN=$TOOLCHAIN" >> "$GITHUB_ENV"
 
     # https://github.com/actions-rust-lang/setup-rust-toolchain
     - name: Set up Rust toolchain
-      uses: actions-rust-lang/setup-rust-toolchain@2b1f5e9b395427c92ee4e3331786ca3c37afe2d7 # v1.16.0
+      uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1.16.1
       with:
         toolchain: ${{ env.TOOLCHAIN }}
         components: clippy,rustfmt
@@ -186,7 +199,7 @@ runs:
     - name: Install cargo-nextest
       if: inputs.build-type != 'pre-commit' && runner.os != 'macOS'
       # https://github.com/taiki-e/install-action
-      uses: taiki-e/install-action@db5fb34fa772531a3ece57ca434f579eb334e0fb # v2.75.30
+      uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
       with:
         tool: cargo-nextest@${{ env.CARGO_NEXTEST_VERSION }}
 
@@ -249,10 +262,14 @@ runs:
 
     - name: Install uv
       # https://github.com/astral-sh/setup-uv
-      uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # v8.2.0
       with:
         version: ${{ env.UV_VERSION }}
-        enable-cache: ${{ inputs.uv-cache-enabled }}
+        enable-cache: >-
+          ${{ inputs.uv-cache-enabled == 'auto'
+          && runner.os == 'macOS'
+          && 'false'
+          || inputs.uv-cache-enabled }}
         cache-suffix: ${{ env.CACHE_SCOPE }}-uv-${{ env.UV_VERSION }}
         prune-cache: true
 
@@ -261,7 +278,7 @@ runs:
       run: |
         echo "UV_CACHE_DIR=$(uv cache dir)" >> $GITHUB_ENV
 
-    # Self-hosted runners skip setup-uv's save-cache (and its built-in prune) under auto.
+    # Self-hosted and macOS runners skip setup-uv's cache post-step under auto.
     - name: Prune uv cache
       shell: bash
       run: uv cache prune --ci

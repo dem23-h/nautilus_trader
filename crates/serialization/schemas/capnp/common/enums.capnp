@@ -47,6 +47,11 @@ enum OptionKind {
     put @1;
 }
 
+enum GreeksConvention {
+    blackScholes @0;
+    priceAdjusted @1;
+}
+
 enum OrderSide {
     noOrderSide @0;
     buy @1;
@@ -80,6 +85,7 @@ enum OrderStatus {
     pendingCancel @11;
     partiallyFilled @12;
     filled @13;
+    voided @14;
 }
 
 enum TimeInForce {

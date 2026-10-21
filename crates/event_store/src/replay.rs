@@ -22,6 +22,7 @@
 
 use std::{fmt::Display, path::PathBuf};
 
+use indexmap::IndexMap;
 use nautilus_common::{
     cache::Cache,
     messages::{
@@ -32,26 +33,28 @@ use nautilus_common::{
         execution::SubmitOrderList,
     },
 };
-use nautilus_core::UnixNanos;
+use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     data::{Bar, QuoteTick, TradeTick},
-    enums::OmsType,
+    enums::{OmsType, OrderSide, PositionSide},
     events::{
-        AccountState, OrderEventAny, OrderFilled, OrderInitialized, PositionAdjusted,
-        PositionChanged, PositionClosed, PositionOpened,
+        AccountState, OrderEventAny, OrderFillVoided, OrderFilled, OrderInitialized,
+        PositionAdjusted, PositionChanged, PositionClosed, PositionOpened,
     },
-    orders::OrderAny,
-    position::Position,
+    identifiers::PositionId,
+    orders::{Order, OrderAny},
+    position::{Position, PositionReplayEvent},
+    types::{Money, Quantity},
 };
 use serde::de::DeserializeOwned;
 
 #[cfg(test)]
 use crate::capture::builtins::{
-    PAYLOAD_TYPE_BATCH_CANCEL_ORDERS, PAYLOAD_TYPE_BOOK_DELTAS_RESPONSE,
-    PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE, PAYLOAD_TYPE_BOOK_RESPONSE, PAYLOAD_TYPE_CANCEL_ALL_ORDERS,
-    PAYLOAD_TYPE_CANCEL_ORDER, PAYLOAD_TYPE_CUSTOM_DATA_RESPONSE,
-    PAYLOAD_TYPE_EXECUTION_MASS_STATUS, PAYLOAD_TYPE_FILL_REPORT,
-    PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE, PAYLOAD_TYPE_MODIFY_ORDER,
+    PAYLOAD_TYPE_BATCH_CANCEL_ORDERS, PAYLOAD_TYPE_BATCH_MODIFY_ORDERS,
+    PAYLOAD_TYPE_BOOK_DELTAS_RESPONSE, PAYLOAD_TYPE_BOOK_DEPTH_RESPONSE,
+    PAYLOAD_TYPE_BOOK_RESPONSE, PAYLOAD_TYPE_CANCEL_ALL_ORDERS, PAYLOAD_TYPE_CANCEL_ORDER,
+    PAYLOAD_TYPE_CUSTOM_DATA_RESPONSE, PAYLOAD_TYPE_EXECUTION_MASS_STATUS,
+    PAYLOAD_TYPE_FILL_REPORT, PAYLOAD_TYPE_FORWARD_PRICES_RESPONSE, PAYLOAD_TYPE_MODIFY_ORDER,
     PAYLOAD_TYPE_ORDER_STATUS_REPORT, PAYLOAD_TYPE_ORDER_WITH_FILLS,
     PAYLOAD_TYPE_POSITION_STATUS_REPORT, PAYLOAD_TYPE_QUERY_ACCOUNT, PAYLOAD_TYPE_QUERY_ORDER,
     PAYLOAD_TYPE_REQUEST_COMMAND, PAYLOAD_TYPE_SUBMIT_ORDER, PAYLOAD_TYPE_SUBSCRIBE_COMMAND,
@@ -70,13 +73,14 @@ use crate::{
         PAYLOAD_TYPE_FUNDING_RATES_RESPONSE, PAYLOAD_TYPE_INSTRUMENT_RESPONSE,
         PAYLOAD_TYPE_INSTRUMENTS_RESPONSE, PAYLOAD_TYPE_ORDER_ACCEPTED,
         PAYLOAD_TYPE_ORDER_CANCEL_REJECTED, PAYLOAD_TYPE_ORDER_CANCELED, PAYLOAD_TYPE_ORDER_DENIED,
-        PAYLOAD_TYPE_ORDER_EMULATED, PAYLOAD_TYPE_ORDER_EXPIRED, PAYLOAD_TYPE_ORDER_FILLED,
-        PAYLOAD_TYPE_ORDER_INITIALIZED, PAYLOAD_TYPE_ORDER_MODIFY_REJECTED,
-        PAYLOAD_TYPE_ORDER_PENDING_CANCEL, PAYLOAD_TYPE_ORDER_PENDING_UPDATE,
-        PAYLOAD_TYPE_ORDER_REJECTED, PAYLOAD_TYPE_ORDER_RELEASED, PAYLOAD_TYPE_ORDER_SUBMITTED,
-        PAYLOAD_TYPE_ORDER_TRIGGERED, PAYLOAD_TYPE_ORDER_UPDATED, PAYLOAD_TYPE_POSITION_ADJUSTED,
-        PAYLOAD_TYPE_POSITION_CHANGED, PAYLOAD_TYPE_POSITION_CLOSED, PAYLOAD_TYPE_POSITION_OPENED,
-        PAYLOAD_TYPE_QUOTES_RESPONSE, PAYLOAD_TYPE_SUBMIT_ORDER_LIST, PAYLOAD_TYPE_TRADES_RESPONSE,
+        PAYLOAD_TYPE_ORDER_EMULATED, PAYLOAD_TYPE_ORDER_EXPIRED, PAYLOAD_TYPE_ORDER_FILL_VOIDED,
+        PAYLOAD_TYPE_ORDER_FILLED, PAYLOAD_TYPE_ORDER_INITIALIZED,
+        PAYLOAD_TYPE_ORDER_MODIFY_REJECTED, PAYLOAD_TYPE_ORDER_PENDING_CANCEL,
+        PAYLOAD_TYPE_ORDER_PENDING_UPDATE, PAYLOAD_TYPE_ORDER_REJECTED,
+        PAYLOAD_TYPE_ORDER_RELEASED, PAYLOAD_TYPE_ORDER_SUBMITTED, PAYLOAD_TYPE_ORDER_TRIGGERED,
+        PAYLOAD_TYPE_ORDER_UPDATED, PAYLOAD_TYPE_POSITION_ADJUSTED, PAYLOAD_TYPE_POSITION_CHANGED,
+        PAYLOAD_TYPE_POSITION_CLOSED, PAYLOAD_TYPE_POSITION_OPENED, PAYLOAD_TYPE_QUOTES_RESPONSE,
+        PAYLOAD_TYPE_SUBMIT_ORDER_LIST, PAYLOAD_TYPE_TRADES_RESPONSE,
     },
     entry::EventStoreEntry,
     error::EventStoreError,
@@ -137,6 +141,7 @@ pub(crate) const CACHE_REPLAY_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_ORDER_CANCEL_REJECTED,
     PAYLOAD_TYPE_ORDER_UPDATED,
     PAYLOAD_TYPE_ORDER_FILLED,
+    PAYLOAD_TYPE_ORDER_FILL_VOIDED,
     PAYLOAD_TYPE_POSITION_OPENED,
     PAYLOAD_TYPE_POSITION_CHANGED,
     PAYLOAD_TYPE_POSITION_CLOSED,
@@ -147,6 +152,7 @@ pub(crate) const CACHE_REPLAY_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
 pub(crate) const FORENSIC_ONLY_CAPTURE_PAYLOAD_TYPES: &[&str] = &[
     PAYLOAD_TYPE_SUBMIT_ORDER,
     PAYLOAD_TYPE_MODIFY_ORDER,
+    PAYLOAD_TYPE_BATCH_MODIFY_ORDERS,
     PAYLOAD_TYPE_CANCEL_ORDER,
     PAYLOAD_TYPE_CANCEL_ALL_ORDERS,
     PAYLOAD_TYPE_BATCH_CANCEL_ORDERS,
@@ -1104,7 +1110,11 @@ pub fn restore_cache_snapshot_blob(
 /// Applies one event-store entry to cache state when a replay rule exists.
 ///
 /// Returns `Ok(true)` when the entry changed cache state and `Ok(false)` when the
-/// payload is outside the current cache bootstrap replay surface.
+/// payload is outside the current cache bootstrap replay surface, or when the entry's
+/// position target cannot be established (a position event's target is absent, or a
+/// fill's instrument is missing so the position cannot open). The latter paths log a
+/// warning so the report's ignored count surfaces the divergence instead of claiming
+/// a full apply.
 ///
 /// # Errors
 ///
@@ -1172,25 +1182,40 @@ pub fn apply_cache_replay_entry(
         }
         PAYLOAD_TYPE_ORDER_FILLED => {
             let fill = decode_payload::<OrderFilled>(entry)?;
-            let event = OrderEventAny::Filled(fill);
+            // The fill side panics deep inside Position/Order application; the hash
+            // proves the bytes match what was written, not that the producer wrote a
+            // semantically valid fill, so guard before the model invariants fire.
+            if matches!(fill.order_side, OrderSide::NoOrderSide) {
+                return Err(apply_error(
+                    entry,
+                    "OrderFilled.order_side must be Buy or Sell, was NoOrderSide",
+                ));
+            }
+            let event = OrderEventAny::Filled(fill.clone());
             apply_result(entry, cache.update_order(&event))?;
-            apply_fill_to_position(cache, entry, &fill)?;
+            if !apply_fill_to_position(cache, entry, &fill)? {
+                return Ok(false);
+            }
+        }
+        PAYLOAD_TYPE_ORDER_FILL_VOIDED => {
+            let fill_voided = decode_payload::<OrderFillVoided>(entry)?;
+            apply_fill_void_to_order_and_positions(cache, entry, &fill_voided)?;
         }
         PAYLOAD_TYPE_POSITION_OPENED => {
             let opened = decode_payload::<PositionOpened>(entry)?;
-            apply_position_opened(cache, entry, &opened)?;
+            return apply_position_opened(cache, entry, &opened);
         }
         PAYLOAD_TYPE_POSITION_CHANGED => {
             let changed = decode_payload::<PositionChanged>(entry)?;
-            apply_position_changed(cache, entry, &changed)?;
+            return apply_position_changed(cache, entry, &changed);
         }
         PAYLOAD_TYPE_POSITION_CLOSED => {
             let closed = decode_payload::<PositionClosed>(entry)?;
-            apply_position_closed(cache, entry, &closed)?;
+            return apply_position_closed(cache, entry, &closed);
         }
         PAYLOAD_TYPE_POSITION_ADJUSTED => {
             let adjustment = decode_payload::<PositionAdjusted>(entry)?;
-            apply_position_adjustment(cache, entry, adjustment)?;
+            return apply_position_adjustment(cache, entry, adjustment);
         }
         _ => return Ok(false),
     }
@@ -1270,41 +1295,284 @@ where
     Ok(wrap(decode_payload(entry)?))
 }
 
+// Returns `Ok(true)` when the position side applied (no position association, or an
+// idempotent replay no-op) and `Ok(false)` when the instrument needed to open the
+// position is missing, so the report's ignored count surfaces the divergence.
 fn apply_fill_to_position(
     cache: &mut Cache,
     entry: &EventStoreEntry,
     fill: &OrderFilled,
-) -> Result<(), CacheReplayError> {
+) -> Result<bool, CacheReplayError> {
     let Some(position_id) = fill.position_id else {
-        return Ok(());
+        return Ok(true);
     };
 
     if let Some(mut position) = cache.position_owned(&position_id) {
-        if position.trade_ids().contains(&fill.trade_id) {
-            return Ok(());
+        // Mirror live `Position::apply_fill`: a duplicate inside an open episode is
+        // the idempotent replay no-op; historical duplicates on a Flat position are
+        // ignored inside `apply` itself from the carried replay history.
+        if position.side != PositionSide::Flat && position.trade_ids().contains(&fill.trade_id) {
+            return Ok(true);
         }
 
         position.apply(fill);
         apply_result(entry, cache.update_position(&position))?;
-        return Ok(());
+        return Ok(true);
     }
 
     let Some(instrument) = cache.instrument(&fill.instrument_id).cloned() else {
-        return Ok(());
+        log::warn!(
+            "Replay seq {} skipped opening position {position_id}: instrument {} not in cache",
+            entry.seq,
+            fill.instrument_id,
+        );
+        return Ok(false);
     };
 
-    let position = Position::new(&instrument, *fill);
+    let position = Position::new(&instrument, fill.clone());
     apply_result(entry, cache.add_position(&position, OmsType::Unspecified))?;
+    Ok(true)
+}
+
+fn apply_fill_void_to_order_and_positions(
+    cache: &mut Cache,
+    entry: &EventStoreEntry,
+    fill_voided: &OrderFillVoided,
+) -> Result<(), CacheReplayError> {
+    let event = OrderEventAny::FillVoided(fill_voided.clone());
+    let order = cache
+        .order_owned(&fill_voided.client_order_id)
+        .ok_or_else(|| {
+            apply_error(
+                entry,
+                format!("order {} not found", fill_voided.client_order_id),
+            )
+        })?;
+    let original_fill = order
+        .events()
+        .into_iter()
+        .find_map(|candidate| match candidate {
+            OrderEventAny::Filled(fill) if fill.trade_id == fill_voided.trade_id => Some(fill),
+            _ => None,
+        });
+
+    let mut validated_order = order.clone();
+    apply_result(entry, validated_order.apply(event.clone()))?;
+
+    let corrected_positions =
+        if let Some(original_fill) = original_fill.filter(|fill| fill.position_id.is_some()) {
+            prepare_fill_void_positions(cache, entry, fill_voided, original_fill.event_id)?
+        } else {
+            Vec::new()
+        };
+
+    apply_result(entry, cache.update_order(&event))?;
+    for position in corrected_positions {
+        apply_result(entry, cache.update_position(&position))?;
+    }
     Ok(())
+}
+
+fn prepare_fill_void_positions(
+    cache: &Cache,
+    entry: &EventStoreEntry,
+    fill_voided: &OrderFillVoided,
+    source_event_id: UUID4,
+) -> Result<Vec<Position>, CacheReplayError> {
+    let fragments = collect_fill_void_fragments(cache, entry, fill_voided, source_event_id)?;
+    let allocations = allocate_fill_void_fragments(entry, fill_voided, &fragments)?;
+    let mut corrected_positions = Vec::new();
+
+    for (position_id, (voided_qty, commission_voided)) in allocations {
+        if voided_qty.is_zero() {
+            return Err(apply_error(
+                entry,
+                format!(
+                    "commission-only position correction requires authoritative reconciliation for fill {}",
+                    fill_voided.trade_id
+                ),
+            ));
+        }
+        let mut position = cache
+            .position_owned(&position_id)
+            .ok_or_else(|| apply_error(entry, format!("position {position_id} not found")))?;
+        let previous = position
+            .fill_voids
+            .iter()
+            .rev()
+            .find(|record| {
+                record.event.client_order_id == fill_voided.client_order_id
+                    && record.event.trade_id == fill_voided.trade_id
+            })
+            .map(|record| (record.voided_qty, record.commission_voided));
+        if previous == Some((voided_qty, commission_voided)) {
+            continue;
+        }
+        apply_result(
+            entry,
+            position.apply_fill_void(fill_voided.clone(), voided_qty, commission_voided),
+        )?;
+        corrected_positions.push(position);
+    }
+    Ok(corrected_positions)
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FillVoidFragment {
+    position_id: PositionId,
+    split_rank: u8,
+    quantity: Quantity,
+    commission: Option<Money>,
+}
+
+fn collect_fill_void_fragments(
+    cache: &Cache,
+    entry: &EventStoreEntry,
+    fill_voided: &OrderFillVoided,
+    source_event_id: UUID4,
+) -> Result<Vec<FillVoidFragment>, CacheReplayError> {
+    let positions: Vec<Position> = cache
+        .positions(
+            None,
+            Some(&fill_voided.instrument_id),
+            Some(&fill_voided.strategy_id),
+            Some(&fill_voided.account_id),
+            None,
+        )
+        .into_iter()
+        .map(|position| position.cloned())
+        .collect();
+    let mut fragments = Vec::new();
+
+    for position in &positions {
+        for replay_event in &position.replay_events {
+            let PositionReplayEvent::Filled(fill) = replay_event else {
+                continue;
+            };
+
+            if fill.client_order_id != fill_voided.client_order_id
+                || fill.trade_id != fill_voided.trade_id
+            {
+                continue;
+            }
+            let split_rank = if fill.event_id == source_event_id {
+                0
+            } else if fill.causation_id == Some(source_event_id) {
+                1
+            } else {
+                continue;
+            };
+            fragments.push(FillVoidFragment {
+                position_id: position.id,
+                split_rank,
+                quantity: fill.last_qty,
+                commission: fill.commission,
+            });
+        }
+    }
+
+    if fragments.is_empty() {
+        return Err(apply_error(
+            entry,
+            format!(
+                "no position fragments found for fill {}",
+                fill_voided.trade_id
+            ),
+        ));
+    }
+    fragments.sort_by_key(|fragment| fragment.split_rank);
+    Ok(fragments)
+}
+
+fn allocate_fill_void_fragments(
+    entry: &EventStoreEntry,
+    fill_voided: &OrderFillVoided,
+    fragments: &[FillVoidFragment],
+) -> Result<IndexMap<PositionId, (Quantity, Option<Money>)>, CacheReplayError> {
+    let mut allocations = IndexMap::<PositionId, (Quantity, Option<Money>)>::new();
+    let mut remaining_qty = fill_voided.voided_qty;
+    for fragment in fragments.iter().rev() {
+        if remaining_qty.is_zero() {
+            break;
+        }
+        let removed = remaining_qty.min(fragment.quantity);
+        allocations
+            .entry(fragment.position_id)
+            .and_modify(|allocation| allocation.0 = allocation.0 + removed)
+            .or_insert((removed, None));
+        remaining_qty = remaining_qty - removed;
+    }
+
+    if !remaining_qty.is_zero() {
+        return Err(apply_error(
+            entry,
+            format!(
+                "position fragments do not cover voided quantity for fill {}",
+                fill_voided.trade_id
+            ),
+        ));
+    }
+
+    if let Some(mut remaining_commission) = fill_voided.commission_voided {
+        for fragment in fragments.iter().rev() {
+            if remaining_commission.is_zero() {
+                break;
+            }
+            let Some(commission) = fragment.commission else {
+                continue;
+            };
+
+            if commission.currency != remaining_commission.currency {
+                return Err(apply_error(
+                    entry,
+                    format!(
+                        "position commission currency differs for fill {}",
+                        fill_voided.trade_id
+                    ),
+                ));
+            }
+            let removed_raw = remaining_commission.raw.abs().min(commission.raw.abs());
+            let removed = Money::from_raw(
+                removed_raw * remaining_commission.raw.signum(),
+                remaining_commission.currency,
+            );
+            allocations
+                .entry(fragment.position_id)
+                .and_modify(|allocation| {
+                    allocation.1 = Some(
+                        allocation
+                            .1
+                            .map_or(removed, |commission| commission + removed),
+                    );
+                })
+                .or_insert((
+                    Quantity::zero(fill_voided.voided_qty.precision),
+                    Some(removed),
+                ));
+            remaining_commission = remaining_commission - removed;
+        }
+
+        if !remaining_commission.is_zero() {
+            return Err(apply_error(
+                entry,
+                format!(
+                    "position fragments do not cover voided commission for fill {}",
+                    fill_voided.trade_id
+                ),
+            ));
+        }
+    }
+    Ok(allocations)
 }
 
 fn apply_position_opened(
     cache: &mut Cache,
     entry: &EventStoreEntry,
     opened: &PositionOpened,
-) -> Result<(), CacheReplayError> {
+) -> Result<bool, CacheReplayError> {
     let Some(mut position) = cache.position_owned(&opened.position_id) else {
-        return Ok(());
+        warn_position_skip(entry, opened.position_id);
+        return Ok(false);
     };
 
     position.trader_id = opened.trader_id;
@@ -1329,16 +1597,17 @@ fn apply_position_opened(
     position.realized_return = 0.0;
 
     apply_result(entry, cache.update_position(&position))?;
-    Ok(())
+    Ok(true)
 }
 
 fn apply_position_changed(
     cache: &mut Cache,
     entry: &EventStoreEntry,
     changed: &PositionChanged,
-) -> Result<(), CacheReplayError> {
+) -> Result<bool, CacheReplayError> {
     let Some(mut position) = cache.position_owned(&changed.position_id) else {
-        return Ok(());
+        warn_position_skip(entry, changed.position_id);
+        return Ok(false);
     };
 
     position.trader_id = changed.trader_id;
@@ -1362,16 +1631,17 @@ fn apply_position_changed(
     position.realized_pnl = changed.realized_pnl;
 
     apply_result(entry, cache.update_position(&position))?;
-    Ok(())
+    Ok(true)
 }
 
 fn apply_position_closed(
     cache: &mut Cache,
     entry: &EventStoreEntry,
     closed: &PositionClosed,
-) -> Result<(), CacheReplayError> {
+) -> Result<bool, CacheReplayError> {
     let Some(mut position) = cache.position_owned(&closed.position_id) else {
-        return Ok(());
+        warn_position_skip(entry, closed.position_id);
+        return Ok(false);
     };
 
     position.trader_id = closed.trader_id;
@@ -1397,21 +1667,32 @@ fn apply_position_closed(
     position.realized_pnl = closed.realized_pnl;
 
     apply_result(entry, cache.update_position(&position))?;
-    Ok(())
+    Ok(true)
 }
 
 fn apply_position_adjustment(
     cache: &mut Cache,
     entry: &EventStoreEntry,
     adjustment: PositionAdjusted,
-) -> Result<(), CacheReplayError> {
+) -> Result<bool, CacheReplayError> {
     let Some(mut position) = cache.position_owned(&adjustment.position_id) else {
-        return Ok(());
+        warn_position_skip(entry, adjustment.position_id);
+        return Ok(false);
     };
 
     position.apply_adjustment(adjustment);
     apply_result(entry, cache.update_position(&position))?;
-    Ok(())
+    Ok(true)
+}
+
+// A position event whose position is absent cannot apply; counting it as applied would
+// let a restore report full success while an open position is missing from the cache.
+fn warn_position_skip(entry: &EventStoreEntry, position_id: PositionId) {
+    log::warn!(
+        "Replay seq {} skipped {}: position {position_id} not in cache",
+        entry.seq,
+        entry.payload_type,
+    );
 }
 
 fn decode_payload<T>(entry: &EventStoreEntry) -> Result<T, CacheReplayError>
@@ -1472,7 +1753,8 @@ mod tests {
             PositionEvent,
             account::stubs::{cash_account_state, cash_account_state_million_usd},
             order::spec::{
-                OrderAcceptedSpec, OrderFilledSpec, OrderInitializedSpec, OrderSubmittedSpec,
+                OrderAcceptedSpec, OrderFillVoidedSpec, OrderFilledSpec, OrderInitializedSpec,
+                OrderSubmittedSpec,
             },
         },
         identifiers::{
@@ -1789,7 +2071,17 @@ mod tests {
             &[],
         ),
         cache_mutation(
+            "settle_position_snapshots",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
             "purge_instrument",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
+            "purge_instrument_skip_order_guard",
             CacheMutationRecoveryClass::SnapshotOwned,
             &[],
         ),
@@ -1993,6 +2285,7 @@ mod tests {
                 PAYLOAD_TYPE_ORDER_CANCEL_REJECTED,
                 PAYLOAD_TYPE_ORDER_UPDATED,
                 PAYLOAD_TYPE_ORDER_FILLED,
+                PAYLOAD_TYPE_ORDER_FILL_VOIDED,
             ],
         ),
         cache_mutation(
@@ -2005,6 +2298,7 @@ mod tests {
             CacheMutationRecoveryClass::EventStoreCapturedAndReplayed,
             &[
                 PAYLOAD_TYPE_ORDER_FILLED,
+                PAYLOAD_TYPE_ORDER_FILL_VOIDED,
                 PAYLOAD_TYPE_POSITION_OPENED,
                 PAYLOAD_TYPE_POSITION_CHANGED,
                 PAYLOAD_TYPE_POSITION_CLOSED,
@@ -2013,6 +2307,11 @@ mod tests {
         ),
         cache_mutation(
             "snapshot_position",
+            CacheMutationRecoveryClass::SnapshotOwned,
+            &[],
+        ),
+        cache_mutation(
+            "snapshot_position_encoded",
             CacheMutationRecoveryClass::SnapshotOwned,
             &[],
         ),
@@ -2113,13 +2412,20 @@ mod tests {
         collect_cache_public_methods(true)
     }
 
+    /// Every file carrying an `impl Cache` block, since `include_str!` cannot glob a directory.
+    /// Add a file here when the cache module is split further, or its methods drop out of this
+    /// classification guard.
+    const CACHE_IMPL_SOURCES: &[&str] = &[
+        include_str!("../../common/src/cache/mod.rs"),
+        include_str!("../../common/src/cache/position.rs"),
+    ];
+
     fn collect_cache_public_methods(require_mut_self: bool) -> AHashSet<&'static str> {
-        let source = include_str!("../../common/src/cache/mod.rs");
         let mut methods = AHashSet::new();
         let mut pending_name: Option<&'static str> = None;
         let mut pending_signature = String::new();
 
-        for line in source.lines() {
+        for line in CACHE_IMPL_SOURCES.iter().flat_map(|source| source.lines()) {
             let trimmed = line.trim_start();
 
             if pending_name.is_none() {
@@ -3110,7 +3416,7 @@ mod tests {
             .position_id(position_id)
             .commission(Money::from("1 USD"))
             .build();
-        let filled_event = OrderEventAny::Filled(filled);
+        let filled_event = OrderEventAny::Filled(filled.clone());
         let reader = reader_with_entries(
             "run-order-replay",
             &[
@@ -3135,9 +3441,188 @@ mod tests {
         assert_eq!(order.event_count(), 4);
         assert_eq!(order.last_event(), &filled_event);
         assert_eq!(position.event_count(), 1);
-        assert_eq!(position.last_event(), Some(filled));
+        assert_eq!(position.last_event(), Some(filled.clone()));
         assert_eq!(position.trade_ids(), vec![filled.trade_id]);
         assert_eq!(position.commissions(), vec![Money::from("1 USD")]);
+    }
+
+    #[rstest]
+    fn order_fill_replay_without_instrument_counts_fill_as_ignored() {
+        // The position side cannot open without the instrument; the fill must count
+        // as ignored rather than claim a full apply.
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let position_id = PositionId::from("P-NO-INSTR");
+        let initialized = OrderInitializedSpec::builder()
+            .instrument_id(instrument.id())
+            .build();
+        let client_order_id = initialized.client_order_id;
+        let submitted = OrderSubmittedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .account_id(submitted.account_id)
+            .build();
+        let filled = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .venue_order_id(accepted.venue_order_id)
+            .account_id(submitted.account_id)
+            .position_id(position_id)
+            .build();
+        let reader = reader_with_entries(
+            "run-fill-no-instrument",
+            &[
+                append_order_event(1, &OrderEventAny::Initialized(initialized)),
+                append_order_event(2, &OrderEventAny::Submitted(submitted)),
+                append_order_event(3, &OrderEventAny::Accepted(accepted)),
+                append_order_event(4, &OrderEventAny::Filled(filled)),
+            ],
+        );
+        let mut cache = Cache::default();
+
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).expect("replay");
+
+        assert_eq!(report.applied_entries, 3);
+        assert_eq!(report.ignored_entries, 1);
+        assert!(cache.position_owned(&position_id).is_none());
+    }
+
+    #[rstest]
+    fn order_fill_void_replay_updates_order_and_position() {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let position_id = PositionId::from("P-VOID-001");
+        let initialized = OrderInitializedSpec::builder()
+            .instrument_id(instrument.id())
+            .build();
+        let client_order_id = initialized.client_order_id;
+        let submitted = OrderSubmittedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .account_id(submitted.account_id)
+            .build();
+        let filled = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .venue_order_id(accepted.venue_order_id)
+            .account_id(submitted.account_id)
+            .position_id(position_id)
+            .commission(Money::from("1 USD"))
+            .build();
+        let fill_voided = OrderFillVoidedSpec::builder()
+            .trader_id(filled.trader_id)
+            .strategy_id(filled.strategy_id)
+            .instrument_id(filled.instrument_id)
+            .client_order_id(filled.client_order_id)
+            .venue_order_id(filled.venue_order_id)
+            .account_id(filled.account_id)
+            .trade_id(filled.trade_id)
+            .voided_qty(Quantity::from(50_000))
+            .commission_voided(Money::from("0.40 USD"))
+            .order_side(filled.order_side)
+            .order_type(filled.order_type)
+            .last_px(filled.last_px)
+            .currency(filled.currency)
+            .liquidity_side(filled.liquidity_side)
+            .position_id(position_id)
+            .is_reopened(true)
+            .build();
+        let reader = reader_with_entries(
+            "run-fill-void-replay",
+            &[
+                append_order_event(1, &OrderEventAny::Initialized(initialized)),
+                append_order_event(2, &OrderEventAny::Submitted(submitted)),
+                append_order_event(3, &OrderEventAny::Accepted(accepted)),
+                append_order_event(4, &OrderEventAny::Filled(filled)),
+                append_order_event(5, &OrderEventAny::FillVoided(fill_voided.clone())),
+            ],
+        );
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).expect("add instrument");
+
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).expect("replay");
+        let order = cache.order_owned(&client_order_id).expect("order replayed");
+        let position = cache
+            .position_owned(&position_id)
+            .expect("position replayed");
+
+        assert_eq!(report.applied_entries, 5);
+        assert_eq!(report.ignored_entries, 0);
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.filled_qty(), Quantity::from(50_000));
+        assert_eq!(order.voided_qty(), Quantity::from(50_000));
+        assert_eq!(position.quantity, Quantity::from(50_000));
+        assert_eq!(position.commissions(), vec![Money::from("0.60 USD")]);
+        assert_eq!(position.fill_voids.len(), 1);
+        assert_eq!(position.fill_voids[0].event, fill_voided);
+    }
+
+    #[rstest]
+    fn order_fill_void_replay_updates_order_without_position() {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let initialized = OrderInitializedSpec::builder()
+            .instrument_id(instrument.id())
+            .build();
+        let client_order_id = initialized.client_order_id;
+        let submitted = OrderSubmittedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .build();
+        let accepted = OrderAcceptedSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .account_id(submitted.account_id)
+            .build();
+        let filled = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .client_order_id(client_order_id)
+            .venue_order_id(accepted.venue_order_id)
+            .account_id(submitted.account_id)
+            .build();
+        let fill_voided = OrderFillVoidedSpec::builder()
+            .trader_id(filled.trader_id)
+            .strategy_id(filled.strategy_id)
+            .instrument_id(filled.instrument_id)
+            .client_order_id(filled.client_order_id)
+            .venue_order_id(filled.venue_order_id)
+            .account_id(filled.account_id)
+            .trade_id(filled.trade_id)
+            .voided_qty(Quantity::from(50_000))
+            .order_side(filled.order_side)
+            .order_type(filled.order_type)
+            .last_px(filled.last_px)
+            .currency(filled.currency)
+            .liquidity_side(filled.liquidity_side)
+            .is_reopened(true)
+            .build();
+        let reader = reader_with_entries(
+            "run-order-only-fill-void-replay",
+            &[
+                append_order_event(1, &OrderEventAny::Initialized(initialized)),
+                append_order_event(2, &OrderEventAny::Submitted(submitted)),
+                append_order_event(3, &OrderEventAny::Accepted(accepted)),
+                append_order_event(4, &OrderEventAny::Filled(filled)),
+                append_order_event(5, &OrderEventAny::FillVoided(fill_voided)),
+            ],
+        );
+        let mut cache = Cache::default();
+        cache.add_instrument(instrument).expect("add instrument");
+
+        let report = replay_cache_snapshot_tail(&mut cache, &reader).expect("replay");
+        let order = cache.order_owned(&client_order_id).expect("order replayed");
+
+        assert_eq!(report.applied_entries, 5);
+        assert_eq!(report.ignored_entries, 0);
+        assert_eq!(order.status(), OrderStatus::PartiallyFilled);
+        assert_eq!(order.filled_qty(), Quantity::from(50_000));
+        assert_eq!(order.voided_qty(), Quantity::from(50_000));
+        assert_eq!(cache.positions_total_count(None, None, None, None, None), 0);
     }
 
     #[rstest]
@@ -3153,7 +3638,7 @@ mod tests {
             .last_qty(Quantity::from("1"))
             .last_px(Price::from("1.00000"))
             .build();
-        let mut live_position = Position::new(&instrument, opened_fill);
+        let mut live_position = Position::new(&instrument, opened_fill.clone());
         let opened = PositionOpened::create(
             &live_position,
             &opened_fill,
@@ -3252,7 +3737,7 @@ mod tests {
             .instrument_id(instrument.id())
             .position_id(position_id)
             .build();
-        let position = Position::new(&instrument, fill);
+        let position = Position::new(&instrument, fill.clone());
         let adjustment = PositionAdjusted::new(
             fill.trader_id,
             fill.strategy_id,
@@ -3285,6 +3770,50 @@ mod tests {
     }
 
     #[rstest]
+    fn position_event_for_unknown_position_is_counted_as_ignored() {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let position_id = PositionId::from("P-MISSING");
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .position_id(position_id)
+            .build();
+        let position = Position::new(&instrument, fill.clone());
+        let opened = PositionOpened::create(&position, &fill, UUID4::new(), UnixNanos::from(10));
+        let entry = append_position_event(1, &PositionEvent::PositionOpened(opened)).entry;
+        let mut cache = Cache::default();
+
+        let applied = apply_cache_replay_entry(&mut cache, &entry).expect("apply");
+
+        assert!(
+            !applied,
+            "missing position must count as ignored, not applied"
+        );
+    }
+
+    #[rstest]
+    fn order_filled_with_no_order_side_is_an_apply_error_not_a_panic() {
+        // The entry hash proves the stored bytes match what was written, not that the
+        // producer wrote a valid fill; OrderSide::NoOrderSide deserializes cleanly and
+        // without the guard panics deep inside Position/Order application.
+        let mut fill = OrderFilledSpec::builder()
+            .position_id(PositionId::from("P-001"))
+            .build();
+        fill.order_side = OrderSide::NoOrderSide;
+        let entry = append_serde_payload(1, PAYLOAD_TYPE_ORDER_FILLED, &fill).entry;
+        let mut cache = Cache::default();
+
+        let err = apply_cache_replay_entry(&mut cache, &entry).expect_err("must reject");
+
+        match err {
+            CacheReplayError::Apply { seq, message, .. } => {
+                assert_eq!(seq, 1);
+                assert!(message.contains("NoOrderSide"), "message was: {message}");
+            }
+            other => panic!("expected Apply, was {other:?}"),
+        }
+    }
+
+    #[rstest]
     fn duplicate_position_fill_is_not_applied_twice() {
         let instrument = InstrumentAny::CurrencyPair(audusd_sim());
         let position_id = PositionId::from("P-001");
@@ -3293,21 +3822,97 @@ mod tests {
             .position_id(position_id)
             .commission(Money::from("1 USD"))
             .build();
-        let position = Position::new(&instrument, fill);
-        let entry = append_order_event(1, &OrderEventAny::Filled(fill)).entry;
+        let position = Position::new(&instrument, fill.clone());
+        let entry = append_order_event(1, &OrderEventAny::Filled(fill.clone())).entry;
         let mut cache = Cache::default();
         cache
             .add_position(&position, OmsType::Unspecified)
             .expect("seed position");
 
-        apply_fill_to_position(&mut cache, &entry, &fill).expect("apply fill");
+        let applied = apply_fill_to_position(&mut cache, &entry, &fill).expect("apply fill");
         let position = cache
             .position_owned(&position_id)
             .expect("position updated");
 
+        assert!(
+            applied,
+            "duplicate trade within an open episode is the idempotent no-op and counts as applied"
+        );
         assert_eq!(position.event_count(), 1);
         assert_eq!(position.trade_ids(), vec![fill.trade_id]);
         assert_eq!(position.commissions(), vec![Money::from("1 USD")]);
+    }
+
+    #[rstest]
+    fn flat_position_with_reused_trade_id_is_ignored_like_live() {
+        // Live `Position::apply_fill` ignores a fill whose trade id already sits in
+        // the position's carried replay history, so replay must not skip it early or
+        // reopen the position either: `apply` ignores it and state matches live.
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let position_id = PositionId::from("P-REOPEN");
+        let open_fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .position_id(position_id)
+            .order_side(OrderSide::Buy)
+            .trade_id(TradeId::from("T-1"))
+            .commission(Money::from("2 USD"))
+            .build();
+        let close_fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .position_id(position_id)
+            .order_side(OrderSide::Sell)
+            .trade_id(TradeId::from("T-2"))
+            .build();
+        let mut position = Position::new(&instrument, open_fill);
+        position.apply(&close_fill);
+        assert_eq!(position.side, PositionSide::Flat);
+
+        let dup_fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .position_id(position_id)
+            .order_side(OrderSide::Buy)
+            .trade_id(TradeId::from("T-1"))
+            .commission(Money::from("1 USD"))
+            .build();
+        let entry = append_order_event(3, &OrderEventAny::Filled(dup_fill.clone())).entry;
+        let mut cache = Cache::default();
+        cache
+            .add_position(&position, OmsType::Unspecified)
+            .expect("seed position");
+
+        let applied = apply_fill_to_position(&mut cache, &entry, &dup_fill).expect("apply");
+        let position = cache
+            .position_owned(&position_id)
+            .expect("position updated");
+
+        assert!(
+            applied,
+            "a historical duplicate is the idempotent no-op and counts as applied"
+        );
+        assert_eq!(position.side, PositionSide::Flat);
+        assert_eq!(position.event_count(), 2);
+        assert_eq!(position.trade_ids().len(), 2);
+        assert_eq!(position.commissions(), vec![Money::from("2 USD")]);
+    }
+
+    #[rstest]
+    fn fill_for_missing_instrument_is_counted_as_ignored() {
+        let instrument = InstrumentAny::CurrencyPair(audusd_sim());
+        let position_id = PositionId::from("P-NO-INSTR");
+        let fill = OrderFilledSpec::builder()
+            .instrument_id(instrument.id())
+            .position_id(position_id)
+            .build();
+        let entry = append_order_event(1, &OrderEventAny::Filled(fill.clone())).entry;
+        let mut cache = Cache::default();
+
+        let applied = apply_fill_to_position(&mut cache, &entry, &fill).expect("apply");
+
+        assert!(
+            !applied,
+            "a position that cannot open must count as ignored, was claimed applied"
+        );
+        assert!(cache.position_owned(&position_id).is_none());
     }
 
     #[rstest]
@@ -3376,7 +3981,7 @@ mod tests {
         let position = Position::new(&instrument, fill);
         let mut snapshot_cache = Cache::default();
         let snapshot_ref = snapshot_cache
-            .snapshot_position(&position)
+            .snapshot_position_encoded(&position)
             .expect("snapshot position");
         let anchored_state = cash_account_state_million_usd("100 USD", "0 USD", "100 USD");
         let replayed_state = cash_account_state_million_usd("200 USD", "0 USD", "200 USD");
@@ -3443,7 +4048,7 @@ mod tests {
         let position = Position::new(&instrument, fill);
         let mut snapshot_cache = Cache::default();
         let snapshot_ref = snapshot_cache
-            .snapshot_position(&position)
+            .snapshot_position_encoded(&position)
             .expect("snapshot position");
 
         {

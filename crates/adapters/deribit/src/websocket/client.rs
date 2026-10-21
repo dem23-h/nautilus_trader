@@ -30,7 +30,7 @@ use std::{
 
 use arc_swap::ArcSwap;
 use futures_util::Stream;
-use nautilus_common::{enums::LogColor, live::get_runtime, log_info};
+use nautilus_common::{enums::LogColor, live::get_runtime, log_debug};
 use nautilus_core::{
     AtomicMap, AtomicSet, consts::NAUTILUS_USER_AGENT, env::get_or_env_var_opt,
     time::get_atomic_clock_realtime,
@@ -91,6 +91,7 @@ pub struct DeribitWebSocketClient {
     url: String,
     environment: DeribitEnvironment,
     heartbeat_interval: Option<u64>,
+    auth_timeout_secs: u64,
     credential: Option<Credential>,
     auth_state: Arc<tokio::sync::RwLock<Option<AuthState>>>,
     signal: Arc<AtomicBool>,
@@ -136,11 +137,13 @@ impl DeribitWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if only one of `api_key` or `api_secret` is provided.
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         url: Option<String>,
         api_key: Option<String>,
         api_secret: Option<String>,
         heartbeat_interval: u64,
+        auth_timeout_secs: Option<u64>,
         environment: DeribitEnvironment,
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
@@ -150,6 +153,7 @@ impl DeribitWebSocketClient {
             api_key,
             api_secret,
             heartbeat_interval,
+            auth_timeout_secs,
             environment,
             true,
             transport_backend,
@@ -164,6 +168,7 @@ impl DeribitWebSocketClient {
         api_key: Option<String>,
         api_secret: Option<String>,
         heartbeat_interval: u64,
+        auth_timeout_secs: Option<u64>,
         environment: DeribitEnvironment,
         env_fallback: bool,
         transport_backend: TransportBackend,
@@ -179,7 +184,7 @@ impl DeribitWebSocketClient {
             Credential::resolve_with_env_fallback(api_key, api_secret, environment, env_fallback)?;
 
         if credential.is_some() {
-            log::info!("Credentials loaded ({environment})");
+            log::debug!("Credentials loaded ({environment})");
         } else {
             log::debug!("No credentials configured - unauthenticated mode");
         }
@@ -191,6 +196,7 @@ impl DeribitWebSocketClient {
             url,
             environment,
             heartbeat_interval: Some(heartbeat_interval),
+            auth_timeout_secs: auth_timeout_secs.unwrap_or(AUTHENTICATION_TIMEOUT_SECS),
             credential,
             auth_state: Arc::new(tokio::sync::RwLock::new(None)),
             signal,
@@ -234,6 +240,7 @@ impl DeribitWebSocketClient {
             None,
             None,
             DERIBIT_WS_HEARTBEAT_SECS,
+            None,
             environment,
             false,
             TransportBackend::default(),
@@ -259,6 +266,7 @@ impl DeribitWebSocketClient {
             None,
             None,
             heartbeat_interval,
+            None,
             environment,
             false,
             TransportBackend::default(),
@@ -281,6 +289,7 @@ impl DeribitWebSocketClient {
         environment: DeribitEnvironment,
         api_key: Option<String>,
         api_secret: Option<String>,
+        auth_timeout_secs: Option<u64>,
         proxy_url: Option<String>,
     ) -> anyhow::Result<Self> {
         let (key_env, secret_env) = credential_env_vars(environment);
@@ -295,6 +304,7 @@ impl DeribitWebSocketClient {
             Some(api_key),
             Some(api_secret),
             DERIBIT_WS_HEARTBEAT_SECS,
+            auth_timeout_secs,
             environment,
             TransportBackend::default(),
             proxy_url,
@@ -499,7 +509,7 @@ impl DeribitWebSocketClient {
     ///
     /// Returns an error if the connection fails.
     pub async fn connect(&mut self) -> anyhow::Result<()> {
-        log_info!(
+        log_debug!(
             "Connecting to WebSocket: {}",
             self.url,
             color = LogColor::Blue
@@ -780,7 +790,7 @@ impl DeribitWebSocketClient {
         });
 
         self.task_handle = Some(Arc::new(task_handle));
-        log::info!("Connected to WebSocket");
+        log::debug!("Connected to WebSocket");
 
         Ok(())
     }
@@ -791,7 +801,7 @@ impl DeribitWebSocketClient {
     ///
     /// Returns an error if the close operation fails.
     pub async fn close(&self) -> DeribitWsResult<()> {
-        log::info!("Closing WebSocket connection");
+        log::debug!("Closing WebSocket connection");
         self.signal.store(true, Ordering::Relaxed);
 
         let _ = self.cmd_tx.read().await.send(HandlerCommand::Disconnect);
@@ -875,7 +885,7 @@ impl DeribitWebSocketClient {
         // Determine scope
         let scope = session_name.map(|name| format!("session:{name}"));
 
-        log::info!("Authenticating WebSocket...");
+        log::debug!("Authenticating WebSocket...");
 
         let rx = self.auth_tracker.begin();
 
@@ -887,11 +897,11 @@ impl DeribitWebSocketClient {
         // Wait for authentication result with timeout
         match self
             .auth_tracker
-            .wait_for_result::<DeribitWsError>(Duration::from_secs(AUTHENTICATION_TIMEOUT_SECS), rx)
+            .wait_for_result::<DeribitWsError>(Duration::from_secs(self.auth_timeout_secs), rx)
             .await
         {
             Ok(()) => {
-                log::info!("WebSocket authenticated successfully");
+                log::debug!("WebSocket authenticated successfully");
                 Ok(())
             }
             Err(e) => {

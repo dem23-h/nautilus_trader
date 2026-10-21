@@ -41,12 +41,14 @@ python = [
   "nautilus-network/python",
   "nautilus-system/python",
   "pyo3",
+  "pyo3-async-runtimes",
   "pyo3-stub-gen",
 ]
 high-precision = ["nautilus-model/high-precision"]
 
 [package.metadata.docs.rs]
-all-features = true
+# Python docs depend on the local pyo3-stub-gen patch for now, which published crates do not carry
+features = ["examples", "high-precision"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
@@ -55,6 +57,7 @@ nautilus-core = { workspace = true }
 nautilus-live = { workspace = true }
 nautilus-model = { workspace = true }
 nautilus-network = { workspace = true }
+nautilus-persistence-macros = { workspace = true }
 nautilus-system = { workspace = true, optional = true }
 
 ahash = { workspace = true }
@@ -70,6 +73,7 @@ dashmap = { workspace = true }
 derive_builder = { workspace = true }
 dotenvy = { workspace = true }
 futures-util = { workspace = true }
+indexmap = { workspace = true }
 log = { workspace = true }
 rand = { workspace = true }
 rust_decimal = { workspace = true }
@@ -88,16 +92,22 @@ uuid = { workspace = true }
 zeroize = { workspace = true }
 
 pyo3 = { workspace = true, optional = true }
+pyo3-async-runtimes = { workspace = true, optional = true }
 pyo3-stub-gen = { workspace = true, optional = true }
 
 [dev-dependencies]
-nautilus-testkit = { workspace = true }
+nautilus-execution = { workspace = true }
+nautilus-sandbox = { workspace = true }
+nautilus-testkit = { workspace = true, default-features = false, features = [
+  "testers",
+] }
 nautilus-trading = { workspace = true }
 
 axum = { workspace = true }
 criterion = { workspace = true }
 proptest = { workspace = true }
 rstest = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
 toml = { workspace = true }
 
 [[bench]]
@@ -149,6 +159,12 @@ test = false
 [[bin]]
 name = "polymarket-create-api-key"
 path = "bin/create_api_key.rs"
+doc = false
+test = false
+
+[[bin]]
+name = "polymarket-set-allowances"
+path = "bin/set_allowances.rs"
 doc = false
 test = false
 

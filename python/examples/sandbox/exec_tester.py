@@ -30,8 +30,8 @@ from decimal import Decimal
 from nautilus_trader.adapters.sandbox import SandboxExecutionClientConfig
 from nautilus_trader.adapters.sandbox import SandboxExecutionClientFactory
 from nautilus_trader.common import Environment
+from nautilus_trader.config import LiveRiskEngineConfig
 from nautilus_trader.live import LiveNode
-from nautilus_trader.live import LiveRiskEngineConfig
 from nautilus_trader.model import AccountId
 from nautilus_trader.model import ClientId
 from nautilus_trader.model import Currency
@@ -75,7 +75,7 @@ def main() -> None:
     )
 
     node = builder.build()
-    node.add_native_strategy(
+    node.add_builtin_strategy(
         "ExecTester",
         ExecTesterConfig(
             strategy_id=StrategyId.from_str("EXEC_TESTER-001"),

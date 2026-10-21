@@ -13,12 +13,13 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
-use std::time::Duration;
+use std::{num::NonZeroUsize, time::Duration};
 
 use ahash::{AHashMap, AHashSet};
 use chrono::Duration as ChronoDuration;
 use nautilus_common::{
     actor::{DataActor, DataActorCore},
+    config::ConfigError,
     enums::LogColor,
     log_info, nautilus_actor,
     timer::TimeEvent,
@@ -26,7 +27,8 @@ use nautilus_common::{
 use nautilus_model::{
     data::{
         Bar, FundingRateUpdate, IndexPriceUpdate, InstrumentClose, InstrumentStatus,
-        MarkPriceUpdate, OrderBookDeltas, QuoteTick, TradeTick, option_chain::OptionGreeks,
+        MarkPriceUpdate, OrderBookDeltas, OrderBookDepth10, QuoteTick, TradeTick,
+        option_chain::OptionGreeks,
     },
     identifiers::InstrumentId,
     instruments::InstrumentAny,
@@ -53,6 +55,10 @@ pub struct DataTester {
 nautilus_actor!(DataTester);
 
 impl DataActor for DataTester {
+    #[expect(
+        clippy::too_many_lines,
+        reason = "startup subscribes to each configured data scenario explicitly"
+    )]
     fn on_start(&mut self) -> anyhow::Result<()> {
         let instrument_ids = self.config.instrument_ids.clone();
         let client_id = self.config.client_id;
@@ -104,23 +110,31 @@ impl DataActor for DataTester {
                 self.subscribe_book_at_interval(
                     instrument_id,
                     self.config.book_type,
-                    self.config.book_depth,
-                    self.config.book_interval_ms,
+                    self.config
+                        .book_depth
+                        .map(|depth| {
+                            NonZeroUsize::new(depth).ok_or_else(|| {
+                                ConfigError::range("book_depth", "must be positive, was 0")
+                            })
+                        })
+                        .transpose()?,
+                    NonZeroUsize::new(self.config.book_interval_ms).ok_or_else(|| {
+                        ConfigError::range("book_interval_ms", "must be positive, was 0")
+                    })?,
                     client_id,
                     subscribe_params.clone(),
                 );
             }
 
-            // TODO: Support subscribe_book_depth when the method is available
-            // if self.config.subscribe_book_depth {
-            //     self.subscribe_book_depth(
-            //         instrument_id,
-            //         self.config.book_type,
-            //         self.config.book_depth,
-            //         client_id,
-            //         subscribe_params.clone(),
-            //     );
-            // }
+            if self.config.subscribe_book_depth {
+                self.subscribe_book_depth10(
+                    instrument_id,
+                    self.config.book_type,
+                    client_id,
+                    self.config.manage_book,
+                    subscribe_params.clone(),
+                );
+            }
 
             if self.config.subscribe_quotes {
                 self.subscribe_quotes(instrument_id, client_id, subscribe_params.clone());
@@ -178,7 +192,14 @@ impl DataActor for DataTester {
             if self.config.request_book_snapshot {
                 let _ = self.request_book_snapshot(
                     instrument_id,
-                    self.config.book_depth,
+                    self.config
+                        .book_depth
+                        .map(|depth| {
+                            NonZeroUsize::new(depth).ok_or_else(|| {
+                                ConfigError::range("book_depth", "must be positive, was 0")
+                            })
+                        })
+                        .transpose()?,
                     client_id,
                     request_params.clone(),
                 );
@@ -281,16 +302,17 @@ impl DataActor for DataTester {
             if self.config.subscribe_book_at_interval {
                 self.unsubscribe_book_at_interval(
                     instrument_id,
-                    self.config.book_interval_ms,
+                    NonZeroUsize::new(self.config.book_interval_ms).ok_or_else(|| {
+                        ConfigError::range("book_interval_ms", "must be positive, was 0")
+                    })?,
                     client_id,
                     subscribe_params.clone(),
                 );
             }
 
-            // TODO: Support unsubscribe_book_depth when the method is available
-            // if self.config.subscribe_book_depth {
-            //     self.unsubscribe_book_depth(instrument_id, client_id, subscribe_params.clone());
-            // }
+            if self.config.subscribe_book_depth {
+                self.unsubscribe_book_depth10(instrument_id, client_id, subscribe_params.clone());
+            }
 
             if self.config.subscribe_quotes {
                 self.unsubscribe_quotes(instrument_id, client_id, subscribe_params.clone());
@@ -381,6 +403,13 @@ impl DataActor for DataTester {
             }
         } else if self.config.log_data {
             log_info!("{deltas:?}", color = LogColor::Cyan);
+        }
+        Ok(())
+    }
+
+    fn on_book_depth(&mut self, depth: &OrderBookDepth10) -> anyhow::Result<()> {
+        if self.config.log_data {
+            log_info!("{depth:?}", color = LogColor::Cyan);
         }
         Ok(())
     }

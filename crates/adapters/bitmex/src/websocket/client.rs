@@ -77,6 +77,7 @@ pub struct BitmexWebSocketClient {
     url: String,
     credential: Option<Credential>,
     heartbeat: Option<u64>,
+    auth_timeout_secs: u64,
     account_id: AccountId,
     auth_tracker: AuthTracker,
     signal: Arc<AtomicBool>,
@@ -97,12 +98,14 @@ impl BitmexWebSocketClient {
     /// # Errors
     ///
     /// Returns an error if only one of `api_key` or `api_secret` is provided (both or neither required).
+    #[expect(clippy::too_many_arguments)]
     pub fn new(
         url: Option<String>,
         api_key: Option<String>,
         api_secret: Option<String>,
         account_id: Option<AccountId>,
         heartbeat: u64,
+        auth_timeout_secs: Option<u64>,
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
     ) -> anyhow::Result<Self> {
@@ -124,6 +127,7 @@ impl BitmexWebSocketClient {
             url: url.unwrap_or(BITMEX_WS_URL.to_string()),
             credential,
             heartbeat: Some(heartbeat),
+            auth_timeout_secs: auth_timeout_secs.unwrap_or(AUTHENTICATION_TIMEOUT_SECS),
             account_id,
             auth_tracker: AuthTracker::new(),
             signal: Arc::new(AtomicBool::new(false)),
@@ -156,6 +160,7 @@ impl BitmexWebSocketClient {
         api_secret: Option<String>,
         account_id: Option<AccountId>,
         heartbeat: u64,
+        auth_timeout_secs: Option<u64>,
         environment: BitmexEnvironment,
         transport_backend: TransportBackend,
         proxy_url: Option<String>,
@@ -171,6 +176,7 @@ impl BitmexWebSocketClient {
             secret,
             account_id,
             heartbeat,
+            auth_timeout_secs,
             transport_backend,
             proxy_url,
         )
@@ -193,6 +199,7 @@ impl BitmexWebSocketClient {
             Some(api_secret),
             None,
             5,
+            None,
             TransportBackend::default(),
             None,
         )
@@ -427,7 +434,11 @@ impl BitmexWebSocketClient {
                         }
 
                         if handler.send(BitmexWsMessage::Reconnected).is_err() {
-                            log::error!("Failed to forward reconnect event (receiver dropped)");
+                            if handler.is_stopped() {
+                                log::debug!("Failed to forward reconnect event (receiver dropped)");
+                            } else {
+                                log::error!("Failed to forward reconnect event (receiver dropped)");
+                            }
                             break;
                         }
                     }
@@ -440,7 +451,11 @@ impl BitmexWebSocketClient {
                     }
                     Some(msg) => {
                         if handler.send(msg).is_err() {
-                            log::error!("Failed to send message (receiver dropped)");
+                            if handler.is_stopped() {
+                                log::debug!("Failed to send message (receiver dropped)");
+                            } else {
+                                log::error!("Failed to send message (receiver dropped)");
+                            }
                             break;
                         }
                     }
@@ -597,10 +612,7 @@ impl BitmexWebSocketClient {
             })?;
 
         self.auth_tracker
-            .wait_for_result::<BitmexWsError>(
-                Duration::from_secs(AUTHENTICATION_TIMEOUT_SECS),
-                receiver,
-            )
+            .wait_for_result::<BitmexWsError>(Duration::from_secs(self.auth_timeout_secs), receiver)
             .await
     }
 
@@ -1266,6 +1278,7 @@ mod tests {
             Some("test_secret".to_string()),
             Some(AccountId::new("BITMEX-TEST")),
             5,
+            None,
             TransportBackend::default(),
             None,
         )
@@ -1332,6 +1345,7 @@ mod tests {
             Some("test_secret".to_string()),
             Some(AccountId::new("BITMEX-TEST")),
             5,
+            None,
             TransportBackend::default(),
             None,
         )
@@ -1363,6 +1377,7 @@ mod tests {
             None,
             Some(AccountId::new("BITMEX-TEST")),
             5,
+            None,
             TransportBackend::default(),
             None,
         )
@@ -1379,6 +1394,7 @@ mod tests {
             Some("test_secret".to_string()),
             Some(AccountId::new("BITMEX-TEST")),
             5,
+            None,
             TransportBackend::default(),
             None,
         )
@@ -1449,6 +1465,7 @@ mod tests {
             None,
             Some(AccountId::new("BITMEX-TEST")),
             5,
+            None,
             TransportBackend::default(),
             None,
         )
@@ -1497,6 +1514,7 @@ mod tests {
             None,
             Some(AccountId::new("BITMEX-TEST")),
             5,
+            None,
             TransportBackend::default(),
             None,
         )
@@ -1552,6 +1570,7 @@ mod tests {
             Some("test_secret".to_string()),
             Some(AccountId::new("BITMEX-TEST")),
             5,
+            None,
             TransportBackend::default(),
             None,
         )
